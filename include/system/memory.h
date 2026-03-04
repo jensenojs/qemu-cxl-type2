@@ -1481,6 +1481,7 @@ bool memory_region_init_ram_from_file(MemoryRegion *mr,
                                       const char *path,
                                       ram_addr_t offset,
                                       Error **errp);
+#endif
 
 /**
  * memory_region_init_ram_from_fd:  Initialize RAM memory region with a
@@ -1510,7 +1511,6 @@ bool memory_region_init_ram_from_fd(MemoryRegion *mr,
                                     int fd,
                                     ram_addr_t offset,
                                     Error **errp);
-#endif
 
 /**
  * memory_region_init_ram_ptr:  Initialize RAM memory region from a
