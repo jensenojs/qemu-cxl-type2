@@ -49,10 +49,13 @@
 
 /* Data transfer region - OPTIMIZED for larger chunks */
 #define CXL_GPU_DATA_OFFSET         0x1000    /* Data buffer offset */
-#define CXL_GPU_DATA_SIZE           0x100000  /* Data buffer size (1MB) - was 60KB */
+#define CXL_GPU_DATA_SIZE           0x100000  /* Data buffer size (1MB) */
 
 /* Command register size - increased to accommodate larger data buffer */
-#define CXL_GPU_CMD_REG_SIZE        0x101000  /* ~1MB + 4KB registers */
+#define CXL_GPU_CMD_REG_SIZE        0x101000  /* 1MB + 4KB registers */
+
+/* Module payload encoding in CXL_GPU_REG_PARAM1. */
+#define CXL_GPU_MODULE_DATA_ZSTD    (1U << 0)
 
 /* Bulk transfer region (BAR4 direct access) */
 #define CXL_GPU_BULK_TRANSFER_SIZE  0x4000000 /* 64MB bulk transfer region */
@@ -109,6 +112,7 @@ typedef enum {
     CXL_GPU_CMD_MODULE_LOAD_PTX = 0x30,
     CXL_GPU_CMD_MODULE_UNLOAD   = 0x31,
     CXL_GPU_CMD_FUNC_GET        = 0x32,
+    CXL_GPU_CMD_MODULE_LOAD_CUBIN = 0x33,
 
     CXL_GPU_CMD_LAUNCH_KERNEL   = 0x40,
 

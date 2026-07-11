@@ -43,6 +43,7 @@
 #include <sys/eventfd.h>
 #include <linux/vfio.h>
 #include <unistd.h>
+#include <zstd.h>
 
 #ifndef DEFAULT_HETGPU_LIB_PATH
 #define DEFAULT_HETGPU_LIB_PATH NULL
@@ -2464,7 +2465,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         break;
 
     case CXL_GPU_CMD_MODULE_LOAD_PTX:
-        if (hetgpu->initialized && ct2d->gpu_cmd.num_modules < 64) {
+        if (hetgpu->initialized && ct2d->gpu_cmd.num_modules < ARRAY_SIZE(ct2d->gpu_cmd.modules)) {
             /* PTX source is in data buffer */
             void *module = NULL;
             err = hetgpu_load_ptx(hetgpu, (const char *)ct2d->gpu_cmd.data,
@@ -2481,8 +2482,66 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         }
         break;
 
+    case CXL_GPU_CMD_MODULE_LOAD_CUBIN:
+        if (hetgpu->initialized &&
+            ct2d->gpu_cmd.num_modules < ARRAY_SIZE(ct2d->gpu_cmd.modules)) {
+            size = ct2d->gpu_cmd.params[0];
+            uint32_t encoding = ct2d->gpu_cmd.params[1];
+            size_t uncompressed_size = ct2d->gpu_cmd.params[2];
+            if (!size || size > ct2d->gpu_cmd.data_size) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                break;
+            }
+
+            const void *cubin_data = ct2d->gpu_cmd.data;
+            size_t cubin_size = size;
+            void *decoded = NULL;
+            if (encoding & ~CXL_GPU_MODULE_DATA_ZSTD) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                break;
+            }
+            if (encoding & CXL_GPU_MODULE_DATA_ZSTD) {
+                if (!uncompressed_size || uncompressed_size > 64 * MiB) {
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                    break;
+                }
+                decoded = g_try_malloc(uncompressed_size);
+                if (!decoded) {
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_OUT_OF_MEMORY;
+                    break;
+                }
+                size_t result = ZSTD_decompress(decoded, uncompressed_size,
+                                                ct2d->gpu_cmd.data, size);
+                if (ZSTD_isError(result) || result != uncompressed_size) {
+                    qemu_log("CXL hetGPU: CUBIN Zstd decode failed: %s result=%zu expected=%zu\n",
+                             ZSTD_getErrorName(result), result,
+                             uncompressed_size);
+                    g_free(decoded);
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                    break;
+                }
+                cubin_data = decoded;
+                cubin_size = result;
+            }
+
+            void *module = NULL;
+            err = hetgpu_load_cubin(hetgpu, cubin_data, cubin_size,
+                                    (HetGPUModule *)&module);
+            g_free(decoded);
+            if (err == HETGPU_SUCCESS) {
+                ct2d->gpu_cmd.modules[ct2d->gpu_cmd.num_modules] = module;
+                ct2d->gpu_cmd.results[0] = ct2d->gpu_cmd.num_modules;
+                ct2d->gpu_cmd.num_modules++;
+            } else {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_PTX;
+            }
+        } else {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
+        }
+        break;
+
     case CXL_GPU_CMD_FUNC_GET:
-        if (hetgpu->initialized && ct2d->gpu_cmd.num_functions < 256) {
+        if (hetgpu->initialized && ct2d->gpu_cmd.num_functions < ARRAY_SIZE(ct2d->gpu_cmd.functions)) {
             uint32_t module_id = ct2d->gpu_cmd.params[0];
             /* Function name is in data buffer */
             if (module_id < ct2d->gpu_cmd.num_modules) {
@@ -2520,9 +2579,27 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 config.shared_mem_bytes = ct2d->gpu_cmd.params[4] & 0xFFFFFFFF;
                 config.stream = NULL;
 
-                /* Kernel args are in data buffer as array of pointers */
+                /* The guest marshals argument values into consecutive 8-byte
+                 * slots. CUDA expects kernelParams[i] to point at the host
+                 * storage containing argument i; passing the slot values as
+                 * pointers makes the driver dereference GPU virtual addresses
+                 * in the QEMU process. Build the host pointer array here. */
                 uint32_t num_args = (ct2d->gpu_cmd.params[4] >> 32) & 0xFF;
-                void **args = (void **)ct2d->gpu_cmd.data;
+                uint64_t *arg_values = (uint64_t *)ct2d->gpu_cmd.data;
+                void *args[256];
+
+                if ((uint64_t)num_args * sizeof(*arg_values) >
+                    ct2d->gpu_cmd.data_size) {
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                    break;
+                }
+                for (uint32_t i = 0; i < num_args; i++) {
+                    args[i] = &arg_values[i];
+                }
+
+                /* knockout: each argument currently owns one 8-byte slot;
+                 * by-value kernel parameters larger than 8 bytes require a
+                 * size/offset descriptor in the BAR2 command ABI. */
 
                 err = hetgpu_launch_kernel(hetgpu,
                                            ct2d->gpu_cmd.functions[func_id],

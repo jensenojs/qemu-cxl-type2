@@ -204,8 +204,11 @@ typedef struct CXLType2State {
         uint64_t results[4];
         uint8_t  *data;                /* Data buffer - dynamically allocated (1MB) */
         size_t   data_size;            /* Size of data buffer */
-        void    *modules[64];          /* Loaded PTX modules */
-        void    *functions[256];       /* Kernel function handles */
+        /* knockout: fixed capacities cover the current ggml CUDA artifact
+         * (133 modules, 6413 entry functions); switch to dynamic tables if a
+         * workload exceeds these measured bounds. */
+        void    *modules[256];         /* Loaded PTX/CUBIN modules */
+        void    *functions[8192];      /* Kernel function handles */
         uint32_t num_modules;
         uint32_t num_functions;
         uint32_t capabilities;         /* Device capabilities (bulk transfer, etc.) */
