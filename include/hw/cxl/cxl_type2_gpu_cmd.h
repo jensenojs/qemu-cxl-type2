@@ -113,6 +113,8 @@ typedef enum {
     CXL_GPU_CMD_MODULE_UNLOAD   = 0x31,
     CXL_GPU_CMD_FUNC_GET        = 0x32,
     CXL_GPU_CMD_MODULE_LOAD_CUBIN = 0x33,
+    CXL_GPU_CMD_MODULE_GET_GLOBAL = 0x34,
+    CXL_GPU_CMD_FUNC_GET_PARAM_INFO = 0x35,
 
     CXL_GPU_CMD_LAUNCH_KERNEL   = 0x40,
 
@@ -215,6 +217,7 @@ typedef enum {
     CXL_GPU_ERROR_NOT_READY             = 600,
     CXL_GPU_ERROR_LAUNCH_FAILED         = 700,
     CXL_GPU_ERROR_INVALID_PTX           = 800,
+    CXL_GPU_ERROR_NOT_SUPPORTED         = 801,
     CXL_GPU_ERROR_UNKNOWN               = 999,
 } CXLGPUError;
 

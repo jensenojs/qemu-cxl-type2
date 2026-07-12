@@ -55,6 +55,8 @@ typedef int (*cuMemcpyDtoH_fn)(void *, uint64_t, size_t);
 typedef int (*cuMemcpyDtoD_fn)(uint64_t, uint64_t, size_t);
 typedef int (*cuModuleLoadData_fn)(void **, const void *);
 typedef int (*cuModuleGetFunction_fn)(void **, void *, const char *);
+typedef int (*cuModuleGetGlobal_fn)(uint64_t *, size_t *, void *, const char *);
+typedef int (*cuFuncGetParamInfo_fn)(void *, size_t, size_t *, size_t *);
 typedef int (*cuLaunchKernel_fn)(void *, unsigned int, unsigned int, unsigned int,
                                   unsigned int, unsigned int, unsigned int,
                                   unsigned int, void *, void **, void **);
@@ -94,6 +96,8 @@ static struct {
     cuMemcpyDtoD_fn cuMemcpyDtoD;
     cuModuleLoadData_fn cuModuleLoadData;
     cuModuleGetFunction_fn cuModuleGetFunction;
+    cuModuleGetGlobal_fn cuModuleGetGlobal;
+    cuFuncGetParamInfo_fn cuFuncGetParamInfo;
     cuLaunchKernel_fn cuLaunchKernel;
     cuCtxPushCurrent_fn cuCtxPushCurrent;
     cuCtxPopCurrent_fn cuCtxPopCurrent;
@@ -186,6 +190,8 @@ HetGPUError hetgpu_init(HetGPUState *state, HetGPUBackendType backend,
             g_cuda_funcs.cuMemcpyDtoD = dlsym(g_cuda_lib_handle, "cuMemcpyDtoD_v2");
             g_cuda_funcs.cuModuleLoadData = dlsym(g_cuda_lib_handle, "cuModuleLoadData");
             g_cuda_funcs.cuModuleGetFunction = dlsym(g_cuda_lib_handle, "cuModuleGetFunction");
+            g_cuda_funcs.cuModuleGetGlobal = dlsym(g_cuda_lib_handle, "cuModuleGetGlobal_v2");
+            g_cuda_funcs.cuFuncGetParamInfo = dlsym(g_cuda_lib_handle, "cuFuncGetParamInfo");
             g_cuda_funcs.cuLaunchKernel = dlsym(g_cuda_lib_handle, "cuLaunchKernel");
             g_cuda_funcs.cuCtxPushCurrent = dlsym(g_cuda_lib_handle, "cuCtxPushCurrent_v2");
             g_cuda_funcs.cuCtxPopCurrent = dlsym(g_cuda_lib_handle, "cuCtxPopCurrent_v2");
@@ -1104,6 +1110,87 @@ HetGPUError hetgpu_get_function(HetGPUState *state, HetGPUModule module,
     }
 
     return HETGPU_ERROR_NOT_INITIALIZED;
+}
+
+HetGPUError hetgpu_get_global(HetGPUState *state, HetGPUModule module,
+                              const char *name, HetGPUDevicePtr *dev_ptr,
+                              size_t *size)
+{
+    if (!state || !state->initialized || !module || !name || !dev_ptr || !size) {
+        return HETGPU_ERROR_INVALID_VALUE;
+    }
+
+    if (g_cuda_funcs.cuModuleGetGlobal && state->backend != HETGPU_BACKEND_SIMULATION) {
+        cuda_lock(state);
+        uint64_t ptr = 0;
+        size_t bytes = 0;
+        int err = g_cuda_funcs.cuModuleGetGlobal(&ptr, &bytes, module, name);
+        cuda_unlock(state);
+
+        if (err == 0) {
+            *dev_ptr = ptr;
+            *size = bytes;
+            qemu_log("CXL hetGPU: [dev%d] Got global '%s' -> 0x%" PRIx64 " size=%zu\n",
+                     state->device_index, name, ptr, bytes);
+            return HETGPU_SUCCESS;
+        }
+
+        const char *err_name = "UNKNOWN";
+        if (g_cuda_funcs.cuGetErrorName) {
+            g_cuda_funcs.cuGetErrorName(err, &err_name);
+        }
+        qemu_log("CXL hetGPU: [dev%d] cuModuleGetGlobal('%s') failed: %s (%d)\n",
+                 state->device_index, name, err_name, err);
+        switch (err) {
+        case 1:
+            return HETGPU_ERROR_INVALID_VALUE;
+        case 201:
+            return HETGPU_ERROR_INVALID_CONTEXT;
+        case 400:
+            return HETGPU_ERROR_INVALID_HANDLE;
+        case 500:
+            return HETGPU_ERROR_NOT_FOUND;
+        case 801:
+            return HETGPU_ERROR_NOT_SUPPORTED;
+        default:
+            return HETGPU_ERROR_UNKNOWN;
+        }
+    }
+
+    return HETGPU_ERROR_NOT_SUPPORTED;
+}
+
+HetGPUError hetgpu_get_param_info(HetGPUState *state, HetGPUFunction function,
+                                  size_t param_index, size_t *param_offset,
+                                  size_t *param_size)
+{
+    if (!state || !state->initialized || !function || !param_offset ||
+        !param_size) {
+        return HETGPU_ERROR_INVALID_VALUE;
+    }
+
+    if (g_cuda_funcs.cuFuncGetParamInfo &&
+        state->backend != HETGPU_BACKEND_SIMULATION) {
+        cuda_lock(state);
+        int err = g_cuda_funcs.cuFuncGetParamInfo(function, param_index,
+                                                  param_offset, param_size);
+        cuda_unlock(state);
+
+        switch (err) {
+        case 0:
+            return HETGPU_SUCCESS;
+        case 1:
+            return HETGPU_ERROR_INVALID_VALUE;
+        case 400:
+            return HETGPU_ERROR_INVALID_HANDLE;
+        case 801:
+            return HETGPU_ERROR_NOT_SUPPORTED;
+        default:
+            return HETGPU_ERROR_UNKNOWN;
+        }
+    }
+
+    return HETGPU_ERROR_NOT_SUPPORTED;
 }
 
 HetGPUError hetgpu_launch_kernel(HetGPUState *state, HetGPUFunction function,

@@ -42,6 +42,8 @@ typedef enum {
     HETGPU_ERROR_LAUNCH_FAILED = 7,
     HETGPU_ERROR_INVALID_VALUE = 8,
     HETGPU_ERROR_NOT_SUPPORTED = 9,
+    HETGPU_ERROR_INVALID_HANDLE = 10,
+    HETGPU_ERROR_NOT_FOUND = 11,
     HETGPU_ERROR_UNKNOWN = 255,
 } HetGPUError;
 
@@ -400,6 +402,24 @@ void hetgpu_unload_module(HetGPUState *state, HetGPUModule module);
  */
 HetGPUError hetgpu_get_function(HetGPUState *state, HetGPUModule module,
                                 const char *name, HetGPUFunction *function);
+
+/**
+ * hetgpu_get_global - Get a device global address and size from a module
+ * @state: Initialized HetGPUState
+ * @module: Loaded module
+ * @name: Global symbol name
+ * @dev_ptr: Output device pointer
+ * @size: Output size in bytes
+ *
+ * Returns: HETGPU_SUCCESS on success
+ */
+HetGPUError hetgpu_get_global(HetGPUState *state, HetGPUModule module,
+                              const char *name, HetGPUDevicePtr *dev_ptr,
+                              size_t *size);
+
+HetGPUError hetgpu_get_param_info(HetGPUState *state, HetGPUFunction function,
+                                  size_t param_index, size_t *param_offset,
+                                  size_t *param_size);
 
 /**
  * hetgpu_launch_kernel - Launch GPU kernel

@@ -2565,6 +2565,76 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         }
         break;
 
+    case CXL_GPU_CMD_MODULE_GET_GLOBAL:
+        if (hetgpu->initialized) {
+            uint32_t module_id = ct2d->gpu_cmd.params[0];
+            if (module_id >= ct2d->gpu_cmd.num_modules) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                break;
+            }
+            if (!memchr(ct2d->gpu_cmd.data, '\0', ct2d->gpu_cmd.data_size)) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                break;
+            }
+
+            dev_ptr = 0;
+            size = 0;
+            err = hetgpu_get_global(hetgpu,
+                                    ct2d->gpu_cmd.modules[module_id],
+                                    (const char *)ct2d->gpu_cmd.data,
+                                    &dev_ptr, &size);
+            if (err == HETGPU_SUCCESS) {
+                ct2d->gpu_cmd.results[0] = dev_ptr;
+                ct2d->gpu_cmd.results[1] = size;
+            } else if (err == HETGPU_ERROR_NOT_FOUND) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_FOUND;
+            } else if (err == HETGPU_ERROR_INVALID_HANDLE) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+            } else if (err == HETGPU_ERROR_NOT_SUPPORTED) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_SUPPORTED;
+            } else if (err == HETGPU_ERROR_INVALID_CONTEXT) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_CONTEXT;
+            } else if (err == HETGPU_ERROR_INVALID_VALUE) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            } else {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_UNKNOWN;
+            }
+        } else {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
+        }
+        break;
+
+    case CXL_GPU_CMD_FUNC_GET_PARAM_INFO:
+        if (hetgpu->initialized) {
+            uint32_t func_id = ct2d->gpu_cmd.params[0];
+            size_t param_offset = 0;
+            size_t param_size = 0;
+
+            if (func_id >= ct2d->gpu_cmd.num_functions) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                break;
+            }
+            err = hetgpu_get_param_info(hetgpu,
+                                        ct2d->gpu_cmd.functions[func_id],
+                                        ct2d->gpu_cmd.params[1],
+                                        &param_offset, &param_size);
+            if (err == HETGPU_SUCCESS) {
+                ct2d->gpu_cmd.results[0] = param_offset;
+                ct2d->gpu_cmd.results[1] = param_size;
+            } else if (err == HETGPU_ERROR_INVALID_VALUE) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            } else if (err == HETGPU_ERROR_INVALID_HANDLE) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+            } else if (err == HETGPU_ERROR_NOT_SUPPORTED) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_SUPPORTED;
+            } else {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_UNKNOWN;
+            }
+        } else {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
+        }
+        break;
+
     case CXL_GPU_CMD_LAUNCH_KERNEL:
         if (hetgpu->initialized) {
             uint32_t func_id = ct2d->gpu_cmd.params[0];
@@ -2579,27 +2649,46 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 config.shared_mem_bytes = ct2d->gpu_cmd.params[4] & 0xFFFFFFFF;
                 config.stream = NULL;
 
-                /* The guest marshals argument values into consecutive 8-byte
-                 * slots. CUDA expects kernelParams[i] to point at the host
-                 * storage containing argument i; passing the slot values as
-                 * pointers makes the driver dereference GPU virtual addresses
-                 * in the QEMU process. Build the host pointer array here. */
                 uint32_t num_args = (ct2d->gpu_cmd.params[4] >> 32) & 0xFF;
-                uint64_t *arg_values = (uint64_t *)ct2d->gpu_cmd.data;
+                size_t param_extent = ct2d->gpu_cmd.params[5];
                 void *args[256];
 
-                if ((uint64_t)num_args * sizeof(*arg_values) >
-                    ct2d->gpu_cmd.data_size) {
+                if (num_args > ARRAY_SIZE(args) ||
+                    param_extent > ct2d->gpu_cmd.data_size) {
                     ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
                     break;
                 }
                 for (uint32_t i = 0; i < num_args; i++) {
-                    args[i] = &arg_values[i];
-                }
+                    size_t param_offset = 0;
+                    size_t param_size = 0;
 
-                /* knockout: each argument currently owns one 8-byte slot;
-                 * by-value kernel parameters larger than 8 bytes require a
-                 * size/offset descriptor in the BAR2 command ABI. */
+                    err = hetgpu_get_param_info(hetgpu,
+                                                ct2d->gpu_cmd.functions[func_id],
+                                                i, &param_offset, &param_size);
+                    if (err != HETGPU_SUCCESS ||
+                        param_offset > param_extent ||
+                        param_size > param_extent - param_offset) {
+                        ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                        break;
+                    }
+                    args[i] = ct2d->gpu_cmd.data + param_offset;
+                }
+                if (ct2d->gpu_cmd.cmd_result != CXL_GPU_SUCCESS) {
+                    break;
+                }
+                if (num_args < ARRAY_SIZE(args)) {
+                    size_t next_offset = 0;
+                    size_t next_size = 0;
+
+                    err = hetgpu_get_param_info(hetgpu,
+                                                ct2d->gpu_cmd.functions[func_id],
+                                                num_args, &next_offset,
+                                                &next_size);
+                    if (err != HETGPU_ERROR_INVALID_VALUE) {
+                        ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                        break;
+                    }
+                }
 
                 err = hetgpu_launch_kernel(hetgpu,
                                            ct2d->gpu_cmd.functions[func_id],
