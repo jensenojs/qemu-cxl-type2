@@ -8,7 +8,7 @@
 
 在`cxl-lab` source lock切换前，CNB `gevico.online/jensen/qemu-cxl-type2`只是candidate，GitHub `jensenojs/qemu-cxl-type2`仍是primary。迁移commit必须先进入CNB，再以相同SHA进入GitHub；双端fresh mirror验证通过后，`cxl-lab`单个cutover commit才使CNB成为primary。
 
-当前功能基线是`49b1a4e0edd7e1605975292fd62b85d2942db80b`。source迁移只证明公开heads/tags及其可达superproject对象，不证明`.gitmodules`中的16个外部仓库、QEMU build、Type-2 realization或模型正确性。局部边界见`docs/specs/cloud-source-authority.md`。
+当前功能基线是`49b1a4e0edd7e1605975292fd62b85d2942db80b`。source迁移只证明公开heads/tags及其可达superproject对象，不证明`.gitmodules`中的16个外部仓库、QEMU build、Type-2 realization或模型正确性。局部边界见`docs/specs/cloud-source-authority.md`，执行证据见`docs/evidence/cloud-source-migration.md`。
 
 ## Cloud Build Boundary
 
