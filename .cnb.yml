@@ -28,3 +28,21 @@ $:
         - name: publish QEMU Type-2 component
           script: |
             bash scripts/publish_component.sh "$PWD/.work/component/payload"
+
+  api_trigger_component_fresh_pull:
+    - git:
+        submodules: false
+        lfs: false
+      runner:
+        cpus: 2
+      docker:
+        image: docker.cnb.cool/gevico.online/jensen/cxl-lab@sha256:8732c435c97964f2ba95b42fbbcaf79b3c23feffc3b1f7683531917122f4f59e
+      services:
+        - docker
+      stages:
+        - name: fresh pull and verify QEMU Type-2 component
+          script: |
+            python3 -m unittest discover -s tests -p 'test_component_artifact.py'
+            bash scripts/pull_component.sh \
+              manifests/artifacts/qemu-cxl-type2.candidate.json \
+              "$PWD/.work/restored/qemu-cxl-type2"
