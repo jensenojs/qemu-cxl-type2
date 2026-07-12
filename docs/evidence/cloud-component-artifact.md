@@ -19,3 +19,7 @@ profile_sha256=1a0536adb54c3b64dc00187a2b78b91512f73261f99e25dd813dc9c9c864583e
 ## 证明边界
 
 该证据证明QEMU二进制可从固定源码生成，并能从新CNB任务按不可变digest恢复。`-device help`只证明设备类型已经注册。它不证明设备realize、guest节点、tiny计算、固定1.5B、Kimi或性能。
+
+## 后续组合暴露的边界
+
+CNB组合任务[`cnb-qij-1jtb6g3nl`](https://cnb.cool/gevico.online/jensen/cxl-lab/-/build/logs/cnb-qij-1jtb6g3nl)按上述digest恢复QEMU后，在guest启动前报`could not load PC BIOS 'bios-256k.bin'`。这说明单独恢复可执行文件不足以形成可启动的system-emulation输入。该digest仍证明旧单文件制品可恢复，但不能继续作为Type-2运行输入；替代制品必须加入spec冻结的三个QEMU自有firmware并重新build、发布和fresh pull。

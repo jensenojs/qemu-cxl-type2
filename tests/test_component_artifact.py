@@ -86,6 +86,20 @@ class ComponentArtifactTest(unittest.TestCase):
         self.assertEqual((output / "bin/server").read_bytes(), content)
         self.assertEqual((output / "guest/lib.so").readlink().as_posix(), "lib.so.1")
 
+    def test_qemu_profile_declares_minimal_runtime_files(self) -> None:
+        profile = json.loads(
+            (Path(__file__).resolve().parents[1] / "manifests/build-profile.json").read_text()
+        )
+        self.assertEqual(
+            profile["outputs"],
+            [
+                {"path": "bin/qemu-system-x86_64", "type": "file", "mode": "0755"},
+                {"path": "share/qemu/bios-256k.bin", "type": "file", "mode": "0644"},
+                {"path": "share/qemu/kvmvapic.bin", "type": "file", "mode": "0644"},
+                {"path": "share/qemu/linuxboot_dma.bin", "type": "file", "mode": "0644"},
+            ],
+        )
+
     def test_rejects_absolute_path(self) -> None:
         archive = self.tar("absolute.tar", lambda stream: add_file(stream, "/escape", b"x"))
         with self.assertRaises(ValueError):

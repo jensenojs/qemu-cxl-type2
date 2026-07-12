@@ -66,6 +66,23 @@ python3 "$ROOT/scripts/component_artifact.py" verify-archive \
 "$OUTPUT/bin/qemu-system-x86_64" --version >"$WORK/version.txt"
 "$OUTPUT/bin/qemu-system-x86_64" -device help >"$WORK/device-help.txt"
 grep -Fq 'cxl-type2' "$WORK/device-help.txt"
+set +e
+timeout 3 "$OUTPUT/bin/qemu-system-x86_64" \
+    -accel tcg,thread=multi \
+    -cpu max \
+    -S \
+    -display none \
+    -monitor none \
+    -serial none \
+    -nic none \
+    -vga none \
+    -m 256M \
+    -L "$OUTPUT/share/qemu" \
+    >"$WORK/paused-boot.stdout" \
+    2>"$WORK/paused-boot.stderr"
+paused_boot_rc=$?
+set -e
+[[ $paused_boot_rc -eq 124 ]]
 ldd "$OUTPUT/bin/qemu-system-x86_64" >"$WORK/qemu-ldd.txt"
 
 printf 'component_fresh_pull=pass\n'
