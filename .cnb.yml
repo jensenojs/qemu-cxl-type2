@@ -44,5 +44,5 @@ $:
           script: |
             python3 -m unittest discover -s tests -p 'test_component_artifact.py'
             bash scripts/pull_component.sh \
-              manifests/artifacts/qemu-cxl-type2.json \
+              manifests/artifacts/qemu-cxl-type2.candidate.json \
               "$PWD/.work/restored/qemu-cxl-type2"
