@@ -1,0 +1,11 @@
+$:
+  api_trigger_source_probe:
+    - git:
+        submodules: false
+        lfs: false
+      runner:
+        cpus: 2
+      stages:
+        - name: verify QEMU Type-2 source checkout
+          script: |
+            bash scripts/verify_source_checkout.sh 49b1a4e0edd7e1605975292fd62b85d2942db80b

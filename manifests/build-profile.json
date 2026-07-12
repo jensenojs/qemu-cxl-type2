@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "status": "candidate-unverified",
+  "component": "qemu-cxl-type2",
+  "target_arch": "amd64",
+  "baseline_commit": "49b1a4e0edd7e1605975292fd62b85d2942db80b",
+  "build_system": "configure+ninja",
+  "configure_args": [
+    "--target-list=x86_64-softmmu"
+  ],
+  "targets": [
+    "qemu-system-x86_64"
+  ],
+  "parallelism": 4,
+  "known_gitlinks": {
+    "subprojects/hetGPU": "67bef2966eed98a4e4cb9634f6310ed0b46d03ed"
+  },
+  "expected_outputs": [
+    {
+      "path": "build/qemu-system-x86_64",
+      "type": "file",
+      "executable": true
+    }
+  ],
+  "unresolved_before_build": [
+    "complete required gitlink set",
+    "fixed toolchain digest and system packages",
+    "runtime dynamic dependency file set",
+    "component artifact contract"
+  ]
+}
