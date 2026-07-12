@@ -9,3 +9,22 @@ $:
         - name: verify QEMU Type-2 source checkout
           script: |
             bash scripts/verify_source_checkout.sh 49b1a4e0edd7e1605975292fd62b85d2942db80b
+
+  api_trigger_component_build_publish:
+    - git:
+        submodules: false
+        lfs: false
+      runner:
+        cpus: 4
+      timeout: 12h
+      docker:
+        image: docker.cnb.cool/gevico.online/jensen/cxl-lab@sha256:8732c435c97964f2ba95b42fbbcaf79b3c23feffc3b1f7683531917122f4f59e
+      services:
+        - docker
+      stages:
+        - name: build and validate QEMU Type-2
+          script: |
+            bash scripts/build_component.sh
+        - name: publish QEMU Type-2 component
+          script: |
+            bash scripts/publish_component.sh "$PWD/.work/component/payload"

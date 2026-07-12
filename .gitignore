@@ -1,5 +1,6 @@
 /GNUmakefile
 /build/
+/.work/
 /.cache/
 /.vscode/
 *.pyc
