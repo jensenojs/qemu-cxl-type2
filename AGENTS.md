@@ -6,13 +6,13 @@
 
 ## Cloud Source Authority
 
-在`cxl-lab` source lock切换前，CNB `gevico.online/jensen/qemu-cxl-type2`只是candidate，GitHub `jensenojs/qemu-cxl-type2`仍是primary。迁移commit必须先进入CNB，再以相同SHA进入GitHub；双端fresh mirror验证通过后，`cxl-lab`单个cutover commit才使CNB成为primary。
+CNB `gevico.online/jensen/qemu-cxl-type2`是source primary，GitHub `jensenojs/qemu-cxl-type2`保存同SHA公开mirror。新commit先进入CNB，再以相同SHA进入GitHub；`cxl-lab`的有效控制ref只消费已经同步到两端的exact source。
 
 当前功能基线是`49b1a4e0edd7e1605975292fd62b85d2942db80b`。source迁移只证明公开heads/tags及其可达superproject对象，不证明`.gitmodules`中的16个外部仓库、QEMU build、Type-2 realization或模型正确性。局部边界见`docs/specs/cloud-source-authority.md`，执行证据见`docs/evidence/cloud-source-migration.md`。
 
 ## Cloud Build Boundary
 
-`manifests/build-profile.json`只保存当前已验证本地入口的候选形状：`configure --target-list=x86_64-softmmu`和`ninja qemu-system-x86_64`。真实CNB build前必须确认`subprojects/hetGPU@67bef2966eed98a4e4cb9634f6310ed0b46d03ed`及其他实际依赖；不得把候选profile称为已验证artifact合同。
+`manifests/build-profile.json`已经由CNB exact source和固定工具链验证：只恢复`subprojects/hetGPU@67bef2966eed98a4e4cb9634f6310ed0b46d03ed`，执行`configure --target-list=x86_64-softmmu`和`ninja qemu-system-x86_64`。正式payload保存binary和串口Type-2运行实际读取的三个firmware；完整身份见`manifests/artifacts/qemu-cxl-type2.json`。
 
 工具链缺口在`cxl-lab/.ide/Dockerfile`从固定digest派生最小增量层。组件feature、configure参数和输出shape只在本仓profile/spec中决定。source probe不允许fetch、初始化submodule、build或修改checkout。
 
@@ -28,6 +28,8 @@
 - candidate local configure: `mkdir -p build && cd build && ../configure --target-list=x86_64-softmmu`
 - candidate local build: `ninja -j2 qemu-system-x86_64`
 - device presence: `build/qemu-system-x86_64 -device help | grep -i cxl-type2`
+- CNB build/publish: event `api_trigger_component_build_publish`
+- CNB fresh pull: event `api_trigger_component_fresh_pull`
 
 完整QEMU build应在CNB exact SHA和冻结toolchain上执行。本机若为调试必须复用现有build目录并限制并行，不能把本地结果传播为CNB artifact证据。
 
