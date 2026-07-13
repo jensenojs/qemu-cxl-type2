@@ -104,6 +104,17 @@ printf 'component_publish=pass\n'
 printf 'artifact_reference=%s@%s\n' "$REPOSITORY" "$digest"
 printf 'archive_sha256=%s\n' "$archive_sha256"
 printf 'manifest_sha256=%s\n' "$manifest_sha256"
-printf '%s\n' '=== COMPONENT_CANDIDATE_JSON_BEGIN ==='
-cat "$WORK/candidate.json"
-printf '%s\n' '=== COMPONENT_CANDIDATE_JSON_END ==='
+printf '%s\n' '=== CNB_OUTPUT_BEGIN component-candidate ==='
+python3 - "$WORK/candidate.json" <<'PY'
+import json, sys
+candidate=json.load(open(sys.argv[1]))
+json.dump({
+    "schema_version":1,
+    "name":"component-candidate",
+    "kind":"component-candidate",
+    "transport":"inline-json",
+    "payload":candidate,
+},sys.stdout,indent=2,sort_keys=True)
+print()
+PY
+printf '%s\n' '=== CNB_OUTPUT_END component-candidate ==='
