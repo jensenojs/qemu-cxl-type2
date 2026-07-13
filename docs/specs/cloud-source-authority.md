@@ -1,3 +1,7 @@
+---
+status: completed
+---
+
 # QEMU CXL Type-2 云端源码权威
 
 ## 目标与证据层

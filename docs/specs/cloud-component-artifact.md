@@ -1,3 +1,7 @@
+---
+status: completed
+---
+
 # QEMU Type-2组件制品
 
 ## 目标
