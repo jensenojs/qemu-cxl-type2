@@ -12,6 +12,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/cutils.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
@@ -738,7 +739,12 @@ int cxl_type2_hetgpu_init(CXLType2State *ct2d, Error **errp)
     fflush(stderr);
 
     /* Initialize hetGPU */
-    err = hetgpu_init(hetgpu,
+    err = ct2d->paired_case.required ?
+          hetgpu_init_formal(hetgpu,
+                             ct2d->gpu_info.hetgpu_backend,
+                             ct2d->gpu_info.hetgpu_device_index,
+                             lib_path) :
+          hetgpu_init(hetgpu,
                       ct2d->gpu_info.hetgpu_backend,
                       ct2d->gpu_info.hetgpu_device_index,
                       lib_path);
@@ -980,6 +986,11 @@ int cxl_type2_gpu_init(CXLType2State *ct2d, Error **errp)
             fprintf(stderr, "CXL Type2: hetGPU backend initialized successfully\n");
             fflush(stderr);
             return 0;
+        }
+        if (ct2d->paired_case.required) {
+            qemu_log("CXL Type2: formal paired mode rejects hetGPU "
+                     "initialization failure\n");
+            return -1;
         }
         /* Fall through to VFIO or simulation if hetGPU fails */
         fprintf(stderr, "CXL Type2: hetGPU init failed, trying fallback\n");
@@ -2249,6 +2260,317 @@ static int cxl_coherent_pool_free(CXLType2State *ct2d, uint64_t offset)
  * GPU Command Interface
  * ======================================================================== */
 
+static const char *cxl_type2_paired_case_name(uint32_t case_kind)
+{
+    switch (case_kind) {
+    case CXL_GPU_CASE_BASELINE:
+        return "baseline";
+    case CXL_GPU_CASE_CONCORDIA:
+        return "concordia";
+    default:
+        return "invalid";
+    }
+}
+
+static bool cxl_type2_command_requires_formal_case(uint32_t cmd)
+{
+    switch (cmd) {
+    case CXL_GPU_CMD_NOP:
+    case CXL_GPU_CMD_INIT:
+    case CXL_GPU_CMD_GET_DEVICE_COUNT:
+    case CXL_GPU_CMD_GET_DEVICE:
+    case CXL_GPU_CMD_GET_DEVICE_NAME:
+    case CXL_GPU_CMD_GET_DEVICE_PROPS:
+    case CXL_GPU_CMD_GET_TOTAL_MEM:
+    case CXL_GPU_CMD_CASE_BEGIN:
+    case CXL_GPU_CMD_CASE_END:
+        return false;
+    default:
+        return true;
+    }
+}
+
+static void cxl_type2_clear_gpu_handles(CXLType2State *ct2d)
+{
+    memset(ct2d->gpu_cmd.modules, 0, sizeof(ct2d->gpu_cmd.modules));
+    memset(ct2d->gpu_cmd.functions, 0, sizeof(ct2d->gpu_cmd.functions));
+    ct2d->gpu_cmd.num_modules = 0;
+    ct2d->gpu_cmd.num_functions = 0;
+}
+
+static uint64_t cxl_type2_paired_config_binding(
+    CXLType2State *ct2d, uint32_t case_kind, const char *aof_path,
+    const char *restore_path, const char *manifest_path)
+{
+    g_autofree char *identity = g_strdup_printf(
+        "kimi-case-config-v1\ncase=%u\nenabled=%u\nrestore=0\n"
+        "min-allocation=%" PRIu64 "\nmax-regions=%" PRIu64
+        "\ncheckpoint-every=%" PRIu64 "\nlogs=%u\naof=%s\n"
+        "restore-aof=%s\nmanifest=%s\n",
+        case_kind, case_kind == CXL_GPU_CASE_CONCORDIA,
+        ct2d->paired_case.min_allocation_bytes,
+        ct2d->paired_case.max_regions,
+        ct2d->paired_case.checkpoint_every_launches,
+        ct2d->paired_case.logs_enabled, aof_path, restore_path,
+        manifest_path);
+    g_autofree char *digest = g_compute_checksum_for_string(
+        G_CHECKSUM_SHA256, identity, -1);
+    char prefix[17];
+    uint64_t binding;
+
+    memcpy(prefix, digest, 16);
+    prefix[16] = '\0';
+    if (qemu_strtou64(prefix, NULL, 16, &binding) < 0) {
+        return 1;
+    }
+    return binding ? binding : 1;
+}
+
+static HetGPUError cxl_type2_reset_formal_backend(CXLType2State *ct2d)
+{
+    HetGPUState *hetgpu = &ct2d->gpu_info.hetgpu_state;
+    HetGPUError error;
+
+    cxl_type2_clear_gpu_handles(ct2d);
+    error = hetgpu_reset_formal(hetgpu, HETGPU_BACKEND_NVIDIA,
+                                ct2d->gpu_info.hetgpu_device_index,
+                                ct2d->gpu_info.hetgpu_lib_path);
+    if (error != HETGPU_SUCCESS) {
+        return error;
+    }
+    if (!hetgpu->initialized || hetgpu->backend != HETGPU_BACKEND_NVIDIA ||
+        !hetgpu->context || !hetgpu->formal_case_strict ||
+        !hetgpu->kimi_case_begin_v1 || !hetgpu->kimi_case_end_v1) {
+        qemu_log("CXL Type2: formal backend identity incomplete "
+                 "initialized=%d backend=%u context=%p begin=%p end=%p\n",
+                 hetgpu->initialized, hetgpu->backend, hetgpu->context,
+                 hetgpu->kimi_case_begin_v1, hetgpu->kimi_case_end_v1);
+        return HETGPU_ERROR_INVALID_CONTEXT;
+    }
+
+    hetgpu_set_coherency_callback(hetgpu,
+                                  cxl_type2_hetgpu_coherency_callback,
+                                  ct2d);
+    ct2d->gpu_info.passthrough_enabled = true;
+    ct2d->gpu_info.gpu_mem_size = hetgpu->props.total_memory;
+    return HETGPU_SUCCESS;
+}
+
+static void cxl_type2_paired_case_begin(CXLType2State *ct2d,
+                                        uint64_t trace_sequence)
+{
+    HetGPUState *hetgpu = &ct2d->gpu_info.hetgpu_state;
+    uint32_t protocol = ct2d->gpu_cmd.params[0];
+    uint32_t case_kind = ct2d->gpu_cmd.params[1];
+    uint64_t run_binding = ct2d->gpu_cmd.params[2];
+    uint64_t flags = ct2d->gpu_cmd.params[3];
+    uint64_t epoch = ct2d->paired_case.next_epoch;
+    const char *case_name = cxl_type2_paired_case_name(case_kind);
+    g_autofree char *case_dir_name = NULL;
+    g_autofree char *case_dir = NULL;
+    g_autofree char *aof_path = NULL;
+    g_autofree char *restore_path = NULL;
+    g_autofree char *manifest_path = NULL;
+    HetGPUKimiCaseBeginV1 input = { 0 };
+    HetGPUKimiCaseResultV1 result = { 0 };
+    HetGPUError error;
+    uint64_t config_binding;
+
+    memset(ct2d->gpu_cmd.results, 0, sizeof(ct2d->gpu_cmd.results));
+    if (!ct2d->paired_case.required) {
+        ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_SUPPORTED;
+        return;
+    }
+    if (ct2d->paired_case.failed) {
+        ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_DEINITIALIZED;
+        return;
+    }
+    if (protocol != CXL_GPU_CASE_PROTOCOL_VERSION || flags != 0 ||
+        (case_kind != CXL_GPU_CASE_BASELINE &&
+         case_kind != CXL_GPU_CASE_CONCORDIA) ||
+        run_binding != ct2d->paired_case.run_binding ||
+        ct2d->paired_case.active_case != CXL_GPU_CASE_NONE) {
+        ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+        return;
+    }
+
+    case_dir_name = g_strdup_printf("%" PRIu64 "-%s", epoch, case_name);
+    case_dir = g_build_filename(ct2d->paired_case.run_root, "cases",
+                                case_dir_name, NULL);
+    if (g_mkdir_with_parents(case_dir, 0700) != 0) {
+        qemu_log("CXL Type2: create paired case directory %s failed: %s\n",
+                 case_dir, strerror(errno));
+        ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_UNKNOWN;
+        return;
+    }
+    aof_path = g_build_filename(case_dir, "kimi.aof", NULL);
+    restore_path = g_build_filename(case_dir, "restore.aof", NULL);
+    manifest_path = g_build_filename(case_dir, "kimi.manifest.json", NULL);
+    config_binding = cxl_type2_paired_config_binding(
+        ct2d, case_kind, aof_path, restore_path, manifest_path);
+
+    error = cxl_type2_reset_formal_backend(ct2d);
+    if (error != HETGPU_SUCCESS) {
+        ct2d->paired_case.failed = true;
+        ct2d->paired_case.failure_code = error;
+        ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_CONTEXT;
+        return;
+    }
+
+    input.abi_version = HETGPU_KIMI_CASE_ABI_VERSION;
+    input.struct_size = sizeof(input);
+    input.case_kind = case_kind;
+    input.epoch = epoch;
+    input.run_binding = run_binding;
+    input.config_binding = config_binding;
+    input.min_allocation_bytes = ct2d->paired_case.min_allocation_bytes;
+    input.max_regions = ct2d->paired_case.max_regions;
+    input.checkpoint_every_launches =
+        ct2d->paired_case.checkpoint_every_launches;
+    input.enabled = case_kind == CXL_GPU_CASE_CONCORDIA;
+    input.logs_enabled = ct2d->paired_case.logs_enabled;
+    input.aof_path = (const uint8_t *)aof_path;
+    input.aof_path_len = strlen(aof_path);
+    input.restore_aof_path = (const uint8_t *)restore_path;
+    input.restore_aof_path_len = strlen(restore_path);
+    input.manifest_path = (const uint8_t *)manifest_path;
+    input.manifest_path_len = strlen(manifest_path);
+
+    error = hetgpu_kimi_case_begin(hetgpu, &input, &result);
+    if (error != HETGPU_SUCCESS ||
+        result.abi_version != HETGPU_KIMI_CASE_ABI_VERSION ||
+        result.struct_size != sizeof(result) ||
+        result.outcome != HETGPU_KIMI_CASE_SUCCEEDED ||
+        result.case_kind != case_kind || result.epoch != epoch ||
+        result.run_binding != run_binding ||
+        result.config_binding != config_binding) {
+        HetGPUError cleanup_error;
+
+        qemu_log("CXL Type2: Concordia case begin failed error=%u "
+                 "outcome=%u reason=%u detail=%.*s\n",
+                 error, result.outcome, result.reason,
+                 (int)MIN(result.error_len, HETGPU_KIMI_CASE_ERROR_BYTES),
+                 result.error);
+        cleanup_error = hetgpu_cleanup_formal(hetgpu);
+        if (cleanup_error != HETGPU_SUCCESS) {
+            qemu_log("CXL Type2: cleanup after failed case begin also "
+                     "failed: %u\n",
+                     cleanup_error);
+        }
+        cxl_type2_clear_gpu_handles(ct2d);
+        ct2d->gpu_info.passthrough_enabled = false;
+        ct2d->paired_case.failed = true;
+        ct2d->paired_case.failure_code = error != HETGPU_SUCCESS ?
+                                         error :
+                                         result.reason ? result.reason :
+                                         HETGPU_ERROR_UNKNOWN;
+        ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_UNKNOWN;
+        return;
+    }
+
+    ct2d->paired_case.active_case = case_kind;
+    ct2d->paired_case.active_epoch = epoch;
+    ct2d->paired_case.active_first_sequence = trace_sequence;
+    ct2d->paired_case.active_config_binding = config_binding;
+    ct2d->paired_case.next_epoch++;
+    ct2d->gpu_cmd.results[0] = epoch;
+    ct2d->gpu_cmd.results[1] = case_kind;
+    ct2d->gpu_cmd.results[2] = trace_sequence;
+    ct2d->gpu_cmd.results[3] = config_binding;
+    qemu_log("KIMI_CASE_BEGIN run_binding=%" PRIu64 " case=%s epoch=%" PRIu64
+             " first_sequence=%" PRIu64 " config_binding=%" PRIu64
+             " gpu_backend=%s\n",
+             run_binding, case_name, epoch, trace_sequence, config_binding,
+             hetgpu_get_backend_name(hetgpu->backend));
+}
+
+static void cxl_type2_paired_case_end(CXLType2State *ct2d,
+                                      uint64_t trace_sequence)
+{
+    HetGPUState *hetgpu = &ct2d->gpu_info.hetgpu_state;
+    uint32_t protocol = ct2d->gpu_cmd.params[0];
+    uint64_t expected_epoch = ct2d->gpu_cmd.params[1];
+    int32_t application_exit = (int32_t)ct2d->gpu_cmd.params[2];
+    uint64_t run_binding = ct2d->gpu_cmd.params[3];
+    uint64_t epoch = ct2d->paired_case.active_epoch;
+    uint32_t case_kind = ct2d->paired_case.active_case;
+    HetGPUKimiCaseEndV1 input = { 0 };
+    HetGPUKimiCaseResultV1 result = { 0 };
+    HetGPUError sync_error;
+    HetGPUError concordia_error;
+    HetGPUError reset_error;
+    bool result_valid;
+
+    memset(ct2d->gpu_cmd.results, 0, sizeof(ct2d->gpu_cmd.results));
+    if (!ct2d->paired_case.required) {
+        ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_SUPPORTED;
+        return;
+    }
+    if (protocol != CXL_GPU_CASE_PROTOCOL_VERSION ||
+        case_kind == CXL_GPU_CASE_NONE || expected_epoch != epoch ||
+        run_binding != ct2d->paired_case.run_binding) {
+        ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+        return;
+    }
+
+    sync_error = hetgpu_synchronize(hetgpu);
+    input.abi_version = HETGPU_KIMI_CASE_ABI_VERSION;
+    input.struct_size = sizeof(input);
+    input.epoch = epoch;
+    input.run_binding = run_binding;
+    input.config_binding = ct2d->paired_case.active_config_binding;
+    input.application_exit = application_exit;
+    concordia_error = hetgpu_kimi_case_end(hetgpu, &input, &result);
+    reset_error = hetgpu_cleanup_formal(hetgpu);
+    result_valid = result.abi_version == HETGPU_KIMI_CASE_ABI_VERSION &&
+                   result.struct_size == sizeof(result) &&
+                   result.outcome == HETGPU_KIMI_CASE_SUCCEEDED &&
+                   result.case_kind == case_kind && result.epoch == epoch &&
+                   result.run_binding == run_binding &&
+                   result.config_binding == input.config_binding;
+    cxl_type2_clear_gpu_handles(ct2d);
+    ct2d->gpu_info.passthrough_enabled = false;
+
+    ct2d->gpu_cmd.results[0] = epoch;
+    ct2d->gpu_cmd.results[1] = trace_sequence;
+    ct2d->gpu_cmd.results[2] = result.outcome;
+    ct2d->gpu_cmd.results[3] = reset_error;
+
+    qemu_log("KIMI_CASE_END run_binding=%" PRIu64 " case=%s epoch=%" PRIu64
+             " last_sequence=%" PRIu64 " app_exit=%d sync_status=%u"
+             " concordia_status=%u concordia_reason=%u reset_status=%u detail=%.*s\n",
+             run_binding, cxl_type2_paired_case_name(case_kind), epoch,
+             trace_sequence, application_exit, sync_error, result.outcome,
+             result.reason, reset_error,
+             (int)MIN(result.error_len, HETGPU_KIMI_CASE_ERROR_BYTES),
+             result.error);
+
+    ct2d->paired_case.active_case = CXL_GPU_CASE_NONE;
+    ct2d->paired_case.active_epoch = 0;
+    ct2d->paired_case.active_first_sequence = 0;
+    ct2d->paired_case.active_config_binding = 0;
+
+    if (application_exit != 0 || sync_error != HETGPU_SUCCESS ||
+        concordia_error != HETGPU_SUCCESS || !result_valid ||
+        reset_error != HETGPU_SUCCESS) {
+        ct2d->paired_case.failed = true;
+        if (application_exit != 0) {
+            ct2d->paired_case.failure_code = (uint32_t)application_exit;
+        } else if (sync_error != HETGPU_SUCCESS) {
+            ct2d->paired_case.failure_code = sync_error;
+        } else if (concordia_error != HETGPU_SUCCESS) {
+            ct2d->paired_case.failure_code = concordia_error;
+        } else if (!result_valid) {
+            ct2d->paired_case.failure_code = result.reason ?
+                                             result.reason :
+                                             HETGPU_ERROR_UNKNOWN;
+        } else {
+            ct2d->paired_case.failure_code = reset_error;
+        }
+        ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_UNKNOWN;
+    }
+}
+
 static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
 {
     HetGPUState *hetgpu = &ct2d->gpu_info.hetgpu_state;
@@ -2270,6 +2592,18 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
 
     ct2d->gpu_cmd.cmd_status = CXL_GPU_CMD_STATUS_RUNNING;
     ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+
+    if (ct2d->paired_case.required && ct2d->paired_case.failed) {
+        ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_DEINITIALIZED;
+        goto complete;
+    }
+
+    if (ct2d->paired_case.required &&
+        cxl_type2_command_requires_formal_case(cmd) &&
+        ct2d->paired_case.active_case == CXL_GPU_CASE_NONE) {
+        ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_READY;
+        goto complete;
+    }
 
     switch (cmd) {
     case CXL_GPU_CMD_NOP:
@@ -2319,6 +2653,14 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         } else {
             ct2d->gpu_cmd.results[0] = ct2d->device_mem_size;
         }
+        break;
+
+    case CXL_GPU_CMD_CASE_BEGIN:
+        cxl_type2_paired_case_begin(ct2d, trace_sequence);
+        break;
+
+    case CXL_GPU_CMD_CASE_END:
+        cxl_type2_paired_case_end(ct2d, trace_sequence);
         break;
 
     case CXL_GPU_CMD_CTX_CREATE:
@@ -3226,6 +3568,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         break;
     }
 
+complete:
     ct2d->gpu_cmd.cmd_status = CXL_GPU_CMD_STATUS_COMPLETE;
     int64_t trace_duration_ns =
         qemu_clock_get_ns(QEMU_CLOCK_HOST) - trace_start_ns;
@@ -3580,6 +3923,33 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
         ct2d->device_mem_size = CXL_TYPE2_DEFAULT_MEM_SIZE;
     }
 
+    if (ct2d->paired_case.required) {
+        if (!ct2d->paired_case.run_root ||
+            ct2d->paired_case.run_root[0] != '/' ||
+            ct2d->paired_case.run_binding == 0) {
+            error_setg(errp, "paired case control requires absolute "
+                       "paired-run-root and nonzero paired-run-binding");
+            return;
+        }
+        if (ct2d->gpu_info.mode != CXL_TYPE2_GPU_MODE_HETGPU ||
+            ct2d->gpu_info.hetgpu_backend != HETGPU_BACKEND_NVIDIA ||
+            !ct2d->gpu_info.hetgpu_lib_path ||
+            ct2d->gpu_info.hetgpu_lib_path[0] != '/') {
+            error_setg(errp, "paired case control requires exact hetGPU "
+                       "mode, NVIDIA backend, and absolute hetgpu-lib");
+            return;
+        }
+        if (ct2d->paired_case.min_allocation_bytes < 4096 ||
+            ct2d->paired_case.max_regions == 0 ||
+            ct2d->paired_case.checkpoint_every_launches == 0) {
+            error_setg(errp, "paired case Concordia limits must be nonzero "
+                       "and min allocation at least 4096 bytes");
+            return;
+        }
+        ct2d->paired_case.next_epoch = 1;
+        ct2d->paired_case.active_case = CXL_GPU_CASE_NONE;
+    }
+
     if (ct2d->hdmdb && !ct2d->flitmode) {
         error_setg(errp, "hdm-db requires operating in 256B flit mode");
         return;
@@ -3827,6 +4197,20 @@ static const Property cxl_type2_props[] = {
     DEFINE_PROP_INT32("hetgpu-device", CXLType2State, gpu_info.hetgpu_device_index, 0),
     DEFINE_PROP_UINT32("hetgpu-backend", CXLType2State, gpu_info.hetgpu_backend,
                        HETGPU_BACKEND_AUTO),
+    DEFINE_PROP_BOOL("paired-case-control", CXLType2State,
+                     paired_case.required, false),
+    DEFINE_PROP_STRING("paired-run-root", CXLType2State,
+                       paired_case.run_root),
+    DEFINE_PROP_UINT64("paired-run-binding", CXLType2State,
+                       paired_case.run_binding, 0),
+    DEFINE_PROP_UINT64("paired-kimi-min-allocation-bytes", CXLType2State,
+                       paired_case.min_allocation_bytes, 1ULL << 20),
+    DEFINE_PROP_UINT64("paired-kimi-max-regions", CXLType2State,
+                       paired_case.max_regions, 128),
+    DEFINE_PROP_UINT64("paired-kimi-checkpoint-every", CXLType2State,
+                       paired_case.checkpoint_every_launches, 1),
+    DEFINE_PROP_BOOL("paired-kimi-logs", CXLType2State,
+                     paired_case.logs_enabled, true),
     DEFINE_PROP_BOOL("dcd", CXLType2State, dcd.enabled, false),
     DEFINE_PROP_SIZE("dcd-granularity", CXLType2State, dcd.granularity,
                      CXL_TYPE2_DCD_DEFAULT_GRANULARITY),

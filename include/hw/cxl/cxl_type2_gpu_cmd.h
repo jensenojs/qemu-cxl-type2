@@ -74,6 +74,14 @@
 #define CXL_GPU_MAGIC               0x43584C32  /* "CXL2" */
 #define CXL_GPU_VERSION             0x00010000  /* v1.0.0 */
 
+#define CXL_GPU_CASE_PROTOCOL_VERSION 1U
+
+typedef enum {
+    CXL_GPU_CASE_NONE = 0,
+    CXL_GPU_CASE_BASELINE = 1,
+    CXL_GPU_CASE_CONCORDIA = 2,
+} CXLGPUPairedCase;
+
 /* Device status bits */
 #define CXL_GPU_STATUS_READY        (1 << 0)
 #define CXL_GPU_STATUS_BUSY         (1 << 1)
@@ -96,6 +104,8 @@ typedef enum {
     CXL_GPU_CMD_GET_DEVICE_NAME = 0x04,
     CXL_GPU_CMD_GET_DEVICE_PROPS= 0x05,
     CXL_GPU_CMD_GET_TOTAL_MEM   = 0x06,
+    CXL_GPU_CMD_CASE_BEGIN      = 0x08,
+    CXL_GPU_CMD_CASE_END        = 0x09,
 
     CXL_GPU_CMD_CTX_CREATE      = 0x10,
     CXL_GPU_CMD_CTX_DESTROY     = 0x11,

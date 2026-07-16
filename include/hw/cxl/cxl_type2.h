@@ -215,6 +215,23 @@ typedef struct CXLType2State {
         uint32_t capabilities;         /* Device capabilities (bulk transfer, etc.) */
     } gpu_cmd;
 
+    struct {
+        bool required;
+        char *run_root;
+        uint64_t run_binding;
+        uint64_t min_allocation_bytes;
+        uint64_t max_regions;
+        uint64_t checkpoint_every_launches;
+        bool logs_enabled;
+        uint64_t next_epoch;
+        bool failed;
+        uint32_t failure_code;
+        uint32_t active_case;
+        uint64_t active_epoch;
+        uint64_t active_first_sequence;
+        uint64_t active_config_binding;
+    } paired_case;
+
     /* Bulk transfer region for large memory operations */
     MemoryRegion bulk_transfer_region;
     void *bulk_transfer_ptr;           /* Mapped pointer for bulk transfers */
