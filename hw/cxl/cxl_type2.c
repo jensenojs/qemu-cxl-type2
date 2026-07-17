@@ -30,6 +30,7 @@
 #include "hw/cxl/cxl_type2.h"
 #include "hw/cxl/cxl_hetgpu.h"
 #include "hw/cxl/cxl_type2_gpu_cmd.h"
+#include "hw/cxl/cxl_type2_cuda_contract.h"
 #include "hw/cxl/cxl_type2_coherency.h"
 #include "hw/pci/pci.h"
 #include "hw/pci/pcie.h"
@@ -2282,12 +2283,40 @@ static bool cxl_type2_command_requires_formal_case(uint32_t cmd)
     case CXL_GPU_CMD_GET_DEVICE_NAME:
     case CXL_GPU_CMD_GET_DEVICE_PROPS:
     case CXL_GPU_CMD_GET_TOTAL_MEM:
+    case CXL_GPU_CMD_GET_DEVICE_ATTRIBUTE:
     case CXL_GPU_CMD_CASE_BEGIN:
     case CXL_GPU_CMD_CASE_END:
         return false;
     default:
         return true;
     }
+}
+
+typedef struct CXLType2CudaAttributeRequest {
+    HetGPUState *hetgpu;
+    int value;
+} CXLType2CudaAttributeRequest;
+
+typedef struct CXLType2CudaMemInfoRequest {
+    HetGPUState *hetgpu;
+    size_t free_bytes;
+    size_t total_bytes;
+} CXLType2CudaMemInfoRequest;
+
+static int cxl_type2_cuda_query_attribute(void *opaque, int32_t attribute)
+{
+    CXLType2CudaAttributeRequest *request = opaque;
+
+    return hetgpu_cuda_device_get_attribute(request->hetgpu, attribute,
+                                            &request->value);
+}
+
+static int cxl_type2_cuda_query_mem_info(void *opaque)
+{
+    CXLType2CudaMemInfoRequest *request = opaque;
+
+    return hetgpu_cuda_mem_get_info(request->hetgpu, &request->free_bytes,
+                                    &request->total_bytes);
 }
 
 static void cxl_type2_clear_gpu_handles(CXLType2State *ct2d)
@@ -2648,10 +2677,56 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         break;
 
     case CXL_GPU_CMD_GET_TOTAL_MEM:
-        if (hetgpu->initialized) {
-            ct2d->gpu_cmd.results[0] = hetgpu->props.total_memory;
-        } else {
-            ct2d->gpu_cmd.results[0] = ct2d->device_mem_size;
+        memset(ct2d->gpu_cmd.results, 0, sizeof(ct2d->gpu_cmd.results));
+        if (!hetgpu->initialized) {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
+            break;
+        }
+        {
+            size_t total_bytes = 0;
+            int cuda_result = hetgpu_cuda_device_total_memory(hetgpu,
+                                                                &total_bytes);
+            ct2d->gpu_cmd.cmd_result = cuda_result;
+            if (cuda_result == CXL_GPU_SUCCESS) {
+                ct2d->gpu_cmd.results[0] = total_bytes;
+            }
+            qemu_log("CXL TYPE2 CUDA total_mem driver_result=%d total=%zu\n",
+                     cuda_result, total_bytes);
+        }
+        break;
+
+    case CXL_GPU_CMD_GET_DEVICE_ATTRIBUTE:
+        memset(ct2d->gpu_cmd.results, 0, sizeof(ct2d->gpu_cmd.results));
+        {
+            CXLType2CudaAttributeRequest request = {
+                .hetgpu = hetgpu,
+            };
+            int cuda_result;
+
+            if (!cxl_type2_cuda_attribute_wire_is_valid(
+                    ct2d->gpu_cmd.params[0])) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                break;
+            }
+            if (!hetgpu->initialized) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
+                break;
+            }
+            if (!cxl_type2_cuda_dispatch_attribute(
+                    ct2d->gpu_cmd.params[0], cxl_type2_cuda_query_attribute,
+                    &request, &cuda_result)) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                break;
+            }
+            ct2d->gpu_cmd.cmd_result = cuda_result;
+            if (cuda_result == CXL_GPU_SUCCESS) {
+                ct2d->gpu_cmd.results[0] =
+                    (uint64_t)(int64_t)(int32_t)request.value;
+            }
+            qemu_log("CXL TYPE2 CUDA device_attribute attribute=%d "
+                     "driver_result=%d value=%d\n",
+                     (int)(int32_t)ct2d->gpu_cmd.params[0], cuda_result,
+                     request.value);
         }
         break;
 
@@ -2666,8 +2741,8 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
     case CXL_GPU_CMD_CTX_CREATE:
         if (hetgpu->initialized) {
             err = hetgpu_create_context(hetgpu);
-            if (err == HETGPU_SUCCESS) {
-                ct2d->gpu_cmd.results[0] = (uint64_t)(uintptr_t)hetgpu->context;
+            if (err == HETGPU_SUCCESS && ct2d->paired_case.active_epoch != 0) {
+                ct2d->gpu_cmd.results[0] = ct2d->paired_case.active_epoch;
             } else {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_CONTEXT;
             }
@@ -2686,6 +2761,36 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             if (err != HETGPU_SUCCESS) {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_UNKNOWN;
             }
+        }
+        break;
+
+    case CXL_GPU_CMD_MEM_GET_INFO:
+        memset(ct2d->gpu_cmd.results, 0, sizeof(ct2d->gpu_cmd.results));
+        {
+            CXLType2CudaMemInfoRequest request = {
+                .hetgpu = hetgpu,
+            };
+            int cuda_result;
+
+            if (!cxl_type2_cuda_dispatch_mem_info(
+                    ct2d->paired_case.active_case != CXL_GPU_CASE_NONE,
+                    hetgpu->context != NULL, ct2d->gpu_cmd.params[0],
+                    ct2d->paired_case.active_epoch,
+                    cxl_type2_cuda_query_mem_info, &request, &cuda_result)) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_CONTEXT;
+                break;
+            }
+            ct2d->gpu_cmd.cmd_result = cuda_result;
+            if (cuda_result == CXL_GPU_SUCCESS) {
+                ct2d->gpu_cmd.results[0] = request.free_bytes;
+                ct2d->gpu_cmd.results[1] = request.total_bytes;
+            }
+            qemu_log("CXL TYPE2 CUDA mem_info token=%" PRIu64
+                     " active_epoch=%" PRIu64 " active_case=%u "
+                     "live_context=%u driver_result=%d free=%zu total=%zu\n",
+                     ct2d->gpu_cmd.params[0], ct2d->paired_case.active_epoch,
+                     ct2d->paired_case.active_case, hetgpu->context != NULL,
+                     cuda_result, request.free_bytes, request.total_bytes);
         }
         break;
 
@@ -3629,22 +3734,8 @@ static uint64_t cxl_type2_gpu_cmd_read(void *opaque, hwaddr addr, unsigned size)
         value = ct2d->gpu_cmd.results[3];
         break;
     case CXL_GPU_REG_TOTAL_MEM:
-        if (ct2d->dcd.enabled) {
-            value = ct2d->dcd.allocated;
-        } else if (hetgpu->initialized && hetgpu->props.total_memory > 0) {
-            value = hetgpu->props.total_memory;
-        } else {
-            value = ct2d->device_mem_size;
-        }
-        // fprintf(stderr, "CXL GPU: read TOTAL_MEM = 0x%lx (%lu MB)\n",
-        //         (unsigned long)value, (unsigned long)(value / (1024*1024)));
-        break;
     case CXL_GPU_REG_FREE_MEM:
-        if (ct2d->dcd.enabled) {
-            value = ct2d->device_mem_size - ct2d->dcd.allocated;
-        } else {
-            value = ct2d->device_mem_size;
-        }
+        value = 0;
         break;
     case CXL_GPU_REG_CC_MAJOR:
         value = hetgpu->initialized ? hetgpu->props.compute_capability_major : 8;

@@ -45,6 +45,7 @@ typedef int (*cuDeviceGet_fn)(int *, int);
 typedef int (*cuDeviceGetName_fn)(char *, int, int);
 typedef int (*cuDeviceTotalMem_fn)(size_t *, int);
 typedef int (*cuDeviceGetAttribute_fn)(int *, int, int);
+typedef int (*cuMemGetInfo_fn)(size_t *, size_t *);
 typedef int (*cuCtxCreate_fn)(void **, unsigned int, int);
 typedef int (*cuCtxDestroy_fn)(void *);
 typedef int (*cuCtxSynchronize_fn)(void);
@@ -78,6 +79,11 @@ typedef int (*cuGetErrorName_fn)(int, const char **);
 #define CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR 75
 #define CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR 76
 
+#define CUDA_SUCCESS 0
+#define CUDA_ERROR_INVALID_VALUE 1
+#define CUDA_ERROR_NOT_INITIALIZED 3
+#define CUDA_ERROR_INVALID_CONTEXT 201
+
 /* Loaded function pointers */
 static struct {
     cuInit_fn cuInit;
@@ -86,6 +92,7 @@ static struct {
     cuDeviceGetName_fn cuDeviceGetName;
     cuDeviceTotalMem_fn cuDeviceTotalMem;
     cuDeviceGetAttribute_fn cuDeviceGetAttribute;
+    cuMemGetInfo_fn cuMemGetInfo;
     cuCtxCreate_fn cuCtxCreate;
     cuCtxDestroy_fn cuCtxDestroy;
     cuCtxSynchronize_fn cuCtxSynchronize;
@@ -207,6 +214,7 @@ static HetGPUError hetgpu_init_internal(HetGPUState *state,
             g_cuda_funcs.cuDeviceGetName = dlsym(g_cuda_lib_handle, "cuDeviceGetName");
             g_cuda_funcs.cuDeviceTotalMem = dlsym(g_cuda_lib_handle, "cuDeviceTotalMem_v2");
             g_cuda_funcs.cuDeviceGetAttribute = dlsym(g_cuda_lib_handle, "cuDeviceGetAttribute");
+            g_cuda_funcs.cuMemGetInfo = dlsym(g_cuda_lib_handle, "cuMemGetInfo_v2");
             g_cuda_funcs.cuCtxCreate = dlsym(g_cuda_lib_handle, "cuCtxCreate_v2");
             g_cuda_funcs.cuCtxDestroy = dlsym(g_cuda_lib_handle, "cuCtxDestroy_v2");
             g_cuda_funcs.cuCtxSynchronize = dlsym(g_cuda_lib_handle, "cuCtxSynchronize");
@@ -596,6 +604,78 @@ HetGPUError hetgpu_get_device_props(HetGPUState *state, HetGPUDeviceProps *props
 
     *props = state->props;
     return HETGPU_SUCCESS;
+}
+
+int hetgpu_cuda_device_get_attribute(HetGPUState *state, int attribute,
+                                     int *value)
+{
+    int result;
+
+    if (!value) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if (!state || !state->initialized ||
+        state->backend == HETGPU_BACKEND_SIMULATION ||
+        !g_cuda_mutex_initialized || !g_cuda_funcs.cuDeviceGetAttribute) {
+        return CUDA_ERROR_NOT_INITIALIZED;
+    }
+
+    qemu_mutex_lock(&g_cuda_mutex);
+    result = g_cuda_funcs.cuDeviceGetAttribute(value, attribute,
+                                               state->cuda_device);
+    qemu_mutex_unlock(&g_cuda_mutex);
+    return result;
+}
+
+int hetgpu_cuda_device_total_memory(HetGPUState *state, size_t *bytes)
+{
+    int result;
+
+    if (!bytes) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if (!state || !state->initialized ||
+        state->backend == HETGPU_BACKEND_SIMULATION ||
+        !g_cuda_mutex_initialized || !g_cuda_funcs.cuDeviceTotalMem) {
+        return CUDA_ERROR_NOT_INITIALIZED;
+    }
+
+    qemu_mutex_lock(&g_cuda_mutex);
+    result = g_cuda_funcs.cuDeviceTotalMem(bytes, state->cuda_device);
+    qemu_mutex_unlock(&g_cuda_mutex);
+    return result;
+}
+
+int hetgpu_cuda_mem_get_info(HetGPUState *state, size_t *free_bytes,
+                             size_t *total_bytes)
+{
+    int result;
+
+    if (!free_bytes || !total_bytes) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if (!state || !state->initialized || !state->context ||
+        state->backend == HETGPU_BACKEND_SIMULATION ||
+        !g_cuda_mutex_initialized || !g_cuda_funcs.cuCtxSetCurrent ||
+        !g_cuda_funcs.cuMemGetInfo) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+
+    qemu_mutex_lock(&g_cuda_mutex);
+    result = g_cuda_funcs.cuCtxSetCurrent(state->context);
+    if (result == CUDA_SUCCESS) {
+        int driver_result = g_cuda_funcs.cuMemGetInfo(free_bytes, total_bytes);
+
+        qemu_log("CXL TYPE2 CUDA mem_info_driver context_activation_result=%d "
+                 "driver_called=1 driver_result=%d free=%zu total=%zu\n",
+                 result, driver_result, *free_bytes, *total_bytes);
+        result = driver_result;
+    } else {
+        qemu_log("CXL TYPE2 CUDA mem_info_driver context_activation_result=%d "
+                 "driver_called=0\n", result);
+    }
+    qemu_mutex_unlock(&g_cuda_mutex);
+    return result;
 }
 
 HetGPUError hetgpu_create_context(HetGPUState *state)
