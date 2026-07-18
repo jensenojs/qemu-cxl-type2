@@ -2,6 +2,9 @@
 testblock = declare_dependency(dependencies: [block], sources: 'iothread.c')
 
 tests = {
+  'test-cxl-type2-cuda-contract': [
+    meson.project_source_root() / 'hw/cxl/cxl_type2_cuda_contract.c',
+  ],
   'check-block-qdict': [],
   'check-qdict': [],
   'check-qnum': [],

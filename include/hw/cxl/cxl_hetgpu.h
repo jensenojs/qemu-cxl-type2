@@ -291,6 +291,15 @@ HetGPUError hetgpu_get_device_count(int *count);
  */
 HetGPUError hetgpu_get_device_props(HetGPUState *state, HetGPUDeviceProps *props);
 
+/* Raw CUDA Driver queries used by the Type-2 BAR2 CUDA contract.  Each
+ * function returns the exact CUresult from the driver call or a CUDA-compatible
+ * lifecycle/context result when no driver call can be made. */
+int hetgpu_cuda_device_get_attribute(HetGPUState *state, int attribute,
+                                     int *value);
+int hetgpu_cuda_device_total_memory(HetGPUState *state, size_t *bytes);
+int hetgpu_cuda_mem_get_info(HetGPUState *state, size_t *free_bytes,
+                             size_t *total_bytes);
+
 /* ========================================================================
  * Context Management
  * ======================================================================== */
