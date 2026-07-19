@@ -523,6 +523,12 @@ HetGPUError hetgpu_get_param_info(HetGPUState *state, HetGPUFunction function,
 HetGPUError hetgpu_set_function_attribute(HetGPUState *state,
                                           HetGPUFunction function,
                                           int attribute, int value);
+HetGPUError hetgpu_get_max_active_blocks_per_multiprocessor(HetGPUState *state,
+                                                             HetGPUFunction function,
+                                                             int block_size,
+                                                             size_t dynamic_smem_size,
+                                                             unsigned int flags,
+                                                             int *num_blocks);
 
 /**
  * hetgpu_launch_kernel - Launch GPU kernel

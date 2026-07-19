@@ -59,6 +59,8 @@ typedef int (*cuModuleGetFunction_fn)(void **, void *, const char *);
 typedef int (*cuModuleGetGlobal_fn)(uint64_t *, size_t *, void *, const char *);
 typedef int (*cuFuncGetParamInfo_fn)(void *, size_t, size_t *, size_t *);
 typedef int (*cuFuncSetAttribute_fn)(void *, int, int);
+typedef int (*cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags_fn)(int *, void *, int, size_t,
+                                                                         unsigned int);
 typedef int (*cuLaunchKernel_fn)(void *, unsigned int, unsigned int, unsigned int,
                                   unsigned int, unsigned int, unsigned int,
                                   unsigned int, void *, void **, void **);
@@ -107,6 +109,7 @@ static struct {
     cuModuleGetGlobal_fn cuModuleGetGlobal;
     cuFuncGetParamInfo_fn cuFuncGetParamInfo;
     cuFuncSetAttribute_fn cuFuncSetAttribute;
+    cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags_fn cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags;
     cuLaunchKernel_fn cuLaunchKernel;
     cuCtxPushCurrent_fn cuCtxPushCurrent;
     cuCtxPopCurrent_fn cuCtxPopCurrent;
@@ -230,6 +233,8 @@ static HetGPUError hetgpu_init_internal(HetGPUState *state,
             g_cuda_funcs.cuModuleGetGlobal = dlsym(g_cuda_lib_handle, "cuModuleGetGlobal_v2");
             g_cuda_funcs.cuFuncGetParamInfo = dlsym(g_cuda_lib_handle, "cuFuncGetParamInfo");
             g_cuda_funcs.cuFuncSetAttribute = dlsym(g_cuda_lib_handle, "cuFuncSetAttribute");
+            g_cuda_funcs.cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags =
+                dlsym(g_cuda_lib_handle, "cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags");
             g_cuda_funcs.cuLaunchKernel = dlsym(g_cuda_lib_handle, "cuLaunchKernel");
             g_cuda_funcs.cuCtxPushCurrent = dlsym(g_cuda_lib_handle, "cuCtxPushCurrent_v2");
             g_cuda_funcs.cuCtxPopCurrent = dlsym(g_cuda_lib_handle, "cuCtxPopCurrent_v2");
@@ -1467,6 +1472,52 @@ HetGPUError hetgpu_set_function_attribute(HetGPUState *state,
             return HETGPU_SUCCESS;
         case 1:
             return HETGPU_ERROR_INVALID_VALUE;
+        case 201:
+            return HETGPU_ERROR_INVALID_CONTEXT;
+        case 400:
+            return HETGPU_ERROR_INVALID_HANDLE;
+        case 801:
+            return HETGPU_ERROR_NOT_SUPPORTED;
+        default:
+            return HETGPU_ERROR_UNKNOWN;
+        }
+    }
+
+    return HETGPU_ERROR_NOT_SUPPORTED;
+}
+
+HetGPUError hetgpu_get_max_active_blocks_per_multiprocessor(HetGPUState *state,
+                                                             HetGPUFunction function,
+                                                             int block_size,
+                                                             size_t dynamic_smem_size,
+                                                             unsigned int flags,
+                                                             int *num_blocks)
+{
+    if (!state || !state->initialized || !function || !num_blocks) {
+        return HETGPU_ERROR_INVALID_VALUE;
+    }
+    *num_blocks = 0;
+
+    if (g_cuda_funcs.cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags &&
+        state->backend != HETGPU_BACKEND_SIMULATION) {
+        if (!cuda_lock(state)) {
+            return HETGPU_ERROR_INVALID_CONTEXT;
+        }
+        int err = g_cuda_funcs.cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
+            num_blocks, function, block_size, dynamic_smem_size, flags);
+        cuda_unlock(state);
+
+        qemu_log("CXL hetGPU: occupancy function=%p block_size=%d dynamic_smem_size=%zu "
+                 "flags=%u driver_result=%d num_blocks=%d\n",
+                 function, block_size, dynamic_smem_size, flags, err, *num_blocks);
+
+        switch (err) {
+        case 0:
+            return HETGPU_SUCCESS;
+        case 1:
+            return HETGPU_ERROR_INVALID_VALUE;
+        case 3:
+            return HETGPU_ERROR_NOT_INITIALIZED;
         case 201:
             return HETGPU_ERROR_INVALID_CONTEXT;
         case 400:
