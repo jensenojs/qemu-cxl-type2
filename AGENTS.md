@@ -2,6 +2,25 @@
 
 本仓保存QEMU CXL Type-2设备模型、BAR2命令处理和hetGPU backend bridge。它负责把guest CUDA shim写入的命令解释成host侧设备行为；不拥有CXLMemSim server、Concordia backend、guest kernel、模型文件或最终run specification。
 
+## 全链路位置
+
+```text
+cxl-models -> guest llama-cpp
+                    |
+CXLMemSim guest shim -> BAR2 MMIO -> QEMU cxl-type2 [this repository]
+                                             |
+                                             v
+                                      hetGPU backend bridge
+                                             |
+                                             v
+                                     Concordia / NVIDIA L40
+
+linux-cxl-type2 exposes the guest device; type2-guest supplies the bootable guest;
+cxl-lab binds exact QEMU bytes into one formal run.
+```
+
+本仓把BAR2协议转化为设备状态、命令完成与backend调用。guest shim拥有请求编码，Concordia拥有CUDA/NVIDIA执行语义；QEMU负责这两者之间可观察的设备边界。
+
 项目目标、正确性层级与实时工程入口由`/home/jensen/Projects/cxl-memsim/AGENTS.md`定义。跨组件exact source从`cxl-lab/manifests/sources.lock.json`读取。本机活跃云端组件checkout是`/home/jensen/Projects/cxl-cloud/qemu-cxl-type2/`；`/home/jensen/Projects/qemu-cxl-type2/`保留既有本地构建现场。
 
 ## Cloud Source Authority
