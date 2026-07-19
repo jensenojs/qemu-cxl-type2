@@ -3091,6 +3091,34 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         }
         break;
 
+    case CXL_GPU_CMD_FUNC_SET_ATTRIBUTE:
+        if (hetgpu->initialized) {
+            uint32_t func_id = ct2d->gpu_cmd.params[0];
+
+            if (func_id >= ct2d->gpu_cmd.num_functions) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                break;
+            }
+            err = hetgpu_set_function_attribute(
+                hetgpu, ct2d->gpu_cmd.functions[func_id],
+                (int)ct2d->gpu_cmd.params[1],
+                (int)ct2d->gpu_cmd.params[2]);
+            if (err == HETGPU_ERROR_INVALID_VALUE) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            } else if (err == HETGPU_ERROR_INVALID_CONTEXT) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_CONTEXT;
+            } else if (err == HETGPU_ERROR_INVALID_HANDLE) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+            } else if (err == HETGPU_ERROR_NOT_SUPPORTED) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_SUPPORTED;
+            } else if (err != HETGPU_SUCCESS) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_UNKNOWN;
+            }
+        } else {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
+        }
+        break;
+
     case CXL_GPU_CMD_LAUNCH_KERNEL:
         if (hetgpu->initialized) {
             uint32_t func_id = ct2d->gpu_cmd.params[0];

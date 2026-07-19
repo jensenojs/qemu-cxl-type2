@@ -520,6 +520,9 @@ HetGPUError hetgpu_get_global(HetGPUState *state, HetGPUModule module,
 HetGPUError hetgpu_get_param_info(HetGPUState *state, HetGPUFunction function,
                                   size_t param_index, size_t *param_offset,
                                   size_t *param_size);
+HetGPUError hetgpu_set_function_attribute(HetGPUState *state,
+                                          HetGPUFunction function,
+                                          int attribute, int value);
 
 /**
  * hetgpu_launch_kernel - Launch GPU kernel
