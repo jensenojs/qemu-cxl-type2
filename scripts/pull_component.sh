@@ -1,10 +1,30 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+container_runtime=docker
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --container-runtime)
+            [[ $# -ge 2 ]] || { printf 'error: --container-runtime requires a value\n' >&2; exit 2; }
+            container_runtime=$2; shift 2 ;;
+        --) shift; break ;;
+        -*) printf 'error: unknown argument: %s\n' "$1" >&2; exit 2 ;;
+        *) break ;;
+    esac
+done
 if [[ $# -ne 2 ]]; then
-    printf 'usage: %s CANDIDATE_JSON OUTPUT_DIR\n' "$0" >&2
+    printf 'usage: %s [--container-runtime docker|podman] CANDIDATE_JSON OUTPUT_DIR\n' "$0" >&2
     exit 2
 fi
+
+case "$container_runtime" in
+    docker|podman) ;;
+    *) printf 'error: --container-runtime must be docker or podman\n' >&2; exit 2 ;;
+esac
+command -v "$container_runtime" >/dev/null 2>&1 || {
+    printf 'error: missing container runtime: %s\n' "$container_runtime" >&2
+    exit 1
+}
 
 readonly ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 readonly CANDIDATE=$(realpath "$1")
@@ -40,10 +60,10 @@ readonly ORAS_IMAGE=${contract[1]}
 rm -rf "$WORK"
 mkdir -p "$WORK/pulled"
 readonly ORAS_BIN=${WORK}/oras
-oras_container=$(docker create "$ORAS_IMAGE")
-trap 'docker rm -f "$oras_container" >/dev/null 2>&1 || true' EXIT
-docker cp "${oras_container}:/bin/oras" "$ORAS_BIN"
-docker rm "$oras_container" >/dev/null
+oras_container=$("$container_runtime" create "$ORAS_IMAGE")
+trap '"$container_runtime" rm -f "${oras_container:-}" >/dev/null 2>&1 || true' EXIT
+"$container_runtime" cp "${oras_container}:/bin/oras" "$ORAS_BIN"
+"$container_runtime" rm "$oras_container" >/dev/null
 oras_container=
 chmod +x "$ORAS_BIN"
 

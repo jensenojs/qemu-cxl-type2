@@ -7,7 +7,7 @@ verify_source_checkout.sh  验证superproject exact source与clean checkout
 build_component.sh         只恢复声明的hetGPU gitlink并构建qemu-system-x86_64
 component_artifact.py      生成/验证通用组件manifest与安全归档
 publish_component.sh       确定性归档并发布到本仓registry
-pull_component.sh          只按digest恢复并重复version/device/ELF检查
+pull_component.sh          只按digest恢复并重复version/device/ELF检查；默认Docker，可显式选择Podman，不自动回退
 ```
 
 build脚本只允许初始化`subprojects/hetGPU`的声明commit。十五个ROM/test gitlinks不得被隐式初始化。publish/pull是仅有registry边界，认证来自CNB任务。payload保存QEMU binary，以及当前串口Type-2运行实际读取的`bios-256k.bin`、`kvmvapic.bin`和`linuxboot_dma.bin`；不捆绑系统动态库、默认VGA ROM、NIC ROM或整个`pc-bios/`。

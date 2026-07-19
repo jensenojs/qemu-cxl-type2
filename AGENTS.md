@@ -23,6 +23,16 @@ cxl-lab binds exact QEMU bytes into one formal run.
 
 项目目标、正确性层级与实时工程入口由`/home/jensen/Projects/cxl-memsim/AGENTS.md`定义。跨组件exact source从`cxl-lab/manifests/sources.lock.json`读取。本机活跃云端组件checkout是`/home/jensen/Projects/cxl-cloud/qemu-cxl-type2/`；`/home/jensen/Projects/qemu-cxl-type2/`保留既有本地构建现场。
 
+## 控制仓回链
+
+QEMU source、payload和正式运行各由不同的控制仓入口拥有；从本仓继续追踪时使用：
+
+- [控制仓职责与组合边界](https://cnb.cool/gevico.online/jensen/cxl-lab/-/blob/main/AGENTS.md)
+- [source、artifact、run与result字段](https://cnb.cool/gevico.online/jensen/cxl-lab/-/blob/main/manifests/AGENTS.md)
+- [candidate、promotion与fresh-pull](https://cnb.cool/gevico.online/jensen/cxl-lab/-/blob/main/scripts/artifacts/AGENTS.md)
+- [正式运行、observer与result发布](https://cnb.cool/gevico.online/jensen/cxl-lab/-/blob/main/scripts/run/AGENTS.md)
+- [immutable result、core归档与materialize](https://cnb.cool/gevico.online/jensen/cxl-lab/-/blob/main/manifests/results/AGENTS.md)
+
 ## Cloud Source Authority
 
 CNB `gevico.online/jensen/qemu-cxl-type2`是source primary，GitHub `jensenojs/qemu-cxl-type2`保存同SHA公开mirror。新commit先进入CNB，再以相同SHA进入GitHub；`cxl-lab`的有效控制ref只消费已经同步到两端的exact source。
