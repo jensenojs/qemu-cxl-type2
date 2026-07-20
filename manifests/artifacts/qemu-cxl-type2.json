@@ -1,8 +1,8 @@
 {
-  "archive_sha256": "7e6b1f28074bfd1dddef79e9a8cf1284fac1f12d0bce27820e246e38a8b24a5b",
-  "digest": "sha256:b0dce7708bf5e2885ee6c089b105a740050c6b11df4a62cbf56a39c77fd24473",
-  "manifest_sha256": "0475a7e081f199adc556a63bab25a1c8f866938912d8ec2b7196d99388c9cb84",
-  "profile_sha256": "b1ad5e7891aff13c38422304a2d4bad2f0dbbfd6db9c8aeff18a3fbfd9d72f5c",
+  "archive_sha256": "42eb647deb95057900ab4c8de230018965282cfb6f570297a1e2746599f9eb67",
+  "digest": "sha256:ea763b2aed2579db21996825a93f99e3edaab7a807e238196ecb56d10847e191",
+  "manifest_sha256": "e427bc7047182a6f1d01489a9288c606fb648a9c32cd67c51db8f94564f5272d",
+  "profile_sha256": "f20ec8ee29f28f3d1da42fd58dfa0c108a3f646410767ab9800f4a1316555bad",
   "repository": "docker.cnb.cool/gevico.online/jensen/qemu-cxl-type2",
-  "source_commit": "f06d4d40e36d3cd8cf23bc76ce7eae1e60b5c5bb"
+  "source_commit": "678c4f373af1c7f9023fcc8129b669f23b71b580"
 }

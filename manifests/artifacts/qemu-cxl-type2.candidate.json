@@ -1,8 +1,0 @@
-{
-  "archive_sha256": "42eb647deb95057900ab4c8de230018965282cfb6f570297a1e2746599f9eb67",
-  "digest": "sha256:ea763b2aed2579db21996825a93f99e3edaab7a807e238196ecb56d10847e191",
-  "manifest_sha256": "e427bc7047182a6f1d01489a9288c606fb648a9c32cd67c51db8f94564f5272d",
-  "profile_sha256": "f20ec8ee29f28f3d1da42fd58dfa0c108a3f646410767ab9800f4a1316555bad",
-  "repository": "docker.cnb.cool/gevico.online/jensen/qemu-cxl-type2",
-  "source_commit": "678c4f373af1c7f9023fcc8129b669f23b71b580"
-}
