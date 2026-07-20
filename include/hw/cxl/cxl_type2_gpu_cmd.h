@@ -47,12 +47,12 @@
 #define CXL_GPU_REG_WARP_SIZE       0x0160  /* Warp size */
 #define CXL_GPU_REG_BACKEND         0x0164  /* Backend type */
 
-/* Data transfer region - OPTIMIZED for larger chunks */
+/* BAR2 command payload.  The exact cuBLAS initialization corpus contains a
+ * 4,392,672-byte decoded CUBIN, so this shared transport window must exceed
+ * that observed module payload on both guest and QEMU. */
 #define CXL_GPU_DATA_OFFSET         0x1000    /* Data buffer offset */
-#define CXL_GPU_DATA_SIZE           0x100000  /* Data buffer size (1MB) */
-
-/* Command register size - increased to accommodate larger data buffer */
-#define CXL_GPU_CMD_REG_SIZE        0x101000  /* 1MB + 4KB registers */
+#define CXL_GPU_DATA_SIZE           0x800000  /* Data buffer size (8 MiB) */
+#define CXL_GPU_CMD_REG_SIZE        0x801000  /* 8 MiB payload + 4 KiB registers */
 
 /* Module payload encoding in CXL_GPU_REG_PARAM1. */
 #define CXL_GPU_MODULE_DATA_ZSTD    (1U << 0)

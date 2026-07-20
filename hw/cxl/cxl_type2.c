@@ -4076,6 +4076,12 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
     if (ct2d->device_mem_size == 0) {
         ct2d->device_mem_size = CXL_TYPE2_DEFAULT_MEM_SIZE;
     }
+    if (ct2d->cache_size < CXL_GPU_CMD_REG_SIZE) {
+        error_setg(errp,
+                   "cache-size (%" PRIu64 ") is smaller than the BAR2 GPU command region (%u)",
+                   ct2d->cache_size, CXL_GPU_CMD_REG_SIZE);
+        return;
+    }
 
     if (ct2d->paired_case.required) {
         if (!ct2d->paired_case.run_root ||
@@ -4202,8 +4208,7 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
     ct2d->gpu_cmd.status = 0;
     ct2d->gpu_cmd.cmd_status = CXL_GPU_CMD_STATUS_IDLE;
 
-    /* Allocate larger data buffer for optimized transfers (1MB) */
-    ct2d->gpu_cmd.data_size = CXL_GPU_DATA_SIZE;  /* 1MB */
+    ct2d->gpu_cmd.data_size = CXL_GPU_DATA_SIZE;
     ct2d->gpu_cmd.data = g_malloc0(ct2d->gpu_cmd.data_size);
     if (!ct2d->gpu_cmd.data) {
         error_setg(errp, "Failed to allocate GPU command data buffer");
