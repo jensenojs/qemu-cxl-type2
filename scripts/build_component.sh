@@ -31,7 +31,7 @@ git -C "$ROOT" submodule update --init --depth 1 subprojects/hetGPU
 
 [[ $WORK == "$ROOT/.work/component" ]]
 rm -rf "$WORK"
-mkdir -p "$BUILD" "$PAYLOAD/bin" "$PAYLOAD/share/qemu" "$WORK/evidence"
+mkdir -p "$BUILD" "$PAYLOAD/bin" "$PAYLOAD/share/qemu" "$PAYLOAD/evidence/cuda-api" "$WORK/evidence"
 
 python3 "$ROOT/tests/test_component_artifact.py"
 (
@@ -43,6 +43,10 @@ ninja -C "$BUILD" -j"$PARALLEL" qemu-system-x86_64
 readonly QEMU=$BUILD/qemu-system-x86_64
 [[ -x $QEMU ]]
 install -m 0755 "$QEMU" "$PAYLOAD/bin/qemu-system-x86_64"
+install -m 0644 "$ROOT/hw/cxl/cxl_type2.c" "$PAYLOAD/evidence/cuda-api/cxl_type2.c"
+install -m 0644 "$ROOT/hw/cxl/cxl_hetgpu.c" "$PAYLOAD/evidence/cuda-api/cxl_hetgpu.c"
+install -m 0644 "$ROOT/include/hw/cxl/cxl_type2_gpu_cmd.h" \
+    "$PAYLOAD/evidence/cuda-api/cxl_type2_gpu_cmd.h"
 for firmware in bios-256k.bin kvmvapic.bin linuxboot_dma.bin; do
     install -m 0644 "$ROOT/pc-bios/$firmware" "$PAYLOAD/share/qemu/$firmware"
 done
