@@ -2319,12 +2319,55 @@ static int cxl_type2_cuda_query_mem_info(void *opaque)
                                     &request->total_bytes);
 }
 
+static bool cxl_type2_reserve_gpu_handle(void ***handles, size_t *capacity,
+                                         uint32_t count)
+{
+    size_t next_capacity;
+    void **grown;
+
+    if (count == G_MAXUINT32) {
+        return false;
+    }
+    if (count < *capacity) {
+        return true;
+    }
+
+    next_capacity = *capacity ? *capacity : 64;
+    if (next_capacity > G_MAXUINT32 / 2) {
+        next_capacity = G_MAXUINT32;
+    } else {
+        next_capacity *= 2;
+    }
+    grown = g_try_realloc_n(*handles, next_capacity, sizeof(**handles));
+    if (!grown) {
+        return false;
+    }
+    *handles = grown;
+    *capacity = next_capacity;
+    return true;
+}
+
 static void cxl_type2_clear_gpu_handles(CXLType2State *ct2d)
 {
-    memset(ct2d->gpu_cmd.modules, 0, sizeof(ct2d->gpu_cmd.modules));
-    memset(ct2d->gpu_cmd.functions, 0, sizeof(ct2d->gpu_cmd.functions));
+    if (ct2d->gpu_cmd.num_modules || ct2d->gpu_cmd.num_functions) {
+        qemu_log("CXL Type2: GPU handle tables reset modules live=%u high_water=%u capacity=%zu functions live=%u high_water=%u capacity=%zu\n",
+                 ct2d->gpu_cmd.num_modules,
+                 ct2d->gpu_cmd.modules_high_water,
+                 ct2d->gpu_cmd.modules_capacity,
+                 ct2d->gpu_cmd.num_functions,
+                 ct2d->gpu_cmd.functions_high_water,
+                 ct2d->gpu_cmd.functions_capacity);
+    }
+    g_free(ct2d->gpu_cmd.modules);
+    g_free(ct2d->gpu_cmd.functions);
+    ct2d->gpu_cmd.modules = NULL;
+    ct2d->gpu_cmd.functions = NULL;
+    ct2d->gpu_cmd.modules_capacity = 0;
+    ct2d->gpu_cmd.functions_capacity = 0;
     ct2d->gpu_cmd.num_modules = 0;
     ct2d->gpu_cmd.num_functions = 0;
+    ct2d->gpu_cmd.modules_high_water = 0;
+    ct2d->gpu_cmd.functions_high_water = 0;
 }
 
 static uint64_t cxl_type2_paired_config_binding(
@@ -2921,15 +2964,24 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         break;
 
     case CXL_GPU_CMD_MODULE_LOAD_PTX:
-        if (hetgpu->initialized && ct2d->gpu_cmd.num_modules < ARRAY_SIZE(ct2d->gpu_cmd.modules)) {
+        if (hetgpu->initialized) {
             /* PTX source is in data buffer */
             void *module = NULL;
+            if (!cxl_type2_reserve_gpu_handle(&ct2d->gpu_cmd.modules,
+                                               &ct2d->gpu_cmd.modules_capacity,
+                                               ct2d->gpu_cmd.num_modules)) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_OUT_OF_MEMORY;
+                break;
+            }
             err = hetgpu_load_ptx(hetgpu, (const char *)ct2d->gpu_cmd.data,
                                   (HetGPUModule *)&module);
             if (err == HETGPU_SUCCESS) {
                 ct2d->gpu_cmd.modules[ct2d->gpu_cmd.num_modules] = module;
                 ct2d->gpu_cmd.results[0] = ct2d->gpu_cmd.num_modules;
                 ct2d->gpu_cmd.num_modules++;
+                ct2d->gpu_cmd.modules_high_water =
+                    MAX(ct2d->gpu_cmd.modules_high_water,
+                        ct2d->gpu_cmd.num_modules);
             } else {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_PTX;
             }
@@ -2939,8 +2991,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         break;
 
     case CXL_GPU_CMD_MODULE_LOAD_CUBIN:
-        if (hetgpu->initialized &&
-            ct2d->gpu_cmd.num_modules < ARRAY_SIZE(ct2d->gpu_cmd.modules)) {
+        if (hetgpu->initialized) {
             size = ct2d->gpu_cmd.params[0];
             uint32_t encoding = ct2d->gpu_cmd.params[1];
             size_t uncompressed_size = ct2d->gpu_cmd.params[2];
@@ -2981,6 +3032,13 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             }
 
             void *module = NULL;
+            if (!cxl_type2_reserve_gpu_handle(&ct2d->gpu_cmd.modules,
+                                               &ct2d->gpu_cmd.modules_capacity,
+                                               ct2d->gpu_cmd.num_modules)) {
+                g_free(decoded);
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_OUT_OF_MEMORY;
+                break;
+            }
             err = hetgpu_load_cubin(hetgpu, cubin_data, cubin_size,
                                     (HetGPUModule *)&module);
             g_free(decoded);
@@ -2988,6 +3046,9 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 ct2d->gpu_cmd.modules[ct2d->gpu_cmd.num_modules] = module;
                 ct2d->gpu_cmd.results[0] = ct2d->gpu_cmd.num_modules;
                 ct2d->gpu_cmd.num_modules++;
+                ct2d->gpu_cmd.modules_high_water =
+                    MAX(ct2d->gpu_cmd.modules_high_water,
+                        ct2d->gpu_cmd.num_modules);
             } else {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_PTX;
             }
@@ -2997,11 +3058,18 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         break;
 
     case CXL_GPU_CMD_FUNC_GET:
-        if (hetgpu->initialized && ct2d->gpu_cmd.num_functions < ARRAY_SIZE(ct2d->gpu_cmd.functions)) {
+        if (hetgpu->initialized) {
             uint32_t module_id = ct2d->gpu_cmd.params[0];
             /* Function name is in data buffer */
             if (module_id < ct2d->gpu_cmd.num_modules) {
                 void *func = NULL;
+                if (!cxl_type2_reserve_gpu_handle(
+                        &ct2d->gpu_cmd.functions,
+                        &ct2d->gpu_cmd.functions_capacity,
+                        ct2d->gpu_cmd.num_functions)) {
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_OUT_OF_MEMORY;
+                    break;
+                }
                 err = hetgpu_get_function(hetgpu,
                                           ct2d->gpu_cmd.modules[module_id],
                                           (const char *)ct2d->gpu_cmd.data,
@@ -3010,6 +3078,9 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                     ct2d->gpu_cmd.functions[ct2d->gpu_cmd.num_functions] = func;
                     ct2d->gpu_cmd.results[0] = ct2d->gpu_cmd.num_functions;
                     ct2d->gpu_cmd.num_functions++;
+                    ct2d->gpu_cmd.functions_high_water =
+                        MAX(ct2d->gpu_cmd.functions_high_water,
+                            ct2d->gpu_cmd.num_functions);
                 } else {
                     ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_FOUND;
                 }
@@ -4286,6 +4357,8 @@ static void cxl_type2_exit(PCIDevice *pci_dev)
     /* Disconnect from CXLMemSim */
     cxlmemsim_disconnect(ct2d);
     qemu_mutex_destroy(&ct2d->memsim.lock);
+
+    cxl_type2_clear_gpu_handles(ct2d);
 
     /* Cleanup GPU passthrough */
     cxl_type2_gpu_cleanup(ct2d);
