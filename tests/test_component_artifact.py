@@ -93,6 +93,13 @@ class ComponentArtifactTest(unittest.TestCase):
         self.assertEqual(
             profile["outputs"],
             [
+                {"path": "evidence/cuda-api/cxl_hetgpu.c", "type": "file", "mode": "0644"},
+                {"path": "evidence/cuda-api/cxl_type2.c", "type": "file", "mode": "0644"},
+                {
+                    "path": "evidence/cuda-api/cxl_type2_gpu_cmd.h",
+                    "type": "file",
+                    "mode": "0644",
+                },
                 {"path": "bin/qemu-system-x86_64", "type": "file", "mode": "0755"},
                 {"path": "share/qemu/bios-256k.bin", "type": "file", "mode": "0644"},
                 {"path": "share/qemu/kvmvapic.bin", "type": "file", "mode": "0644"},
