@@ -201,6 +201,7 @@ typedef struct CXLType2State {
         uint32_t cmd_status;
         uint32_t cmd_result;
         uint64_t trace_sequence;
+        uint64_t call_id;
         uint64_t params[8];
         uint64_t results[4];
         uint8_t  *data;                /* Data buffer - dynamically allocated (1MB) */

@@ -2658,8 +2658,9 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
 
     qemu_log_mask(LOG_GUEST_ERROR,
                   "CXL TYPE2 TRACE cmd_begin seq=%" PRIu64
+                  " call_id=0x%016" PRIx64
                   " cmd=0x%x p0=0x%" PRIx64 " p1=%" PRIu64 "\n",
-                  trace_sequence, cmd, ct2d->gpu_cmd.params[0],
+                  trace_sequence, ct2d->gpu_cmd.call_id, cmd, ct2d->gpu_cmd.params[0],
                   ct2d->gpu_cmd.params[1]);
 
     qemu_log_mask(LOG_GUEST_ERROR,
@@ -2668,6 +2669,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
 
     ct2d->gpu_cmd.cmd_status = CXL_GPU_CMD_STATUS_RUNNING;
     ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+    hetgpu_cuda_trace_set_call_id(ct2d->gpu_cmd.call_id);
 
     if (ct2d->paired_case.required && ct2d->paired_case.failed) {
         ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_DEINITIALIZED;
@@ -3848,13 +3850,15 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
     }
 
 complete:
+    hetgpu_cuda_trace_set_call_id(0);
     ct2d->gpu_cmd.cmd_status = CXL_GPU_CMD_STATUS_COMPLETE;
     int64_t trace_duration_ns =
         qemu_clock_get_ns(QEMU_CLOCK_HOST) - trace_start_ns;
     qemu_log_mask(LOG_GUEST_ERROR,
                   "CXL TYPE2 TRACE cmd_end seq=%" PRIu64
+                  " call_id=0x%016" PRIx64
                   " cmd=0x%x result=%u duration_ns=%" PRId64 "\n",
-                  trace_sequence, cmd, ct2d->gpu_cmd.cmd_result,
+                  trace_sequence, ct2d->gpu_cmd.call_id, cmd, ct2d->gpu_cmd.cmd_result,
                   trace_duration_ns);
     qemu_log_mask(LOG_GUEST_ERROR,
                   "CXL GPU: cmd 0x%x done, result=%u results[0]=0x%lx\n",
@@ -3893,6 +3897,9 @@ static uint64_t cxl_type2_gpu_cmd_read(void *opaque, hwaddr addr, unsigned size)
         break;
     case CXL_GPU_REG_CMD_RESULT:
         value = ct2d->gpu_cmd.cmd_result;
+        break;
+    case CXL_GPU_REG_CALL_ID:
+        value = ct2d->gpu_cmd.call_id;
         break;
     case CXL_GPU_REG_RESULT0:
         value = ct2d->gpu_cmd.results[0];
@@ -4016,6 +4023,9 @@ static void cxl_type2_gpu_cmd_write(void *opaque, hwaddr addr,
     case CXL_GPU_REG_CMD:
         /* Execute command */
         cxl_type2_gpu_execute_cmd(ct2d, value);
+        break;
+    case CXL_GPU_REG_CALL_ID:
+        ct2d->gpu_cmd.call_id = value;
         break;
     case CXL_GPU_REG_PARAM0:
         ct2d->gpu_cmd.params[0] = value;

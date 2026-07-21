@@ -21,6 +21,7 @@
 #define CXL_GPU_REG_CMD_RESULT      0x0018  /* Command result/error code */
 #define CXL_GPU_REG_CMD_DATA_LO     0x001C  /* Command data low 32 bits */
 #define CXL_GPU_REG_CMD_DATA_HI     0x0020  /* Command data high 32 bits */
+#define CXL_GPU_REG_CALL_ID         0x0028  /* Guest process/call sequence identity */
 
 #define CXL_GPU_REG_PARAM0          0x0040  /* Parameter 0 */
 #define CXL_GPU_REG_PARAM1          0x0048  /* Parameter 1 */
@@ -72,7 +73,7 @@
 
 /* Magic number */
 #define CXL_GPU_MAGIC               0x43584C32  /* "CXL2" */
-#define CXL_GPU_VERSION             0x00010000  /* v1.0.0 */
+#define CXL_GPU_VERSION             0x00010100  /* v1.1.0: call correlation register */
 
 #define CXL_GPU_CASE_PROTOCOL_VERSION 1U
 

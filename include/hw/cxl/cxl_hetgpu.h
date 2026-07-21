@@ -300,6 +300,7 @@ int hetgpu_cuda_device_total_memory(HetGPUState *state, size_t *bytes);
 int hetgpu_cuda_module_get_loading_mode(HetGPUState *state, int *mode);
 int hetgpu_cuda_mem_get_info(HetGPUState *state, size_t *free_bytes,
                              size_t *total_bytes);
+void hetgpu_cuda_trace_set_call_id(uint64_t call_id);
 
 /* ========================================================================
  * Context Management

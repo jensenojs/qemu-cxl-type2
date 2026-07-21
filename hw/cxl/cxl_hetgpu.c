@@ -89,6 +89,24 @@ typedef int (*cuGetErrorName_fn)(int, const char **);
 #define CUDA_ERROR_INVALID_CONTEXT 201
 #define CUDA_ERROR_NOT_SUPPORTED 801
 
+static __thread uint64_t g_cuda_trace_call_id;
+
+void hetgpu_cuda_trace_set_call_id(uint64_t call_id)
+{
+    g_cuda_trace_call_id = call_id;
+}
+
+#define HETGPU_CUDA_CALL(field, ...)                                           \
+    ({                                                                         \
+        qemu_log("CXL TYPE2 TRACE driver_begin call_id=0x%016" PRIx64         \
+                 " symbol=%s\n", g_cuda_trace_call_id, #field);              \
+        int _driver_result = g_cuda_funcs.field(__VA_ARGS__);                  \
+        qemu_log("CXL TYPE2 TRACE driver_end call_id=0x%016" PRIx64           \
+                 " symbol=%s result=%d\n", g_cuda_trace_call_id, #field,     \
+                 _driver_result);                                              \
+        _driver_result;                                                        \
+    })
+
 /* Loaded function pointers */
 static struct {
     cuInit_fn cuInit;
@@ -255,7 +273,7 @@ static HetGPUError hetgpu_init_internal(HetGPUState *state,
             fflush(stderr);
 
             if (g_cuda_funcs.cuInit) {
-                int err = g_cuda_funcs.cuInit(0);
+                int err = HETGPU_CUDA_CALL(cuInit, 0);
                 fprintf(stderr, "CXL hetGPU: cuInit returned err=%d\n", err);
                 fflush(stderr);
                 if (err != 0) {
@@ -297,7 +315,7 @@ static HetGPUError hetgpu_init_internal(HetGPUState *state,
 
         /* Get device handle — with MIG, different device_index = different MIG instance */
         if (g_cuda_funcs.cuDeviceGet) {
-            err = g_cuda_funcs.cuDeviceGet(&cuda_dev, device_index);
+            err = HETGPU_CUDA_CALL(cuDeviceGet, &cuda_dev, device_index);
             if (err != 0) {
                 qemu_log("CXL hetGPU: cuDeviceGet(%d) failed: %d\n", device_index, err);
                 qemu_log("CXL hetGPU: If using MIG, ensure MIG instances are configured\n");
@@ -310,16 +328,16 @@ static HetGPUError hetgpu_init_internal(HetGPUState *state,
         /* Create per-device context */
         if (g_cuda_funcs.cuCtxCreate) {
             qemu_log("CXL hetGPU: Calling cuCtxCreate_v2 for device %d\n", cuda_dev);
-            err = g_cuda_funcs.cuCtxCreate(&ctx, 0, cuda_dev);
+            err = HETGPU_CUDA_CALL(cuCtxCreate, &ctx, 0, cuda_dev);
 
             if (err != 0) {
                 const char *err_name = "UNKNOWN";
                 const char *err_str = "Unknown error";
                 if (g_cuda_funcs.cuGetErrorName) {
-                    g_cuda_funcs.cuGetErrorName(err, &err_name);
+                    HETGPU_CUDA_CALL(cuGetErrorName, err, &err_name);
                 }
                 if (g_cuda_funcs.cuGetErrorString) {
-                    g_cuda_funcs.cuGetErrorString(err, &err_str);
+                    HETGPU_CUDA_CALL(cuGetErrorString, err, &err_str);
                 }
                 qemu_log("CXL hetGPU: cuCtxCreate FAILED: %s (%d) - %s\n",
                          err_name, err, err_str);
@@ -341,12 +359,12 @@ static HetGPUError hetgpu_init_internal(HetGPUState *state,
 
                 state->props = default_props;
                 if (g_cuda_funcs.cuDeviceGetName) {
-                    g_cuda_funcs.cuDeviceGetName(state->props.name,
+                    HETGPU_CUDA_CALL(cuDeviceGetName, state->props.name,
                                                  sizeof(state->props.name), cuda_dev);
                 }
                 if (g_cuda_funcs.cuDeviceTotalMem) {
                     size_t mem = 0;
-                    if (g_cuda_funcs.cuDeviceTotalMem(&mem, cuda_dev) == 0) {
+                    if (HETGPU_CUDA_CALL(cuDeviceTotalMem, &mem, cuda_dev) == 0) {
                         state->props.total_memory = mem;
                     }
                 }
@@ -365,7 +383,7 @@ static HetGPUError hetgpu_init_internal(HetGPUState *state,
             /* Pop the context cuCtxCreate auto-pushed, we'll use cuCtxSetCurrent */
             if (g_cuda_funcs.cuCtxPopCurrent) {
                 void *popped = NULL;
-                g_cuda_funcs.cuCtxPopCurrent(&popped);
+                HETGPU_CUDA_CALL(cuCtxPopCurrent, &popped);
             }
         } else {
             qemu_log("CXL hetGPU: cuCtxCreate_v2 symbol not found\n");
@@ -381,34 +399,34 @@ static HetGPUError hetgpu_init_internal(HetGPUState *state,
         state->props = default_props;
 
         if (g_cuda_funcs.cuDeviceGetName) {
-            err = g_cuda_funcs.cuDeviceGetName(state->props.name,
+            err = HETGPU_CUDA_CALL(cuDeviceGetName, state->props.name,
                                          sizeof(state->props.name), cuda_dev);
         }
         if (g_cuda_funcs.cuDeviceTotalMem) {
-            if (g_cuda_funcs.cuDeviceTotalMem(&total_mem, cuda_dev) == 0) {
+            if (HETGPU_CUDA_CALL(cuDeviceTotalMem, &total_mem, cuda_dev) == 0) {
                 state->props.total_memory = total_mem;
                 qemu_log("CXL hetGPU: Device %d total memory: %lu MB\n",
                          device_index, (unsigned long)(total_mem / (1024*1024)));
             }
         }
         if (g_cuda_funcs.cuDeviceGetAttribute) {
-            if (g_cuda_funcs.cuDeviceGetAttribute(&attr_val,
+            if (HETGPU_CUDA_CALL(cuDeviceGetAttribute, &attr_val,
                     CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, cuda_dev) == 0) {
                 state->props.compute_capability_major = attr_val;
             }
-            if (g_cuda_funcs.cuDeviceGetAttribute(&attr_val,
+            if (HETGPU_CUDA_CALL(cuDeviceGetAttribute, &attr_val,
                     CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, cuda_dev) == 0) {
                 state->props.compute_capability_minor = attr_val;
             }
-            if (g_cuda_funcs.cuDeviceGetAttribute(&attr_val,
+            if (HETGPU_CUDA_CALL(cuDeviceGetAttribute, &attr_val,
                     CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, cuda_dev) == 0) {
                 state->props.multiprocessor_count = attr_val;
             }
-            if (g_cuda_funcs.cuDeviceGetAttribute(&attr_val,
+            if (HETGPU_CUDA_CALL(cuDeviceGetAttribute, &attr_val,
                     CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK, cuda_dev) == 0) {
                 state->props.max_threads_per_block = attr_val;
             }
-            if (g_cuda_funcs.cuDeviceGetAttribute(&attr_val,
+            if (HETGPU_CUDA_CALL(cuDeviceGetAttribute, &attr_val,
                     CU_DEVICE_ATTRIBUTE_WARP_SIZE, cuda_dev) == 0) {
                 state->props.warp_size = attr_val;
             }
@@ -540,7 +558,7 @@ static HetGPUError hetgpu_cleanup_internal(HetGPUState *state)
         int err;
 
         qemu_mutex_lock(&g_cuda_mutex);
-        err = g_cuda_funcs.cuCtxDestroy(state->context);
+        err = HETGPU_CUDA_CALL(cuCtxDestroy, state->context);
         qemu_mutex_unlock(&g_cuda_mutex);
         if (err != 0) {
             qemu_log("CXL hetGPU: cuCtxDestroy failed context=%p error=%d\n",
@@ -587,7 +605,7 @@ HetGPUError hetgpu_get_device_count(int *count)
 
     if (g_cuda_funcs.cuDeviceGetCount) {
         *count = -999;  /* Sentinel value to detect if function updates it */
-        int err = g_cuda_funcs.cuDeviceGetCount(count);
+        int err = HETGPU_CUDA_CALL(cuDeviceGetCount, count);
         fprintf(stderr, "CXL hetGPU: cuDeviceGetCount returned err=%d, count=%d\n", err, *count);
         fflush(stderr);
         if (err != 0) {
@@ -633,7 +651,7 @@ int hetgpu_cuda_device_get_attribute(HetGPUState *state, int attribute,
     }
 
     qemu_mutex_lock(&g_cuda_mutex);
-    result = g_cuda_funcs.cuDeviceGetAttribute(value, attribute,
+    result = HETGPU_CUDA_CALL(cuDeviceGetAttribute, value, attribute,
                                                state->cuda_device);
     qemu_mutex_unlock(&g_cuda_mutex);
     return result;
@@ -653,7 +671,7 @@ int hetgpu_cuda_device_total_memory(HetGPUState *state, size_t *bytes)
     }
 
     qemu_mutex_lock(&g_cuda_mutex);
-    result = g_cuda_funcs.cuDeviceTotalMem(bytes, state->cuda_device);
+    result = HETGPU_CUDA_CALL(cuDeviceTotalMem, bytes, state->cuda_device);
     qemu_mutex_unlock(&g_cuda_mutex);
     return result;
 }
@@ -675,7 +693,7 @@ int hetgpu_cuda_module_get_loading_mode(HetGPUState *state, int *mode)
     }
 
     qemu_mutex_lock(&g_cuda_mutex);
-    result = g_cuda_funcs.cuModuleGetLoadingMode(mode);
+    result = HETGPU_CUDA_CALL(cuModuleGetLoadingMode, mode);
     qemu_mutex_unlock(&g_cuda_mutex);
     return result;
 }
@@ -696,9 +714,9 @@ int hetgpu_cuda_mem_get_info(HetGPUState *state, size_t *free_bytes,
     }
 
     qemu_mutex_lock(&g_cuda_mutex);
-    result = g_cuda_funcs.cuCtxSetCurrent(state->context);
+    result = HETGPU_CUDA_CALL(cuCtxSetCurrent, state->context);
     if (result == CUDA_SUCCESS) {
-        int driver_result = g_cuda_funcs.cuMemGetInfo(free_bytes, total_bytes);
+        int driver_result = HETGPU_CUDA_CALL(cuMemGetInfo, free_bytes, total_bytes);
 
         qemu_log("CXL TYPE2 CUDA mem_info_driver context_activation_result=%d "
                  "driver_called=1 driver_result=%d free=%zu total=%zu\n",
@@ -742,7 +760,7 @@ HetGPUError hetgpu_create_context(HetGPUState *state)
 
     if (g_cuda_funcs.cuCtxCreate) {
         void *ctx = NULL;
-        int err = g_cuda_funcs.cuCtxCreate(&ctx, 0, state->cuda_device);
+        int err = HETGPU_CUDA_CALL(cuCtxCreate, &ctx, 0, state->cuda_device);
         if (err == 0 && ctx != NULL) {
             state->context = ctx;
             qemu_log("CXL hetGPU: Created new CUDA context %p\n", ctx);
@@ -762,7 +780,7 @@ void hetgpu_destroy_context(HetGPUState *state)
     }
 
     if (state->backend != HETGPU_BACKEND_SIMULATION && g_cuda_funcs.cuCtxDestroy) {
-        g_cuda_funcs.cuCtxDestroy(state->context);
+        HETGPU_CUDA_CALL(cuCtxDestroy, state->context);
     }
 
     state->context = NULL;
@@ -784,7 +802,7 @@ static bool cuda_lock(HetGPUState *state)
     if (state->context) {
         /* Use cuCtxSetCurrent — does NOT grow the context stack */
         if (g_cuda_funcs.cuCtxSetCurrent) {
-            int err = g_cuda_funcs.cuCtxSetCurrent(state->context);
+            int err = HETGPU_CUDA_CALL(cuCtxSetCurrent, state->context);
             if (err != 0) {
                 if (state->formal_case_strict) {
                     qemu_log("CXL hetGPU: formal context activation failed "
@@ -797,15 +815,15 @@ static bool cuda_lock(HetGPUState *state)
                          "attempting context re-creation\n", state->context, err);
                 if (g_cuda_funcs.cuCtxCreate) {
                     void *ctx = NULL;
-                    err = g_cuda_funcs.cuCtxCreate(&ctx, 0, state->cuda_device);
+                    err = HETGPU_CUDA_CALL(cuCtxCreate, &ctx, 0, state->cuda_device);
                     if (err == 0 && ctx != NULL) {
                         /* Pop the auto-pushed context from cuCtxCreate */
                         if (g_cuda_funcs.cuCtxPopCurrent) {
                             void *popped = NULL;
-                            g_cuda_funcs.cuCtxPopCurrent(&popped);
+                            HETGPU_CUDA_CALL(cuCtxPopCurrent, &popped);
                         }
                         state->context = ctx;
-                        g_cuda_funcs.cuCtxSetCurrent(ctx);
+                        HETGPU_CUDA_CALL(cuCtxSetCurrent, ctx);
                         qemu_log("CXL hetGPU: Re-created CUDA context %p\n", ctx);
                     }
                 }
@@ -813,7 +831,7 @@ static bool cuda_lock(HetGPUState *state)
         } else if (!state->formal_case_strict &&
                    g_cuda_funcs.cuCtxPushCurrent) {
             /* Fallback to push if SetCurrent not available */
-            g_cuda_funcs.cuCtxPushCurrent(state->context);
+            HETGPU_CUDA_CALL(cuCtxPushCurrent, state->context);
         } else {
             qemu_log("CXL hetGPU: formal context requires cuCtxSetCurrent\n");
             qemu_mutex_unlock(&g_cuda_mutex);
@@ -826,16 +844,16 @@ static bool cuda_lock(HetGPUState *state)
     } else if (g_cuda_funcs.cuCtxCreate) {
         /* No context stored (hetGPU managed mode) - create one */
         void *ctx = NULL;
-        int err = g_cuda_funcs.cuCtxCreate(&ctx, 0, state->cuda_device);
+        int err = HETGPU_CUDA_CALL(cuCtxCreate, &ctx, 0, state->cuda_device);
         if (err == 0 && ctx != NULL) {
             /* Pop the auto-pushed context, use SetCurrent instead */
             if (g_cuda_funcs.cuCtxPopCurrent) {
                 void *popped = NULL;
-                g_cuda_funcs.cuCtxPopCurrent(&popped);
+                HETGPU_CUDA_CALL(cuCtxPopCurrent, &popped);
             }
             state->context = ctx;
             if (g_cuda_funcs.cuCtxSetCurrent) {
-                g_cuda_funcs.cuCtxSetCurrent(ctx);
+                HETGPU_CUDA_CALL(cuCtxSetCurrent, ctx);
             }
             qemu_log("CXL hetGPU: Created CUDA context on demand: %p\n", ctx);
         }
@@ -868,12 +886,12 @@ HetGPUError hetgpu_synchronize(HetGPUState *state)
     }
 
     if (g_cuda_funcs.cuCtxSynchronize) {
-        int err = g_cuda_funcs.cuCtxSynchronize();
+        int err = HETGPU_CUDA_CALL(cuCtxSynchronize);
         cuda_unlock(state);
         if (err != 0) {
             const char *err_name = "UNKNOWN";
             if (g_cuda_funcs.cuGetErrorName) {
-                g_cuda_funcs.cuGetErrorName(err, &err_name);
+                HETGPU_CUDA_CALL(cuGetErrorName, err, &err_name);
             }
             qemu_log("CXL hetGPU: cuCtxSynchronize failed: %s (%d)\n", err_name, err);
             return HETGPU_ERROR_UNKNOWN;
@@ -903,7 +921,7 @@ HetGPUError hetgpu_malloc(HetGPUState *state, size_t size,
         }
 
         uint64_t ptr = 0;
-        int err = g_cuda_funcs.cuMemAlloc(&ptr, size);
+        int err = HETGPU_CUDA_CALL(cuMemAlloc, &ptr, size);
         cuda_unlock(state);
 
         if (err == 0) {
@@ -915,7 +933,7 @@ HetGPUError hetgpu_malloc(HetGPUState *state, size_t size,
         }
         const char *err_name = "UNKNOWN";
         if (g_cuda_funcs.cuGetErrorName) {
-            g_cuda_funcs.cuGetErrorName(err, &err_name);
+            HETGPU_CUDA_CALL(cuGetErrorName, err, &err_name);
         }
         qemu_log("CXL hetGPU: [dev%d] cuMemAlloc(%zu) failed: %s (%d)\n",
                  state->device_index, size, err_name, err);
@@ -963,13 +981,13 @@ HetGPUError hetgpu_free(HetGPUState *state, HetGPUDevicePtr dev_ptr)
         if (!cuda_lock(state)) {
             return HETGPU_ERROR_INVALID_CONTEXT;
         }
-        int err = g_cuda_funcs.cuMemFree(dev_ptr);
+        int err = HETGPU_CUDA_CALL(cuMemFree, dev_ptr);
         cuda_unlock(state);
 
         if (err != 0) {
             const char *err_name = "UNKNOWN";
             if (g_cuda_funcs.cuGetErrorName) {
-                g_cuda_funcs.cuGetErrorName(err, &err_name);
+                HETGPU_CUDA_CALL(cuGetErrorName, err, &err_name);
             }
             qemu_log("CXL hetGPU: [dev%d] cuMemFree failed: %s (%d)\n",
                      state->device_index, err_name, err);
@@ -1017,13 +1035,13 @@ HetGPUError hetgpu_memcpy_htod(HetGPUState *state, HetGPUDevicePtr dst,
         if (!cuda_lock(state)) {
             return HETGPU_ERROR_INVALID_CONTEXT;
         }
-        int err = g_cuda_funcs.cuMemcpyHtoD(dst, src, size);
+        int err = HETGPU_CUDA_CALL(cuMemcpyHtoD, dst, src, size);
         cuda_unlock(state);
 
         if (err != 0) {
             const char *err_name = "UNKNOWN";
             if (g_cuda_funcs.cuGetErrorName) {
-                g_cuda_funcs.cuGetErrorName(err, &err_name);
+                HETGPU_CUDA_CALL(cuGetErrorName, err, &err_name);
             }
             qemu_log("CXL hetGPU: [dev%d] cuMemcpyHtoD failed: %s (%d)\n",
                      state->device_index, err_name, err);
@@ -1066,13 +1084,13 @@ HetGPUError hetgpu_memcpy_dtoh(HetGPUState *state, void *dst,
         if (!cuda_lock(state)) {
             return HETGPU_ERROR_INVALID_CONTEXT;
         }
-        int err = g_cuda_funcs.cuMemcpyDtoH(dst, src, size);
+        int err = HETGPU_CUDA_CALL(cuMemcpyDtoH, dst, src, size);
         cuda_unlock(state);
 
         if (err != 0) {
             const char *err_name = "UNKNOWN";
             if (g_cuda_funcs.cuGetErrorName) {
-                g_cuda_funcs.cuGetErrorName(err, &err_name);
+                HETGPU_CUDA_CALL(cuGetErrorName, err, &err_name);
             }
             qemu_log("CXL hetGPU: [dev%d] cuMemcpyDtoH failed: %s (%d)\n",
                      state->device_index, err_name, err);
@@ -1116,13 +1134,13 @@ HetGPUError hetgpu_memcpy_dtod(HetGPUState *state, HetGPUDevicePtr dst,
         if (!cuda_lock(state)) {
             return HETGPU_ERROR_INVALID_CONTEXT;
         }
-        int err = g_cuda_funcs.cuMemcpyDtoD(dst, src, size);
+        int err = HETGPU_CUDA_CALL(cuMemcpyDtoD, dst, src, size);
         cuda_unlock(state);
 
         if (err != 0) {
             const char *err_name = "UNKNOWN";
             if (g_cuda_funcs.cuGetErrorName) {
-                g_cuda_funcs.cuGetErrorName(err, &err_name);
+                HETGPU_CUDA_CALL(cuGetErrorName, err, &err_name);
             }
             qemu_log("CXL hetGPU: [dev%d] cuMemcpyDtoD failed: %s (%d)\n",
                      state->device_index, err_name, err);
@@ -1279,7 +1297,7 @@ HetGPUError hetgpu_load_ptx(HetGPUState *state, const char *ptx_source,
             return HETGPU_ERROR_INVALID_CONTEXT;
         }
         void *mod = NULL;
-        int err = g_cuda_funcs.cuModuleLoadData(&mod, ptx_source);
+        int err = HETGPU_CUDA_CALL(cuModuleLoadData, &mod, ptx_source);
         cuda_unlock(state);
 
         if (err == 0) {
@@ -1290,7 +1308,7 @@ HetGPUError hetgpu_load_ptx(HetGPUState *state, const char *ptx_source,
         }
         const char *err_name = "UNKNOWN";
         if (g_cuda_funcs.cuGetErrorName) {
-            g_cuda_funcs.cuGetErrorName(err, &err_name);
+            HETGPU_CUDA_CALL(cuGetErrorName, err, &err_name);
         }
         qemu_log("CXL hetGPU: [dev%d] cuModuleLoadData failed: %s (%d)\n",
                  state->device_index, err_name, err);
@@ -1320,7 +1338,7 @@ HetGPUError hetgpu_load_cubin(HetGPUState *state, const void *cubin_data,
             return HETGPU_ERROR_INVALID_CONTEXT;
         }
         void *mod = NULL;
-        int err = g_cuda_funcs.cuModuleLoadData(&mod, cubin_data);
+        int err = HETGPU_CUDA_CALL(cuModuleLoadData, &mod, cubin_data);
         cuda_unlock(state);
 
         if (err == 0) {
@@ -1331,7 +1349,7 @@ HetGPUError hetgpu_load_cubin(HetGPUState *state, const void *cubin_data,
         }
         const char *err_name = "UNKNOWN";
         if (g_cuda_funcs.cuGetErrorName) {
-            g_cuda_funcs.cuGetErrorName(err, &err_name);
+            HETGPU_CUDA_CALL(cuGetErrorName, err, &err_name);
         }
         qemu_log("CXL hetGPU: [dev%d] cuModuleLoadData (cubin) failed: %s (%d)\n",
                  state->device_index, err_name, err);
@@ -1366,7 +1384,7 @@ HetGPUError hetgpu_get_function(HetGPUState *state, HetGPUModule module,
             return HETGPU_ERROR_INVALID_CONTEXT;
         }
         void *func = NULL;
-        int err = g_cuda_funcs.cuModuleGetFunction(&func, module, name);
+        int err = HETGPU_CUDA_CALL(cuModuleGetFunction, &func, module, name);
         cuda_unlock(state);
 
         if (err == 0) {
@@ -1377,7 +1395,7 @@ HetGPUError hetgpu_get_function(HetGPUState *state, HetGPUModule module,
         }
         const char *err_name = "UNKNOWN";
         if (g_cuda_funcs.cuGetErrorName) {
-            g_cuda_funcs.cuGetErrorName(err, &err_name);
+            HETGPU_CUDA_CALL(cuGetErrorName, err, &err_name);
         }
         qemu_log("CXL hetGPU: [dev%d] cuModuleGetFunction('%s') failed: %s (%d)\n",
                  state->device_index, name, err_name, err);
@@ -1406,7 +1424,7 @@ HetGPUError hetgpu_get_global(HetGPUState *state, HetGPUModule module,
         }
         uint64_t ptr = 0;
         size_t bytes = 0;
-        int err = g_cuda_funcs.cuModuleGetGlobal(&ptr, &bytes, module, name);
+        int err = HETGPU_CUDA_CALL(cuModuleGetGlobal, &ptr, &bytes, module, name);
         cuda_unlock(state);
 
         if (err == 0) {
@@ -1419,7 +1437,7 @@ HetGPUError hetgpu_get_global(HetGPUState *state, HetGPUModule module,
 
         const char *err_name = "UNKNOWN";
         if (g_cuda_funcs.cuGetErrorName) {
-            g_cuda_funcs.cuGetErrorName(err, &err_name);
+            HETGPU_CUDA_CALL(cuGetErrorName, err, &err_name);
         }
         qemu_log("CXL hetGPU: [dev%d] cuModuleGetGlobal('%s') failed: %s (%d)\n",
                  state->device_index, name, err_name, err);
@@ -1456,7 +1474,7 @@ HetGPUError hetgpu_get_param_info(HetGPUState *state, HetGPUFunction function,
         if (!cuda_lock(state)) {
             return HETGPU_ERROR_INVALID_CONTEXT;
         }
-        int err = g_cuda_funcs.cuFuncGetParamInfo(function, param_index,
+        int err = HETGPU_CUDA_CALL(cuFuncGetParamInfo, function, param_index,
                                                   param_offset, param_size);
         cuda_unlock(state);
 
@@ -1490,7 +1508,7 @@ HetGPUError hetgpu_set_function_attribute(HetGPUState *state,
         if (!cuda_lock(state)) {
             return HETGPU_ERROR_INVALID_CONTEXT;
         }
-        int err = g_cuda_funcs.cuFuncSetAttribute(function, attribute, value);
+        int err = HETGPU_CUDA_CALL(cuFuncSetAttribute, function, attribute, value);
         cuda_unlock(state);
 
         switch (err) {
@@ -1529,7 +1547,7 @@ HetGPUError hetgpu_get_max_active_blocks_per_multiprocessor(HetGPUState *state,
         if (!cuda_lock(state)) {
             return HETGPU_ERROR_INVALID_CONTEXT;
         }
-        int err = g_cuda_funcs.cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
+        int err = HETGPU_CUDA_CALL(cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags,
             num_blocks, function, block_size, dynamic_smem_size, flags);
         cuda_unlock(state);
 
@@ -1582,7 +1600,7 @@ HetGPUError hetgpu_launch_kernel(HetGPUState *state, HetGPUFunction function,
                  config->block_dim[0], config->block_dim[1], config->block_dim[2],
                  config->shared_mem_bytes);
 
-        int err = g_cuda_funcs.cuLaunchKernel(
+        int err = HETGPU_CUDA_CALL(cuLaunchKernel,
             function,
             config->grid_dim[0], config->grid_dim[1], config->grid_dim[2],
             config->block_dim[0], config->block_dim[1], config->block_dim[2],
@@ -1595,7 +1613,7 @@ HetGPUError hetgpu_launch_kernel(HetGPUState *state, HetGPUFunction function,
         }
         const char *err_name = "UNKNOWN";
         if (g_cuda_funcs.cuGetErrorName) {
-            g_cuda_funcs.cuGetErrorName(err, &err_name);
+            HETGPU_CUDA_CALL(cuGetErrorName, err, &err_name);
         }
         qemu_log("CXL hetGPU: [dev%d] cuLaunchKernel failed: %s (%d)\n",
                  state->device_index, err_name, err);
