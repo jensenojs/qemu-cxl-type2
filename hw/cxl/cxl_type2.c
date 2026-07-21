@@ -2656,12 +2656,11 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
     uint64_t trace_sequence = ++ct2d->gpu_cmd.trace_sequence;
     int64_t trace_start_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
 
-    qemu_log_mask(LOG_GUEST_ERROR,
-                  "CXL TYPE2 TRACE cmd_begin seq=%" PRIu64
-                  " call_id=0x%016" PRIx64
-                  " cmd=0x%x p0=0x%" PRIx64 " p1=%" PRIu64 "\n",
-                  trace_sequence, ct2d->gpu_cmd.call_id, cmd, ct2d->gpu_cmd.params[0],
-                  ct2d->gpu_cmd.params[1]);
+    qemu_log("CXL TYPE2 TRACE cmd_begin seq=%" PRIu64
+             " call_id=0x%016" PRIx64
+             " cmd=0x%x p0=0x%" PRIx64 " p1=%" PRIu64 "\n",
+             trace_sequence, ct2d->gpu_cmd.call_id, cmd, ct2d->gpu_cmd.params[0],
+             ct2d->gpu_cmd.params[1]);
 
     qemu_log_mask(LOG_GUEST_ERROR,
                   "CXL GPU: execute cmd 0x%x, hetgpu_init=%d, ctx=%p\n",
@@ -3854,12 +3853,11 @@ complete:
     ct2d->gpu_cmd.cmd_status = CXL_GPU_CMD_STATUS_COMPLETE;
     int64_t trace_duration_ns =
         qemu_clock_get_ns(QEMU_CLOCK_HOST) - trace_start_ns;
-    qemu_log_mask(LOG_GUEST_ERROR,
-                  "CXL TYPE2 TRACE cmd_end seq=%" PRIu64
-                  " call_id=0x%016" PRIx64
-                  " cmd=0x%x result=%u duration_ns=%" PRId64 "\n",
-                  trace_sequence, ct2d->gpu_cmd.call_id, cmd, ct2d->gpu_cmd.cmd_result,
-                  trace_duration_ns);
+    qemu_log("CXL TYPE2 TRACE cmd_end seq=%" PRIu64
+             " call_id=0x%016" PRIx64
+             " cmd=0x%x result=%u duration_ns=%" PRId64 "\n",
+             trace_sequence, ct2d->gpu_cmd.call_id, cmd, ct2d->gpu_cmd.cmd_result,
+             trace_duration_ns);
     qemu_log_mask(LOG_GUEST_ERROR,
                   "CXL GPU: cmd 0x%x done, result=%u results[0]=0x%lx\n",
                   cmd, ct2d->gpu_cmd.cmd_result,
