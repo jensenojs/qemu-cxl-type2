@@ -211,10 +211,19 @@ typedef struct CXLType2State {
          * IDs from that case. */
         void    **modules;             /* Loaded PTX/CUBIN modules */
         void    **functions;           /* Kernel function handles */
+        void    **graphs;              /* CUDA graph handles */
+        void    **graph_execs;         /* CUDA executable graph handles */
+        void    **graph_nodes;         /* CUDA graph node handles */
         size_t   modules_capacity;
         size_t   functions_capacity;
+        size_t   graphs_capacity;
+        size_t   graph_execs_capacity;
+        size_t   graph_nodes_capacity;
         uint32_t num_modules;
         uint32_t num_functions;
+        uint32_t num_graphs;
+        uint32_t num_graph_execs;
+        uint32_t num_graph_nodes;
         uint32_t modules_high_water;
         uint32_t functions_high_water;
         uint32_t capabilities;         /* Device capabilities (bulk transfer, etc.) */

@@ -73,7 +73,7 @@
 
 /* Magic number */
 #define CXL_GPU_MAGIC               0x43584C32  /* "CXL2" */
-#define CXL_GPU_VERSION             0x00010100  /* v1.1.0: call correlation register */
+#define CXL_GPU_VERSION             0x00010200  /* v1.2.0: graph-exec kernel-node route */
 
 #define CXL_GPU_CASE_PROTOCOL_VERSION 1U
 
@@ -130,6 +130,7 @@ typedef enum {
     CXL_GPU_CMD_FUNC_SET_ATTRIBUTE = 0x36,
     CXL_GPU_CMD_FUNC_GET_OCCUPANCY = 0x37,
     CXL_GPU_CMD_MODULE_GET_LOADING_MODE = 0x38,
+    CXL_GPU_CMD_GRAPH_EXEC_KERNEL_NODE_SET_PARAMS = 0x39,
 
     CXL_GPU_CMD_LAUNCH_KERNEL   = 0x40,
 

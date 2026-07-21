@@ -158,6 +158,9 @@ typedef void* HetGPUModule;
 typedef void* HetGPUFunction;
 typedef void* HetGPUStream;
 typedef void* HetGPUEvent;
+typedef void* HetGPUGraph;
+typedef void* HetGPUGraphExec;
+typedef void* HetGPUGraphNode;
 typedef uint64_t HetGPUDevicePtr;
 
 /* Memory region for CXL coherent access */
@@ -545,6 +548,9 @@ HetGPUError hetgpu_get_max_active_blocks_per_multiprocessor(HetGPUState *state,
 HetGPUError hetgpu_launch_kernel(HetGPUState *state, HetGPUFunction function,
                                  const HetGPULaunchConfig *config,
                                  void **args, size_t num_args);
+int hetgpu_cuda_graph_exec_kernel_node_set_params(
+    HetGPUState *state, HetGPUGraphExec graph_exec, HetGPUGraphNode graph_node,
+    HetGPUFunction function, const HetGPULaunchConfig *config, void **args);
 
 /* ========================================================================
  * Stream Management

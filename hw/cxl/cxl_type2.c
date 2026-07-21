@@ -2353,23 +2353,40 @@ static bool cxl_type2_reserve_gpu_handle(void ***handles, size_t *capacity,
 
 static void cxl_type2_clear_gpu_handles(CXLType2State *ct2d)
 {
-    if (ct2d->gpu_cmd.num_modules || ct2d->gpu_cmd.num_functions) {
-        qemu_log("CXL Type2: GPU handle tables reset modules live=%u high_water=%u capacity=%zu functions live=%u high_water=%u capacity=%zu\n",
+    if (ct2d->gpu_cmd.num_modules || ct2d->gpu_cmd.num_functions ||
+        ct2d->gpu_cmd.num_graphs || ct2d->gpu_cmd.num_graph_execs ||
+        ct2d->gpu_cmd.num_graph_nodes) {
+        qemu_log("CXL Type2: GPU handle tables reset modules live=%u high_water=%u capacity=%zu functions live=%u high_water=%u capacity=%zu graphs live=%u execs live=%u nodes live=%u\n",
                  ct2d->gpu_cmd.num_modules,
                  ct2d->gpu_cmd.modules_high_water,
                  ct2d->gpu_cmd.modules_capacity,
                  ct2d->gpu_cmd.num_functions,
                  ct2d->gpu_cmd.functions_high_water,
-                 ct2d->gpu_cmd.functions_capacity);
+                 ct2d->gpu_cmd.functions_capacity,
+                 ct2d->gpu_cmd.num_graphs,
+                 ct2d->gpu_cmd.num_graph_execs,
+                 ct2d->gpu_cmd.num_graph_nodes);
     }
     g_free(ct2d->gpu_cmd.modules);
     g_free(ct2d->gpu_cmd.functions);
+    g_free(ct2d->gpu_cmd.graphs);
+    g_free(ct2d->gpu_cmd.graph_execs);
+    g_free(ct2d->gpu_cmd.graph_nodes);
     ct2d->gpu_cmd.modules = NULL;
     ct2d->gpu_cmd.functions = NULL;
+    ct2d->gpu_cmd.graphs = NULL;
+    ct2d->gpu_cmd.graph_execs = NULL;
+    ct2d->gpu_cmd.graph_nodes = NULL;
     ct2d->gpu_cmd.modules_capacity = 0;
     ct2d->gpu_cmd.functions_capacity = 0;
+    ct2d->gpu_cmd.graphs_capacity = 0;
+    ct2d->gpu_cmd.graph_execs_capacity = 0;
+    ct2d->gpu_cmd.graph_nodes_capacity = 0;
     ct2d->gpu_cmd.num_modules = 0;
     ct2d->gpu_cmd.num_functions = 0;
+    ct2d->gpu_cmd.num_graphs = 0;
+    ct2d->gpu_cmd.num_graph_execs = 0;
+    ct2d->gpu_cmd.num_graph_nodes = 0;
     ct2d->gpu_cmd.modules_high_water = 0;
     ct2d->gpu_cmd.functions_high_water = 0;
 }
@@ -3263,6 +3280,79 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             }
             qemu_log("CXL TYPE2 CUDA module_loading_mode "
                      "driver_result=%d mode=%d\n", cuda_result, mode);
+        }
+        break;
+
+    case CXL_GPU_CMD_GRAPH_EXEC_KERNEL_NODE_SET_PARAMS:
+        if (!hetgpu->initialized) {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
+            break;
+        }
+        {
+            uint32_t graph_exec_id = ct2d->gpu_cmd.params[0];
+            uint32_t graph_node_id = ct2d->gpu_cmd.params[1];
+            uint32_t func_id = ct2d->gpu_cmd.params[2];
+            HetGPULaunchConfig config = {
+                .grid_dim = {
+                    ct2d->gpu_cmd.params[3] & 0xFFFFFFFF,
+                    (ct2d->gpu_cmd.params[3] >> 32) & 0xFFFFFFFF,
+                    ct2d->gpu_cmd.params[4] & 0xFFFFFFFF,
+                },
+                .block_dim = {
+                    (ct2d->gpu_cmd.params[4] >> 32) & 0xFFFFFFFF,
+                    ct2d->gpu_cmd.params[5] & 0xFFFFFFFF,
+                    (ct2d->gpu_cmd.params[5] >> 32) & 0xFFFFFFFF,
+                },
+                .shared_mem_bytes = ct2d->gpu_cmd.params[6] & 0xFFFFFFFF,
+                .stream = NULL,
+            };
+            uint32_t num_args = ct2d->gpu_cmd.params[6] >> 32;
+            size_t param_extent = ct2d->gpu_cmd.params[7];
+            void *args[256];
+            int cuda_result;
+
+            if (graph_exec_id >= ct2d->gpu_cmd.num_graph_execs ||
+                graph_node_id >= ct2d->gpu_cmd.num_graph_nodes ||
+                func_id >= ct2d->gpu_cmd.num_functions) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                break;
+            }
+            if (num_args > ARRAY_SIZE(args) || param_extent > ct2d->gpu_cmd.data_size) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                break;
+            }
+            for (uint32_t i = 0; i < num_args; i++) {
+                size_t param_offset = 0;
+                size_t param_size = 0;
+
+                err = hetgpu_get_param_info(hetgpu, ct2d->gpu_cmd.functions[func_id], i,
+                                            &param_offset, &param_size);
+                if (err != HETGPU_SUCCESS || param_offset > param_extent ||
+                    param_size > param_extent - param_offset) {
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                    break;
+                }
+                args[i] = ct2d->gpu_cmd.data + param_offset;
+            }
+            if (ct2d->gpu_cmd.cmd_result != CXL_GPU_SUCCESS) {
+                break;
+            }
+            if (num_args < ARRAY_SIZE(args)) {
+                size_t next_offset = 0;
+                size_t next_size = 0;
+
+                err = hetgpu_get_param_info(hetgpu, ct2d->gpu_cmd.functions[func_id],
+                                            num_args, &next_offset, &next_size);
+                if (err != HETGPU_ERROR_INVALID_VALUE) {
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                    break;
+                }
+            }
+            cuda_result = hetgpu_cuda_graph_exec_kernel_node_set_params(
+                hetgpu, ct2d->gpu_cmd.graph_execs[graph_exec_id],
+                ct2d->gpu_cmd.graph_nodes[graph_node_id],
+                ct2d->gpu_cmd.functions[func_id], &config, args);
+            ct2d->gpu_cmd.cmd_result = cuda_result;
         }
         break;
 

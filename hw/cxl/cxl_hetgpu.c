@@ -65,6 +65,22 @@ typedef int (*cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags_fn)(int *, vo
 typedef int (*cuLaunchKernel_fn)(void *, unsigned int, unsigned int, unsigned int,
                                   unsigned int, unsigned int, unsigned int,
                                   unsigned int, void *, void **, void **);
+typedef struct {
+    void *func;
+    unsigned int grid_dim_x;
+    unsigned int grid_dim_y;
+    unsigned int grid_dim_z;
+    unsigned int block_dim_x;
+    unsigned int block_dim_y;
+    unsigned int block_dim_z;
+    unsigned int shared_mem_bytes;
+    void **kernel_params;
+    void **extra;
+    void *kernel;
+    void *context;
+} CudaKernelNodeParams;
+typedef int (*cuGraphExecKernelNodeSetParams_fn)(void *, void *,
+                                                  const CudaKernelNodeParams *);
 typedef int (*cuCtxPushCurrent_fn)(void *);
 typedef int (*cuCtxPopCurrent_fn)(void **);
 typedef int (*cuCtxSetCurrent_fn)(void *);
@@ -132,6 +148,7 @@ static struct {
     cuFuncSetAttribute_fn cuFuncSetAttribute;
     cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags_fn cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags;
     cuLaunchKernel_fn cuLaunchKernel;
+    cuGraphExecKernelNodeSetParams_fn cuGraphExecKernelNodeSetParams;
     cuCtxPushCurrent_fn cuCtxPushCurrent;
     cuCtxPopCurrent_fn cuCtxPopCurrent;
     cuCtxSetCurrent_fn cuCtxSetCurrent;
@@ -258,6 +275,8 @@ static HetGPUError hetgpu_init_internal(HetGPUState *state,
             g_cuda_funcs.cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags =
                 dlsym(g_cuda_lib_handle, "cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags");
             g_cuda_funcs.cuLaunchKernel = dlsym(g_cuda_lib_handle, "cuLaunchKernel");
+            g_cuda_funcs.cuGraphExecKernelNodeSetParams =
+                dlsym(g_cuda_lib_handle, "cuGraphExecKernelNodeSetParams");
             g_cuda_funcs.cuCtxPushCurrent = dlsym(g_cuda_lib_handle, "cuCtxPushCurrent_v2");
             g_cuda_funcs.cuCtxPopCurrent = dlsym(g_cuda_lib_handle, "cuCtxPopCurrent_v2");
             g_cuda_funcs.cuCtxSetCurrent = dlsym(g_cuda_lib_handle, "cuCtxSetCurrent");
@@ -1628,6 +1647,40 @@ HetGPUError hetgpu_launch_kernel(HetGPUState *state, HetGPUFunction function,
     }
 
     return HETGPU_SUCCESS;
+}
+
+int hetgpu_cuda_graph_exec_kernel_node_set_params(
+    HetGPUState *state, HetGPUGraphExec graph_exec, HetGPUGraphNode graph_node,
+    HetGPUFunction function, const HetGPULaunchConfig *config, void **args)
+{
+    int result;
+
+    if (!state || !state->initialized || !graph_exec || !graph_node || !function ||
+        !config || state->backend == HETGPU_BACKEND_SIMULATION ||
+        !g_cuda_funcs.cuGraphExecKernelNodeSetParams) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+
+    CudaKernelNodeParams params = {
+        .func = function,
+        .grid_dim_x = config->grid_dim[0],
+        .grid_dim_y = config->grid_dim[1],
+        .grid_dim_z = config->grid_dim[2],
+        .block_dim_x = config->block_dim[0],
+        .block_dim_y = config->block_dim[1],
+        .block_dim_z = config->block_dim[2],
+        .shared_mem_bytes = config->shared_mem_bytes,
+        .kernel_params = args,
+        .extra = NULL,
+        .kernel = NULL,
+        .context = NULL,
+    };
+    if (!cuda_lock(state)) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    result = HETGPU_CUDA_CALL(cuGraphExecKernelNodeSetParams, graph_exec, graph_node, &params);
+    cuda_unlock(state);
+    return result;
 }
 
 HetGPUError hetgpu_create_stream(HetGPUState *state, HetGPUStream *stream)
