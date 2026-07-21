@@ -48,6 +48,9 @@
 #include <unistd.h>
 #include <zstd.h>
 
+extern int LZ4_decompress_safe(const char *src, char *dst,
+                               int compressed_size, int dst_capacity);
+
 #ifndef DEFAULT_HETGPU_LIB_PATH
 #define DEFAULT_HETGPU_LIB_PATH NULL
 #endif
@@ -3003,11 +3006,13 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             const void *cubin_data = ct2d->gpu_cmd.data;
             size_t cubin_size = size;
             void *decoded = NULL;
-            if (encoding & ~CXL_GPU_MODULE_DATA_ZSTD) {
+            if (encoding != 0 &&
+                encoding != CXL_GPU_MODULE_DATA_ZSTD &&
+                encoding != CXL_GPU_MODULE_DATA_LZ4) {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
                 break;
             }
-            if (encoding & CXL_GPU_MODULE_DATA_ZSTD) {
+            if (encoding != 0) {
                 if (!uncompressed_size || uncompressed_size > 64 * MiB) {
                     ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
                     break;
@@ -3017,18 +3022,32 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                     ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_OUT_OF_MEMORY;
                     break;
                 }
-                size_t result = ZSTD_decompress(decoded, uncompressed_size,
-                                                ct2d->gpu_cmd.data, size);
-                if (ZSTD_isError(result) || result != uncompressed_size) {
-                    qemu_log("CXL hetGPU: CUBIN Zstd decode failed: %s result=%zu expected=%zu\n",
-                             ZSTD_getErrorName(result), result,
-                             uncompressed_size);
-                    g_free(decoded);
-                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
-                    break;
+                if (encoding == CXL_GPU_MODULE_DATA_ZSTD) {
+                    size_t result = ZSTD_decompress(decoded, uncompressed_size,
+                                                    ct2d->gpu_cmd.data, size);
+                    if (ZSTD_isError(result) || result != uncompressed_size) {
+                        qemu_log("CXL hetGPU: CUBIN Zstd decode failed: %s result=%zu expected=%zu\n",
+                                 ZSTD_getErrorName(result), result,
+                                 uncompressed_size);
+                        g_free(decoded);
+                        ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                        break;
+                    }
+                    cubin_size = result;
+                } else {
+                    int result = LZ4_decompress_safe(
+                        (const char *)ct2d->gpu_cmd.data, decoded,
+                        (int)size, (int)uncompressed_size);
+                    if (result < 0 || (size_t)result != uncompressed_size) {
+                        qemu_log("CXL hetGPU: CUBIN LZ4 decode failed: result=%d expected=%zu\n",
+                                 result, uncompressed_size);
+                        g_free(decoded);
+                        ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                        break;
+                    }
+                    cubin_size = (size_t)result;
                 }
                 cubin_data = decoded;
-                cubin_size = result;
             }
 
             void *module = NULL;

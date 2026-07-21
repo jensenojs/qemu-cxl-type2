@@ -1,3 +1,6 @@
+cxl_gpu_lz4 = declare_dependency(link_args: ['-Wl,-l:liblz4.so.1'])
+
+system_ss.add(when: 'CONFIG_CXL', if_true: cxl_gpu_lz4)
 system_ss.add(when: 'CONFIG_CXL',
                if_true: files(
                    'cxl-component-utils.c',
