@@ -1,8 +1,18 @@
+# Shared checkout and artifact environment. Events below state only their workload and resource differences.
+.qemu-cxl-type2-source: &qemu-cxl-type2-source
+  submodules: false
+  lfs: false
+
+.qemu-cxl-type2-component-tools: &qemu-cxl-type2-component-tools
+  image: docker.cnb.cool/gevico.online/jensen/cxl-lab@sha256:8732c435c97964f2ba95b42fbbcaf79b3c23feffc3b1f7683531917122f4f59e
+
+.qemu-cxl-type2-docker-service: &qemu-cxl-type2-docker-service
+  - docker
+
 $:
+  # Verify that CNB checked out the exact source shape expected by this component.
   api_trigger_source_probe:
-    - git:
-        submodules: false
-        lfs: false
+    - git: *qemu-cxl-type2-source
       runner:
         cpus: 2
       stages:
@@ -10,35 +20,29 @@ $:
           script: |
             bash scripts/verify_source_checkout.sh 49b1a4e0edd7e1605975292fd62b85d2942db80b
 
+  # Build, validate, and publish this component as an immutable OCI artifact.
   api_trigger_component_build_publish:
-    - git:
-        submodules: false
-        lfs: false
+    - git: *qemu-cxl-type2-source
       runner:
         cpus: 4
-      timeout: 12h
-      docker:
-        image: docker.cnb.cool/gevico.online/jensen/cxl-lab@sha256:8732c435c97964f2ba95b42fbbcaf79b3c23feffc3b1f7683531917122f4f59e
-      services:
-        - docker
+      docker: *qemu-cxl-type2-component-tools
+      services: *qemu-cxl-type2-docker-service
       stages:
         - name: build and validate QEMU Type-2
+          timeout: 12h
           script: |
             bash scripts/build_component.sh
         - name: publish QEMU Type-2 component
           script: |
             bash scripts/publish_component.sh "$PWD/.work/component/payload"
 
+  # Pull the candidate artifact by digest into an empty directory and verify every file.
   api_trigger_component_fresh_pull:
-    - git:
-        submodules: false
-        lfs: false
+    - git: *qemu-cxl-type2-source
       runner:
         cpus: 2
-      docker:
-        image: docker.cnb.cool/gevico.online/jensen/cxl-lab@sha256:8732c435c97964f2ba95b42fbbcaf79b3c23feffc3b1f7683531917122f4f59e
-      services:
-        - docker
+      docker: *qemu-cxl-type2-component-tools
+      services: *qemu-cxl-type2-docker-service
       stages:
         - name: fresh pull and verify QEMU Type-2 component
           script: |
