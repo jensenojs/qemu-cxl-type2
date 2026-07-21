@@ -297,6 +297,7 @@ HetGPUError hetgpu_get_device_props(HetGPUState *state, HetGPUDeviceProps *props
 int hetgpu_cuda_device_get_attribute(HetGPUState *state, int attribute,
                                      int *value);
 int hetgpu_cuda_device_total_memory(HetGPUState *state, size_t *bytes);
+int hetgpu_cuda_module_get_loading_mode(HetGPUState *state, int *mode);
 int hetgpu_cuda_mem_get_info(HetGPUState *state, size_t *free_bytes,
                              size_t *total_bytes);
 

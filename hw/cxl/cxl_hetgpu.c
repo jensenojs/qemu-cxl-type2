@@ -55,6 +55,7 @@ typedef int (*cuMemcpyHtoD_fn)(uint64_t, const void *, size_t);
 typedef int (*cuMemcpyDtoH_fn)(void *, uint64_t, size_t);
 typedef int (*cuMemcpyDtoD_fn)(uint64_t, uint64_t, size_t);
 typedef int (*cuModuleLoadData_fn)(void **, const void *);
+typedef int (*cuModuleGetLoadingMode_fn)(int *);
 typedef int (*cuModuleGetFunction_fn)(void **, void *, const char *);
 typedef int (*cuModuleGetGlobal_fn)(uint64_t *, size_t *, void *, const char *);
 typedef int (*cuFuncGetParamInfo_fn)(void *, size_t, size_t *, size_t *);
@@ -86,6 +87,7 @@ typedef int (*cuGetErrorName_fn)(int, const char **);
 #define CUDA_ERROR_INVALID_VALUE 1
 #define CUDA_ERROR_NOT_INITIALIZED 3
 #define CUDA_ERROR_INVALID_CONTEXT 201
+#define CUDA_ERROR_NOT_SUPPORTED 801
 
 /* Loaded function pointers */
 static struct {
@@ -105,6 +107,7 @@ static struct {
     cuMemcpyDtoH_fn cuMemcpyDtoH;
     cuMemcpyDtoD_fn cuMemcpyDtoD;
     cuModuleLoadData_fn cuModuleLoadData;
+    cuModuleGetLoadingMode_fn cuModuleGetLoadingMode;
     cuModuleGetFunction_fn cuModuleGetFunction;
     cuModuleGetGlobal_fn cuModuleGetGlobal;
     cuFuncGetParamInfo_fn cuFuncGetParamInfo;
@@ -229,6 +232,7 @@ static HetGPUError hetgpu_init_internal(HetGPUState *state,
             g_cuda_funcs.cuMemcpyDtoH = dlsym(g_cuda_lib_handle, "cuMemcpyDtoH_v2");
             g_cuda_funcs.cuMemcpyDtoD = dlsym(g_cuda_lib_handle, "cuMemcpyDtoD_v2");
             g_cuda_funcs.cuModuleLoadData = dlsym(g_cuda_lib_handle, "cuModuleLoadData");
+            g_cuda_funcs.cuModuleGetLoadingMode = dlsym(g_cuda_lib_handle, "cuModuleGetLoadingMode");
             g_cuda_funcs.cuModuleGetFunction = dlsym(g_cuda_lib_handle, "cuModuleGetFunction");
             g_cuda_funcs.cuModuleGetGlobal = dlsym(g_cuda_lib_handle, "cuModuleGetGlobal_v2");
             g_cuda_funcs.cuFuncGetParamInfo = dlsym(g_cuda_lib_handle, "cuFuncGetParamInfo");
@@ -650,6 +654,28 @@ int hetgpu_cuda_device_total_memory(HetGPUState *state, size_t *bytes)
 
     qemu_mutex_lock(&g_cuda_mutex);
     result = g_cuda_funcs.cuDeviceTotalMem(bytes, state->cuda_device);
+    qemu_mutex_unlock(&g_cuda_mutex);
+    return result;
+}
+
+int hetgpu_cuda_module_get_loading_mode(HetGPUState *state, int *mode)
+{
+    int result;
+
+    if (!mode) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if (!state || !state->initialized ||
+        state->backend == HETGPU_BACKEND_SIMULATION ||
+        !g_cuda_mutex_initialized) {
+        return CUDA_ERROR_NOT_INITIALIZED;
+    }
+    if (!g_cuda_funcs.cuModuleGetLoadingMode) {
+        return CUDA_ERROR_NOT_SUPPORTED;
+    }
+
+    qemu_mutex_lock(&g_cuda_mutex);
+    result = g_cuda_funcs.cuModuleGetLoadingMode(mode);
     qemu_mutex_unlock(&g_cuda_mutex);
     return result;
 }

@@ -2287,6 +2287,7 @@ static bool cxl_type2_command_requires_formal_case(uint32_t cmd)
     case CXL_GPU_CMD_GET_DEVICE_PROPS:
     case CXL_GPU_CMD_GET_TOTAL_MEM:
     case CXL_GPU_CMD_GET_DEVICE_ATTRIBUTE:
+    case CXL_GPU_CMD_MODULE_GET_LOADING_MODE:
     case CXL_GPU_CMD_CASE_BEGIN:
     case CXL_GPU_CMD_CASE_END:
         return false;
@@ -3241,6 +3242,26 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             }
         } else {
             ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
+        }
+        break;
+
+    case CXL_GPU_CMD_MODULE_GET_LOADING_MODE:
+        memset(ct2d->gpu_cmd.results, 0, sizeof(ct2d->gpu_cmd.results));
+        if (!hetgpu->initialized) {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
+            break;
+        }
+        {
+            int mode = 0;
+            int cuda_result = hetgpu_cuda_module_get_loading_mode(hetgpu,
+                                                                   &mode);
+
+            ct2d->gpu_cmd.cmd_result = cuda_result;
+            if (cuda_result == CXL_GPU_SUCCESS) {
+                ct2d->gpu_cmd.results[0] = (uint64_t)(uint32_t)mode;
+            }
+            qemu_log("CXL TYPE2 CUDA module_loading_mode "
+                     "driver_result=%d mode=%d\n", cuda_result, mode);
         }
         break;
 
