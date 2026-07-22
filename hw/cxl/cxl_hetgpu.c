@@ -54,6 +54,7 @@ typedef int (*cuMemFree_fn)(uint64_t);
 typedef int (*cuMemcpyHtoD_fn)(uint64_t, const void *, size_t);
 typedef int (*cuMemcpyDtoH_fn)(void *, uint64_t, size_t);
 typedef int (*cuMemcpyDtoD_fn)(uint64_t, uint64_t, size_t);
+typedef int (*cuPointerGetAttribute_fn)(void *, int, uint64_t);
 typedef int (*cuModuleLoadData_fn)(void **, const void *);
 typedef int (*cuModuleGetLoadingMode_fn)(int *);
 typedef int (*cuModuleGetFunction_fn)(void **, void *, const char *);
@@ -133,6 +134,7 @@ static struct {
     cuMemcpyHtoD_fn cuMemcpyHtoD;
     cuMemcpyDtoH_fn cuMemcpyDtoH;
     cuMemcpyDtoD_fn cuMemcpyDtoD;
+    cuPointerGetAttribute_fn cuPointerGetAttribute;
     cuModuleLoadData_fn cuModuleLoadData;
     cuModuleGetLoadingMode_fn cuModuleGetLoadingMode;
     cuModuleGetFunction_fn cuModuleGetFunction;
@@ -266,6 +268,7 @@ static HetGPUError hetgpu_init_internal(HetGPUState *state,
             g_cuda_funcs.cuMemcpyHtoD = dlsym(g_cuda_lib_handle, "cuMemcpyHtoD_v2");
             g_cuda_funcs.cuMemcpyDtoH = dlsym(g_cuda_lib_handle, "cuMemcpyDtoH_v2");
             g_cuda_funcs.cuMemcpyDtoD = dlsym(g_cuda_lib_handle, "cuMemcpyDtoD_v2");
+            g_cuda_funcs.cuPointerGetAttribute = dlsym(g_cuda_lib_handle, "cuPointerGetAttribute");
             g_cuda_funcs.cuModuleLoadData = dlsym(g_cuda_lib_handle, "cuModuleLoadData");
             g_cuda_funcs.cuModuleGetLoadingMode = dlsym(g_cuda_lib_handle, "cuModuleGetLoadingMode");
             g_cuda_funcs.cuModuleGetFunction = dlsym(g_cuda_lib_handle, "cuModuleGetFunction");
@@ -1052,6 +1055,35 @@ HetGPUError hetgpu_free(HetGPUState *state, HetGPUDevicePtr dev_ptr)
     }
 
     return HETGPU_SUCCESS;
+}
+
+int hetgpu_pointer_get_memory_type(HetGPUState *state, HetGPUDevicePtr ptr,
+                                   int *memory_type)
+{
+    if (!state || !state->initialized || !memory_type) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+
+    if (g_cuda_funcs.cuPointerGetAttribute &&
+        state->backend != HETGPU_BACKEND_SIMULATION) {
+        if (!cuda_lock(state)) {
+            return CUDA_ERROR_INVALID_CONTEXT;
+        }
+        int result = HETGPU_CUDA_CALL(cuPointerGetAttribute, memory_type,
+                                     2, ptr);
+        cuda_unlock(state);
+        return result;
+    }
+
+    if (state->backend == HETGPU_BACKEND_SIMULATION) {
+        if (find_sim_alloc(state, ptr)) {
+            *memory_type = 2;
+            return CUDA_SUCCESS;
+        }
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 HetGPUError hetgpu_memcpy_htod(HetGPUState *state, HetGPUDevicePtr dst,

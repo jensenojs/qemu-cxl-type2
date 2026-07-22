@@ -73,7 +73,7 @@
 
 /* Magic number */
 #define CXL_GPU_MAGIC               0x43584C32  /* "CXL2" */
-#define CXL_GPU_VERSION             0x00010400  /* v1.4.0: CUDA graph lifecycle routes */
+#define CXL_GPU_VERSION             0x00010500  /* v1.5.0: CUDA UVA pointer classification */
 
 #define CXL_GPU_CASE_PROTOCOL_VERSION 1U
 
@@ -120,6 +120,7 @@ typedef enum {
     CXL_GPU_CMD_MEM_COPY_DTOD   = 0x24,
     CXL_GPU_CMD_MEM_SET         = 0x25,
     CXL_GPU_CMD_MEM_GET_INFO    = 0x26,
+    CXL_GPU_CMD_MEM_GET_POINTER_MEMORY_TYPE = 0x27,
 
     CXL_GPU_CMD_MODULE_LOAD_PTX = 0x30,
     CXL_GPU_CMD_MODULE_UNLOAD   = 0x31,

@@ -372,6 +372,19 @@ HetGPUError hetgpu_malloc(HetGPUState *state, size_t size,
 HetGPUError hetgpu_free(HetGPUState *state, HetGPUDevicePtr dev_ptr);
 
 /**
+ * hetgpu_pointer_get_memory_type - Ask the active CUDA backend to classify a UVA
+ * @state: Initialized HetGPUState
+ * @ptr: Numeric pointer value from the guest CUDA call
+ * @memory_type: CUDA memory type when the Driver accepts @ptr
+ *
+ * Returns the raw CUDA Driver result so the guest can distinguish an ordinary
+ * guest host pointer (CUDA_ERROR_INVALID_VALUE in the host process) from a
+ * Driver-owned device or managed allocation.
+ */
+int hetgpu_pointer_get_memory_type(HetGPUState *state, HetGPUDevicePtr ptr,
+                                   int *memory_type);
+
+/**
  * hetgpu_memcpy_htod - Copy memory from host to device
  * @state: Initialized HetGPUState
  * @dst: Destination device pointer

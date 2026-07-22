@@ -2883,6 +2883,19 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         }
         break;
 
+    case CXL_GPU_CMD_MEM_GET_POINTER_MEMORY_TYPE:
+        {
+            int memory_type = 0;
+            int cuda_result = hetgpu_pointer_get_memory_type(
+                hetgpu, ct2d->gpu_cmd.params[0], &memory_type);
+
+            ct2d->gpu_cmd.cmd_result = cuda_result;
+            if (cuda_result == CXL_GPU_SUCCESS) {
+                ct2d->gpu_cmd.results[0] = (uint64_t)memory_type;
+            }
+        }
+        break;
+
     case CXL_GPU_CMD_MEM_ALLOC:
         size = ct2d->gpu_cmd.params[0];
         if (hetgpu->initialized) {
