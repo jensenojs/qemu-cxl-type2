@@ -73,7 +73,7 @@
 
 /* Magic number */
 #define CXL_GPU_MAGIC               0x43584C32  /* "CXL2" */
-#define CXL_GPU_VERSION             0x00010200  /* v1.2.0: graph-exec kernel-node route */
+#define CXL_GPU_VERSION             0x00010300  /* v1.3.0: graph-kernel-node query route */
 
 #define CXL_GPU_CASE_PROTOCOL_VERSION 1U
 
@@ -131,6 +131,7 @@ typedef enum {
     CXL_GPU_CMD_FUNC_GET_OCCUPANCY = 0x37,
     CXL_GPU_CMD_MODULE_GET_LOADING_MODE = 0x38,
     CXL_GPU_CMD_GRAPH_EXEC_KERNEL_NODE_SET_PARAMS = 0x39,
+    CXL_GPU_CMD_GRAPH_KERNEL_NODE_GET_PARAMS = 0x3A,
 
     CXL_GPU_CMD_LAUNCH_KERNEL   = 0x40,
 
@@ -181,6 +182,27 @@ typedef enum {
     CXL_GPU_CMD_MHSLD_GET_INFO      = 0xD0,  /* results: heads, current, stats */
     CXL_GPU_CMD_MHSLD_SET_HEAD      = 0xD1,  /* params: head_id */
 } CXLGPUCommand;
+
+/* Guest-visible representation of a CUDA_KERNEL_NODE_PARAMS response. BAR2 carries
+ * only ids, scalars and copied argument bytes; host addresses never cross it. */
+typedef struct CXLGraphKernelNodeParamsWire {
+    uint32_t function_id;
+    uint32_t grid_dim_x;
+    uint32_t grid_dim_y;
+    uint32_t grid_dim_z;
+    uint32_t block_dim_x;
+    uint32_t block_dim_y;
+    uint32_t block_dim_z;
+    uint32_t shared_mem_bytes;
+    uint32_t num_args;
+    uint32_t reserved;
+    uint64_t param_extent;
+} CXLGraphKernelNodeParamsWire;
+
+typedef struct CXLGraphKernelNodeParamWire {
+    uint64_t offset;
+    uint64_t size;
+} CXLGraphKernelNodeParamWire;
 
 /* P2P register offsets and peer types: defined in cxl_p2p_dma.h */
 

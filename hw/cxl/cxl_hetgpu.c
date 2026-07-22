@@ -65,22 +65,9 @@ typedef int (*cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags_fn)(int *, vo
 typedef int (*cuLaunchKernel_fn)(void *, unsigned int, unsigned int, unsigned int,
                                   unsigned int, unsigned int, unsigned int,
                                   unsigned int, void *, void **, void **);
-typedef struct {
-    void *func;
-    unsigned int grid_dim_x;
-    unsigned int grid_dim_y;
-    unsigned int grid_dim_z;
-    unsigned int block_dim_x;
-    unsigned int block_dim_y;
-    unsigned int block_dim_z;
-    unsigned int shared_mem_bytes;
-    void **kernel_params;
-    void **extra;
-    void *kernel;
-    void *context;
-} CudaKernelNodeParams;
 typedef int (*cuGraphExecKernelNodeSetParams_fn)(void *, void *,
                                                   const CudaKernelNodeParams *);
+typedef int (*cuGraphKernelNodeGetParams_fn)(void *, CudaKernelNodeParams *);
 typedef int (*cuCtxPushCurrent_fn)(void *);
 typedef int (*cuCtxPopCurrent_fn)(void **);
 typedef int (*cuCtxSetCurrent_fn)(void *);
@@ -149,6 +136,7 @@ static struct {
     cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags_fn cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags;
     cuLaunchKernel_fn cuLaunchKernel;
     cuGraphExecKernelNodeSetParams_fn cuGraphExecKernelNodeSetParams;
+    cuGraphKernelNodeGetParams_fn cuGraphKernelNodeGetParams;
     cuCtxPushCurrent_fn cuCtxPushCurrent;
     cuCtxPopCurrent_fn cuCtxPopCurrent;
     cuCtxSetCurrent_fn cuCtxSetCurrent;
@@ -276,7 +264,9 @@ static HetGPUError hetgpu_init_internal(HetGPUState *state,
                 dlsym(g_cuda_lib_handle, "cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags");
             g_cuda_funcs.cuLaunchKernel = dlsym(g_cuda_lib_handle, "cuLaunchKernel");
             g_cuda_funcs.cuGraphExecKernelNodeSetParams =
-                dlsym(g_cuda_lib_handle, "cuGraphExecKernelNodeSetParams");
+                dlsym(g_cuda_lib_handle, "cuGraphExecKernelNodeSetParams_v2");
+            g_cuda_funcs.cuGraphKernelNodeGetParams =
+                dlsym(g_cuda_lib_handle, "cuGraphKernelNodeGetParams_v2");
             g_cuda_funcs.cuCtxPushCurrent = dlsym(g_cuda_lib_handle, "cuCtxPushCurrent_v2");
             g_cuda_funcs.cuCtxPopCurrent = dlsym(g_cuda_lib_handle, "cuCtxPopCurrent_v2");
             g_cuda_funcs.cuCtxSetCurrent = dlsym(g_cuda_lib_handle, "cuCtxSetCurrent");
@@ -1655,10 +1645,15 @@ int hetgpu_cuda_graph_exec_kernel_node_set_params(
 {
     int result;
 
-    if (!state || !state->initialized || !graph_exec || !graph_node || !function ||
-        !config || state->backend == HETGPU_BACKEND_SIMULATION ||
-        !g_cuda_funcs.cuGraphExecKernelNodeSetParams) {
+    if (!state || !state->initialized) {
         return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    if (!graph_exec || !graph_node || !function || !config) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if (state->backend == HETGPU_BACKEND_SIMULATION ||
+        !g_cuda_funcs.cuGraphExecKernelNodeSetParams) {
+        return CUDA_ERROR_NOT_SUPPORTED;
     }
 
     CudaKernelNodeParams params = {
@@ -1679,6 +1674,29 @@ int hetgpu_cuda_graph_exec_kernel_node_set_params(
         return CUDA_ERROR_INVALID_CONTEXT;
     }
     result = HETGPU_CUDA_CALL(cuGraphExecKernelNodeSetParams, graph_exec, graph_node, &params);
+    cuda_unlock(state);
+    return result;
+}
+
+int hetgpu_cuda_graph_kernel_node_get_params(HetGPUState *state, HetGPUGraphNode graph_node,
+                                             CudaKernelNodeParams *params)
+{
+    int result;
+
+    if (!state || !state->initialized) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    if (!graph_node || !params) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if (state->backend == HETGPU_BACKEND_SIMULATION ||
+        !g_cuda_funcs.cuGraphKernelNodeGetParams) {
+        return CUDA_ERROR_NOT_SUPPORTED;
+    }
+    if (!cuda_lock(state)) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    result = HETGPU_CUDA_CALL(cuGraphKernelNodeGetParams, graph_node, params);
     cuda_unlock(state);
     return result;
 }

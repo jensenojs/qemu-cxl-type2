@@ -20,6 +20,21 @@
 extern "C" {
 #endif
 
+typedef struct CudaKernelNodeParams {
+    void *func;
+    unsigned int grid_dim_x;
+    unsigned int grid_dim_y;
+    unsigned int grid_dim_z;
+    unsigned int block_dim_x;
+    unsigned int block_dim_y;
+    unsigned int block_dim_z;
+    unsigned int shared_mem_bytes;
+    void **kernel_params;
+    void **extra;
+    void *kernel;
+    void *context;
+} CudaKernelNodeParams;
+
 /* hetGPU Backend Types */
 typedef enum {
     HETGPU_BACKEND_AUTO = 0,     /* Auto-detect best backend */
@@ -551,6 +566,8 @@ HetGPUError hetgpu_launch_kernel(HetGPUState *state, HetGPUFunction function,
 int hetgpu_cuda_graph_exec_kernel_node_set_params(
     HetGPUState *state, HetGPUGraphExec graph_exec, HetGPUGraphNode graph_node,
     HetGPUFunction function, const HetGPULaunchConfig *config, void **args);
+int hetgpu_cuda_graph_kernel_node_get_params(HetGPUState *state, HetGPUGraphNode graph_node,
+                                             CudaKernelNodeParams *params);
 
 /* ========================================================================
  * Stream Management
