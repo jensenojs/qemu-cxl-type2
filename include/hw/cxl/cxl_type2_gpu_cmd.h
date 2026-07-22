@@ -73,7 +73,7 @@
 
 /* Magic number */
 #define CXL_GPU_MAGIC               0x43584C32  /* "CXL2" */
-#define CXL_GPU_VERSION             0x00010500  /* v1.5.0: CUDA UVA pointer classification */
+#define CXL_GPU_VERSION             0x00010600  /* v1.6.0: CUDA error-name transfer */
 
 #define CXL_GPU_CASE_PROTOCOL_VERSION 1U
 
@@ -108,6 +108,7 @@ typedef enum {
     CXL_GPU_CMD_GET_DEVICE_ATTRIBUTE = 0x07,
     CXL_GPU_CMD_CASE_BEGIN      = 0x08,
     CXL_GPU_CMD_CASE_END        = 0x09,
+    CXL_GPU_CMD_GET_ERROR_NAME  = 0x0A,
 
     CXL_GPU_CMD_CTX_CREATE      = 0x10,
     CXL_GPU_CMD_CTX_DESTROY     = 0x11,

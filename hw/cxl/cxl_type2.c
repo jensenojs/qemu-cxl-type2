@@ -2287,6 +2287,7 @@ static bool cxl_type2_command_requires_formal_case(uint32_t cmd)
     case CXL_GPU_CMD_GET_DEVICE_PROPS:
     case CXL_GPU_CMD_GET_TOTAL_MEM:
     case CXL_GPU_CMD_GET_DEVICE_ATTRIBUTE:
+    case CXL_GPU_CMD_GET_ERROR_NAME:
     case CXL_GPU_CMD_MODULE_GET_LOADING_MODE:
     case CXL_GPU_CMD_CASE_BEGIN:
     case CXL_GPU_CMD_CASE_END:
@@ -2816,6 +2817,31 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                      "driver_result=%d value=%d\n",
                      (int)(int32_t)ct2d->gpu_cmd.params[0], cuda_result,
                      request.value);
+        }
+        break;
+
+    case CXL_GPU_CMD_GET_ERROR_NAME:
+        {
+            const char *name = NULL;
+            size_t length;
+            int cuda_result = hetgpu_cuda_get_error_name(
+                hetgpu, (int)ct2d->gpu_cmd.params[0], &name);
+
+            ct2d->gpu_cmd.cmd_result = cuda_result;
+            if (cuda_result != CXL_GPU_SUCCESS) {
+                break;
+            }
+            if (!name) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                break;
+            }
+            length = strnlen(name, ct2d->gpu_cmd.data_size);
+            if (length == ct2d->gpu_cmd.data_size) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                break;
+            }
+            memcpy(ct2d->gpu_cmd.data, name, length + 1);
+            ct2d->gpu_cmd.results[0] = length;
         }
         break;
 

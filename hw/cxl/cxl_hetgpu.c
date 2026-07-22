@@ -712,6 +712,27 @@ int hetgpu_cuda_device_total_memory(HetGPUState *state, size_t *bytes)
     return result;
 }
 
+int hetgpu_cuda_get_error_name(HetGPUState *state, int error,
+                               const char **name)
+{
+    int result;
+
+    if (!name) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    *name = NULL;
+    if (!state || !state->initialized ||
+        state->backend == HETGPU_BACKEND_SIMULATION ||
+        !g_cuda_mutex_initialized || !g_cuda_funcs.cuGetErrorName) {
+        return CUDA_ERROR_NOT_INITIALIZED;
+    }
+
+    qemu_mutex_lock(&g_cuda_mutex);
+    result = HETGPU_CUDA_CALL(cuGetErrorName, error, name);
+    qemu_mutex_unlock(&g_cuda_mutex);
+    return result;
+}
+
 int hetgpu_cuda_module_get_loading_mode(HetGPUState *state, int *mode)
 {
     int result;
