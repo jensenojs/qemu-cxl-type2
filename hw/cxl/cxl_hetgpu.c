@@ -75,6 +75,32 @@ typedef int (*cuGraphDestroy_fn)(void *);
 typedef int (*cuGraphInstantiate_fn)(void **, void *, void **, char *, size_t);
 typedef int (*cuGraphGetNodes_fn)(void *, void **, size_t *);
 typedef int (*cuGraphNodeGetType_fn)(void *, int *);
+typedef int (*cuLinkCreate_fn)(unsigned int, int *, void **, void **);
+typedef int (*cuLinkAddData_fn)(void *, int, void *, size_t, const char *, unsigned int, int *, void **);
+typedef int (*cuLinkComplete_fn)(void *, void **, size_t *);
+typedef int (*cuLinkDestroy_fn)(void *);
+typedef int (*cuCtxGetLimit_fn)(size_t *, int);
+typedef int (*cuStreamCreate_fn)(void **, unsigned int);
+typedef int (*cuStreamDestroy_fn)(void *);
+typedef int (*cuStreamSynchronize_fn)(void *);
+typedef int (*cuStreamWaitEvent_fn)(void *, void *, unsigned int);
+typedef int (*cuStreamWaitValue32_fn)(void *, uint64_t, uint32_t, unsigned int);
+typedef int (*cuStreamBatchMemOp_fn)(void *, unsigned int, void *, unsigned int);
+typedef int (*cuStreamGetCaptureInfo_v2_fn)(void *, int *, uint64_t *, void **, void ***, size_t *);
+typedef int (*cuStreamGetCtx_fn)(void *, void **);
+typedef int (*cuStreamBeginCapture_fn)(void *, int);
+typedef int (*cuStreamEndCapture_fn)(void *, void **);
+typedef int (*cuStreamIsCapturing_fn)(void *, int *);
+typedef int (*cuEventCreate_fn)(void **, unsigned int);
+typedef int (*cuEventDestroy_fn)(void *);
+typedef int (*cuEventRecord_fn)(void *, void *);
+typedef int (*cuEventQuery_fn)(void *);
+typedef int (*cuEventSynchronize_fn)(void *);
+typedef int (*cuEventElapsedTime_fn)(float *, void *, void *);
+typedef int (*cuMemPrefetchAsync_fn)(uint64_t, size_t, int, void *);
+typedef int (*cuCtxEnablePeerAccess_fn)(void *, unsigned int);
+typedef int (*cuCtxDisablePeerAccess_fn)(void *);
+typedef int (*cuDeviceCanAccessPeer_fn)(int *, int, int);
 typedef int (*cuCtxPushCurrent_fn)(void *);
 typedef int (*cuCtxPopCurrent_fn)(void **);
 typedef int (*cuCtxSetCurrent_fn)(void *);
@@ -151,6 +177,32 @@ static struct {
     cuGraphInstantiate_fn cuGraphInstantiate;
     cuGraphGetNodes_fn cuGraphGetNodes;
     cuGraphNodeGetType_fn cuGraphNodeGetType;
+    cuLinkCreate_fn cuLinkCreate;
+    cuLinkAddData_fn cuLinkAddData;
+    cuLinkComplete_fn cuLinkComplete;
+    cuLinkDestroy_fn cuLinkDestroy;
+    cuCtxGetLimit_fn cuCtxGetLimit;
+    cuStreamCreate_fn cuStreamCreate;
+    cuStreamDestroy_fn cuStreamDestroy;
+    cuStreamSynchronize_fn cuStreamSynchronize;
+    cuStreamWaitEvent_fn cuStreamWaitEvent;
+    cuStreamWaitValue32_fn cuStreamWaitValue32;
+    cuStreamBatchMemOp_fn cuStreamBatchMemOp;
+    cuStreamGetCaptureInfo_v2_fn cuStreamGetCaptureInfo_v2;
+    cuStreamGetCtx_fn cuStreamGetCtx;
+    cuStreamBeginCapture_fn cuStreamBeginCapture;
+    cuStreamEndCapture_fn cuStreamEndCapture;
+    cuStreamIsCapturing_fn cuStreamIsCapturing;
+    cuEventCreate_fn cuEventCreate;
+    cuEventDestroy_fn cuEventDestroy;
+    cuEventRecord_fn cuEventRecord;
+    cuEventQuery_fn cuEventQuery;
+    cuEventSynchronize_fn cuEventSynchronize;
+    cuEventElapsedTime_fn cuEventElapsedTime;
+    cuMemPrefetchAsync_fn cuMemPrefetchAsync;
+    cuCtxEnablePeerAccess_fn cuCtxEnablePeerAccess;
+    cuCtxDisablePeerAccess_fn cuCtxDisablePeerAccess;
+    cuDeviceCanAccessPeer_fn cuDeviceCanAccessPeer;
     cuCtxPushCurrent_fn cuCtxPushCurrent;
     cuCtxPopCurrent_fn cuCtxPopCurrent;
     cuCtxSetCurrent_fn cuCtxSetCurrent;
@@ -294,6 +346,40 @@ static HetGPUError hetgpu_init_internal(HetGPUState *state,
                 dlsym(g_cuda_lib_handle, "cuGraphGetNodes");
             g_cuda_funcs.cuGraphNodeGetType =
                 dlsym(g_cuda_lib_handle, "cuGraphNodeGetType");
+            g_cuda_funcs.cuLinkCreate = dlsym(g_cuda_lib_handle, "cuLinkCreate_v2");
+            if (!g_cuda_funcs.cuLinkCreate)
+                g_cuda_funcs.cuLinkCreate = dlsym(g_cuda_lib_handle, "cuLinkCreate");
+            g_cuda_funcs.cuLinkAddData = dlsym(g_cuda_lib_handle, "cuLinkAddData_v2");
+            if (!g_cuda_funcs.cuLinkAddData)
+                g_cuda_funcs.cuLinkAddData = dlsym(g_cuda_lib_handle, "cuLinkAddData");
+            g_cuda_funcs.cuLinkComplete = dlsym(g_cuda_lib_handle, "cuLinkComplete");
+            g_cuda_funcs.cuLinkDestroy = dlsym(g_cuda_lib_handle, "cuLinkDestroy");
+            g_cuda_funcs.cuCtxGetLimit = dlsym(g_cuda_lib_handle, "cuCtxGetLimit");
+            g_cuda_funcs.cuStreamCreate = dlsym(g_cuda_lib_handle, "cuStreamCreate");
+            g_cuda_funcs.cuStreamDestroy = dlsym(g_cuda_lib_handle, "cuStreamDestroy_v2");
+            g_cuda_funcs.cuStreamSynchronize = dlsym(g_cuda_lib_handle, "cuStreamSynchronize");
+            g_cuda_funcs.cuStreamWaitEvent = dlsym(g_cuda_lib_handle, "cuStreamWaitEvent");
+            g_cuda_funcs.cuStreamWaitValue32 = dlsym(g_cuda_lib_handle, "cuStreamWaitValue32");
+            g_cuda_funcs.cuStreamBatchMemOp = dlsym(g_cuda_lib_handle, "cuStreamBatchMemOp");
+            g_cuda_funcs.cuStreamGetCaptureInfo_v2 = dlsym(g_cuda_lib_handle, "cuStreamGetCaptureInfo_v2");
+            g_cuda_funcs.cuStreamGetCtx = dlsym(g_cuda_lib_handle, "cuStreamGetCtx");
+            g_cuda_funcs.cuStreamBeginCapture = dlsym(g_cuda_lib_handle, "cuStreamBeginCapture_v2");
+            if (!g_cuda_funcs.cuStreamBeginCapture)
+                g_cuda_funcs.cuStreamBeginCapture = dlsym(g_cuda_lib_handle, "cuStreamBeginCapture");
+            g_cuda_funcs.cuStreamEndCapture = dlsym(g_cuda_lib_handle, "cuStreamEndCapture");
+            g_cuda_funcs.cuStreamIsCapturing = dlsym(g_cuda_lib_handle, "cuStreamIsCapturing");
+            g_cuda_funcs.cuEventCreate = dlsym(g_cuda_lib_handle, "cuEventCreate");
+            g_cuda_funcs.cuEventDestroy = dlsym(g_cuda_lib_handle, "cuEventDestroy_v2");
+            g_cuda_funcs.cuEventRecord = dlsym(g_cuda_lib_handle, "cuEventRecord");
+            g_cuda_funcs.cuEventQuery = dlsym(g_cuda_lib_handle, "cuEventQuery");
+            g_cuda_funcs.cuEventSynchronize = dlsym(g_cuda_lib_handle, "cuEventSynchronize");
+            g_cuda_funcs.cuEventElapsedTime = dlsym(g_cuda_lib_handle, "cuEventElapsedTime_v2");
+            if (!g_cuda_funcs.cuEventElapsedTime)
+                g_cuda_funcs.cuEventElapsedTime = dlsym(g_cuda_lib_handle, "cuEventElapsedTime");
+            g_cuda_funcs.cuMemPrefetchAsync = dlsym(g_cuda_lib_handle, "cuMemPrefetchAsync");
+            g_cuda_funcs.cuCtxEnablePeerAccess = dlsym(g_cuda_lib_handle, "cuCtxEnablePeerAccess");
+            g_cuda_funcs.cuCtxDisablePeerAccess = dlsym(g_cuda_lib_handle, "cuCtxDisablePeerAccess");
+            g_cuda_funcs.cuDeviceCanAccessPeer = dlsym(g_cuda_lib_handle, "cuDeviceCanAccessPeer");
             g_cuda_funcs.cuCtxPushCurrent = dlsym(g_cuda_lib_handle, "cuCtxPushCurrent_v2");
             g_cuda_funcs.cuCtxPopCurrent = dlsym(g_cuda_lib_handle, "cuCtxPopCurrent_v2");
             g_cuda_funcs.cuCtxSetCurrent = dlsym(g_cuda_lib_handle, "cuCtxSetCurrent");
@@ -729,6 +815,27 @@ int hetgpu_cuda_get_error_name(HetGPUState *state, int error,
 
     qemu_mutex_lock(&g_cuda_mutex);
     result = HETGPU_CUDA_CALL(cuGetErrorName, error, name);
+    qemu_mutex_unlock(&g_cuda_mutex);
+    return result;
+}
+
+int hetgpu_cuda_get_error_string(HetGPUState *state, int error,
+                                 const char **string)
+{
+    int result;
+
+    if (!string) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    *string = NULL;
+    if (!state || !state->initialized ||
+        state->backend == HETGPU_BACKEND_SIMULATION ||
+        !g_cuda_mutex_initialized || !g_cuda_funcs.cuGetErrorString) {
+        return CUDA_ERROR_NOT_INITIALIZED;
+    }
+
+    qemu_mutex_lock(&g_cuda_mutex);
+    result = HETGPU_CUDA_CALL(cuGetErrorString, error, string);
     qemu_mutex_unlock(&g_cuda_mutex);
     return result;
 }
@@ -1919,26 +2026,233 @@ int hetgpu_cuda_graph_node_get_type(HetGPUState *state,
     return result;
 }
 
+static bool hetgpu_cuda_ready(HetGPUState *state)
+{
+    return state && state->initialized && state->backend != HETGPU_BACKEND_SIMULATION;
+}
+
+#define HETGPU_FORWARD_BODY(field, ...)                                        \
+    do {                                                                        \
+        if (!hetgpu_cuda_ready(state))                                          \
+            return CUDA_ERROR_INVALID_CONTEXT;                                  \
+        if (!g_cuda_funcs.field)                                                \
+            return CUDA_ERROR_NOT_SUPPORTED;                                    \
+        if (!cuda_lock(state))                                                  \
+            return CUDA_ERROR_INVALID_CONTEXT;                                  \
+        int result = HETGPU_CUDA_CALL(field, __VA_ARGS__);                       \
+        cuda_unlock(state);                                                     \
+        return result;                                                          \
+    } while (0)
+
+int hetgpu_cuda_link_create(HetGPUState *state, void **link_state)
+{
+    if (!link_state)
+        return CUDA_ERROR_INVALID_VALUE;
+    HETGPU_FORWARD_BODY(cuLinkCreate, 0, NULL, NULL, link_state);
+}
+
+int hetgpu_cuda_link_add_data(HetGPUState *state, void *link_state, int input_type,
+                              void *data, size_t size, const char *name)
+{
+    if (!link_state || !data || !size)
+        return CUDA_ERROR_INVALID_VALUE;
+    HETGPU_FORWARD_BODY(cuLinkAddData, link_state, input_type, data, size, name,
+                        0, NULL, NULL);
+}
+
+int hetgpu_cuda_link_complete(HetGPUState *state, void *link_state,
+                              void **cubin, size_t *size)
+{
+    if (!link_state || !cubin || !size)
+        return CUDA_ERROR_INVALID_VALUE;
+    HETGPU_FORWARD_BODY(cuLinkComplete, link_state, cubin, size);
+}
+
+int hetgpu_cuda_link_destroy(HetGPUState *state, void *link_state)
+{
+    if (!link_state)
+        return CUDA_ERROR_INVALID_VALUE;
+    HETGPU_FORWARD_BODY(cuLinkDestroy, link_state);
+}
+
+int hetgpu_cuda_ctx_get_limit(HetGPUState *state, size_t *value, int limit)
+{
+    if (!value)
+        return CUDA_ERROR_INVALID_VALUE;
+    HETGPU_FORWARD_BODY(cuCtxGetLimit, value, limit);
+}
+
+int hetgpu_cuda_stream_create(HetGPUState *state, unsigned int flags,
+                              HetGPUStream *stream)
+{
+    if (!stream)
+        return CUDA_ERROR_INVALID_VALUE;
+    HETGPU_FORWARD_BODY(cuStreamCreate, stream, flags);
+}
+
+int hetgpu_cuda_stream_destroy(HetGPUState *state, HetGPUStream stream)
+{
+    if (!stream)
+        return CUDA_ERROR_INVALID_VALUE;
+    HETGPU_FORWARD_BODY(cuStreamDestroy, stream);
+}
+
+int hetgpu_cuda_stream_synchronize(HetGPUState *state, HetGPUStream stream)
+{
+    HETGPU_FORWARD_BODY(cuStreamSynchronize, stream);
+}
+
+int hetgpu_cuda_stream_wait_event(HetGPUState *state, HetGPUStream stream,
+                                  void *event, unsigned int flags)
+{
+    if (!event)
+        return CUDA_ERROR_INVALID_VALUE;
+    HETGPU_FORWARD_BODY(cuStreamWaitEvent, stream, event, flags);
+}
+
+int hetgpu_cuda_stream_wait_value32(HetGPUState *state, HetGPUStream stream,
+                                    uint64_t address, uint32_t value,
+                                    unsigned int flags)
+{
+    HETGPU_FORWARD_BODY(cuStreamWaitValue32, stream, address, value, flags);
+}
+
+int hetgpu_cuda_stream_batch_mem_op(HetGPUState *state, HetGPUStream stream,
+                                    unsigned int count, void *params,
+                                    unsigned int flags)
+{
+    if (count && !params)
+        return CUDA_ERROR_INVALID_VALUE;
+    HETGPU_FORWARD_BODY(cuStreamBatchMemOp, stream, count, params, flags);
+}
+
+int hetgpu_cuda_stream_get_capture_info(HetGPUState *state, HetGPUStream stream,
+                                        int *status, uint64_t *id, void **graph,
+                                        void ***dependencies, size_t *count)
+{
+    if (!status)
+        return CUDA_ERROR_INVALID_VALUE;
+    HETGPU_FORWARD_BODY(cuStreamGetCaptureInfo_v2, stream, status, id, graph,
+                        dependencies, count);
+}
+
+int hetgpu_cuda_stream_get_ctx(HetGPUState *state, HetGPUStream stream,
+                               void **context)
+{
+    if (!context)
+        return CUDA_ERROR_INVALID_VALUE;
+    HETGPU_FORWARD_BODY(cuStreamGetCtx, stream, context);
+}
+
+int hetgpu_cuda_stream_begin_capture(HetGPUState *state, HetGPUStream stream,
+                                     int mode)
+{
+    HETGPU_FORWARD_BODY(cuStreamBeginCapture, stream, mode);
+}
+
+int hetgpu_cuda_stream_end_capture(HetGPUState *state, HetGPUStream stream,
+                                   void **graph)
+{
+    if (!graph)
+        return CUDA_ERROR_INVALID_VALUE;
+    HETGPU_FORWARD_BODY(cuStreamEndCapture, stream, graph);
+}
+
+int hetgpu_cuda_stream_is_capturing(HetGPUState *state, HetGPUStream stream,
+                                    int *status)
+{
+    if (!status)
+        return CUDA_ERROR_INVALID_VALUE;
+    HETGPU_FORWARD_BODY(cuStreamIsCapturing, stream, status);
+}
+
+int hetgpu_cuda_event_create(HetGPUState *state, unsigned int flags, void **event)
+{
+    if (!event)
+        return CUDA_ERROR_INVALID_VALUE;
+    HETGPU_FORWARD_BODY(cuEventCreate, event, flags);
+}
+
+int hetgpu_cuda_event_destroy(HetGPUState *state, void *event)
+{
+    if (!event)
+        return CUDA_ERROR_INVALID_VALUE;
+    HETGPU_FORWARD_BODY(cuEventDestroy, event);
+}
+
+int hetgpu_cuda_event_record(HetGPUState *state, void *event, HetGPUStream stream)
+{
+    if (!event)
+        return CUDA_ERROR_INVALID_VALUE;
+    HETGPU_FORWARD_BODY(cuEventRecord, event, stream);
+}
+
+int hetgpu_cuda_event_query(HetGPUState *state, void *event)
+{
+    if (!event)
+        return CUDA_ERROR_INVALID_VALUE;
+    HETGPU_FORWARD_BODY(cuEventQuery, event);
+}
+
+int hetgpu_cuda_event_synchronize(HetGPUState *state, void *event)
+{
+    if (!event)
+        return CUDA_ERROR_INVALID_VALUE;
+    HETGPU_FORWARD_BODY(cuEventSynchronize, event);
+}
+
+int hetgpu_cuda_event_elapsed_time(HetGPUState *state, float *milliseconds,
+                                   void *start, void *end)
+{
+    if (!milliseconds || !start || !end)
+        return CUDA_ERROR_INVALID_VALUE;
+    HETGPU_FORWARD_BODY(cuEventElapsedTime, milliseconds, start, end);
+}
+
+int hetgpu_cuda_mem_prefetch_async(HetGPUState *state, uint64_t ptr, size_t count,
+                                   int device, HetGPUStream stream)
+{
+    HETGPU_FORWARD_BODY(cuMemPrefetchAsync, ptr, count, device, stream);
+}
+
+int hetgpu_cuda_ctx_enable_peer_access(HetGPUState *state, void *peer_context,
+                                       unsigned int flags)
+{
+    if (!peer_context)
+        return CUDA_ERROR_INVALID_VALUE;
+    HETGPU_FORWARD_BODY(cuCtxEnablePeerAccess, peer_context, flags);
+}
+
+int hetgpu_cuda_ctx_disable_peer_access(HetGPUState *state, void *peer_context)
+{
+    if (!peer_context)
+        return CUDA_ERROR_INVALID_VALUE;
+    HETGPU_FORWARD_BODY(cuCtxDisablePeerAccess, peer_context);
+}
+
+int hetgpu_cuda_device_can_access_peer(HetGPUState *state, int *can_access,
+                                       int device, int peer_device)
+{
+    if (!can_access)
+        return CUDA_ERROR_INVALID_VALUE;
+    HETGPU_FORWARD_BODY(cuDeviceCanAccessPeer, can_access, device, peer_device);
+}
+
+#undef HETGPU_FORWARD_BODY
+
 HetGPUError hetgpu_create_stream(HetGPUState *state, HetGPUStream *stream)
 {
-    if (!state || !state->initialized || !stream) {
-        return HETGPU_ERROR_INVALID_VALUE;
-    }
-
-    *stream = (void *)1;  /* Dummy stream for now */
-    return HETGPU_SUCCESS;
+    return (HetGPUError)hetgpu_cuda_stream_create(state, 0, stream);
 }
 
 void hetgpu_destroy_stream(HetGPUState *state, HetGPUStream stream)
 {
-    (void)state;
-    (void)stream;
+    (void)hetgpu_cuda_stream_destroy(state, stream);
 }
 
 HetGPUError hetgpu_stream_synchronize(HetGPUState *state, HetGPUStream stream)
 {
-    (void)stream;
-    return hetgpu_synchronize(state);
+    return (HetGPUError)hetgpu_cuda_stream_synchronize(state, stream);
 }
 
 const char *hetgpu_get_error_string(HetGPUError error)

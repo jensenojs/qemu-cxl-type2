@@ -317,6 +317,8 @@ int hetgpu_cuda_device_get_attribute(HetGPUState *state, int attribute,
 int hetgpu_cuda_device_total_memory(HetGPUState *state, size_t *bytes);
 int hetgpu_cuda_get_error_name(HetGPUState *state, int error,
                                const char **name);
+int hetgpu_cuda_get_error_string(HetGPUState *state, int error,
+                                 const char **string);
 int hetgpu_cuda_module_get_loading_mode(HetGPUState *state, int *mode);
 int hetgpu_cuda_mem_get_info(HetGPUState *state, size_t *free_bytes,
                              size_t *total_bytes);
@@ -597,6 +599,50 @@ int hetgpu_cuda_graph_get_nodes(HetGPUState *state, HetGPUGraph graph,
 int hetgpu_cuda_graph_node_get_type(HetGPUState *state,
                                     HetGPUGraphNode graph_node,
                                     int *node_type);
+int hetgpu_cuda_link_create(HetGPUState *state, void **link_state);
+int hetgpu_cuda_link_add_data(HetGPUState *state, void *link_state, int input_type,
+                              void *data, size_t size, const char *name);
+int hetgpu_cuda_link_complete(HetGPUState *state, void *link_state,
+                              void **cubin, size_t *size);
+int hetgpu_cuda_link_destroy(HetGPUState *state, void *link_state);
+int hetgpu_cuda_ctx_get_limit(HetGPUState *state, size_t *value, int limit);
+int hetgpu_cuda_stream_create(HetGPUState *state, unsigned int flags,
+                              HetGPUStream *stream);
+int hetgpu_cuda_stream_destroy(HetGPUState *state, HetGPUStream stream);
+int hetgpu_cuda_stream_synchronize(HetGPUState *state, HetGPUStream stream);
+int hetgpu_cuda_stream_wait_event(HetGPUState *state, HetGPUStream stream,
+                                  void *event, unsigned int flags);
+int hetgpu_cuda_stream_wait_value32(HetGPUState *state, HetGPUStream stream,
+                                    uint64_t address, uint32_t value,
+                                    unsigned int flags);
+int hetgpu_cuda_stream_batch_mem_op(HetGPUState *state, HetGPUStream stream,
+                                    unsigned int count, void *params,
+                                    unsigned int flags);
+int hetgpu_cuda_stream_get_capture_info(HetGPUState *state, HetGPUStream stream,
+                                        int *status, uint64_t *id, void **graph,
+                                        void ***dependencies, size_t *count);
+int hetgpu_cuda_stream_get_ctx(HetGPUState *state, HetGPUStream stream,
+                               void **context);
+int hetgpu_cuda_stream_begin_capture(HetGPUState *state, HetGPUStream stream,
+                                     int mode);
+int hetgpu_cuda_stream_end_capture(HetGPUState *state, HetGPUStream stream,
+                                   void **graph);
+int hetgpu_cuda_stream_is_capturing(HetGPUState *state, HetGPUStream stream,
+                                    int *status);
+int hetgpu_cuda_event_create(HetGPUState *state, unsigned int flags, void **event);
+int hetgpu_cuda_event_destroy(HetGPUState *state, void *event);
+int hetgpu_cuda_event_record(HetGPUState *state, void *event, HetGPUStream stream);
+int hetgpu_cuda_event_query(HetGPUState *state, void *event);
+int hetgpu_cuda_event_synchronize(HetGPUState *state, void *event);
+int hetgpu_cuda_event_elapsed_time(HetGPUState *state, float *milliseconds,
+                                   void *start, void *end);
+int hetgpu_cuda_mem_prefetch_async(HetGPUState *state, uint64_t ptr, size_t count,
+                                   int device, HetGPUStream stream);
+int hetgpu_cuda_ctx_enable_peer_access(HetGPUState *state, void *peer_context,
+                                       unsigned int flags);
+int hetgpu_cuda_ctx_disable_peer_access(HetGPUState *state, void *peer_context);
+int hetgpu_cuda_device_can_access_peer(HetGPUState *state, int *can_access,
+                                       int device, int peer_device);
 
 /* ========================================================================
  * Stream Management

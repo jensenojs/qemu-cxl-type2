@@ -214,16 +214,25 @@ typedef struct CXLType2State {
         void    **graphs;              /* CUDA graph handles */
         void    **graph_execs;         /* CUDA executable graph handles */
         void    **graph_nodes;         /* CUDA graph node handles */
+        void    **link_states;         /* CUDA JIT link state handles */
+        void    **streams;             /* CUDA stream handles */
+        void    **events;              /* CUDA event handles */
         size_t   modules_capacity;
         size_t   functions_capacity;
         size_t   graphs_capacity;
         size_t   graph_execs_capacity;
         size_t   graph_nodes_capacity;
+        size_t   link_states_capacity;
+        size_t   streams_capacity;
+        size_t   events_capacity;
         uint32_t num_modules;
         uint32_t num_functions;
         uint32_t num_graphs;
         uint32_t num_graph_execs;
         uint32_t num_graph_nodes;
+        uint32_t num_link_states;
+        uint32_t num_streams;
+        uint32_t num_events;
         uint32_t modules_high_water;
         uint32_t functions_high_water;
         uint32_t capabilities;         /* Device capabilities (bulk transfer, etc.) */

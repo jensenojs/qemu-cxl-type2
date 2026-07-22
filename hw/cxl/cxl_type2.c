@@ -2288,6 +2288,7 @@ static bool cxl_type2_command_requires_formal_case(uint32_t cmd)
     case CXL_GPU_CMD_GET_TOTAL_MEM:
     case CXL_GPU_CMD_GET_DEVICE_ATTRIBUTE:
     case CXL_GPU_CMD_GET_ERROR_NAME:
+    case CXL_GPU_CMD_GET_ERROR_STRING:
     case CXL_GPU_CMD_MODULE_GET_LOADING_MODE:
     case CXL_GPU_CMD_CASE_BEGIN:
     case CXL_GPU_CMD_CASE_END:
@@ -2376,12 +2377,33 @@ static bool cxl_type2_register_gpu_handle(void ***handles, size_t *capacity,
     return true;
 }
 
+static bool cxl_type2_stream_from_wire(CXLType2State *ct2d, uint64_t wire,
+                                       void **stream)
+{
+    if (!stream) {
+        return false;
+    }
+    if (wire == UINT64_MAX) {
+        *stream = NULL;
+        return true;
+    }
+    if (wire > UINT32_MAX || wire >= ct2d->gpu_cmd.num_streams ||
+        !ct2d->gpu_cmd.streams[wire]) {
+        return false;
+    }
+    *stream = ct2d->gpu_cmd.streams[wire];
+    return true;
+}
+
 static void cxl_type2_clear_gpu_handles(CXLType2State *ct2d)
 {
+    HetGPUState *hetgpu = &ct2d->gpu_info.hetgpu_state;
+
     if (ct2d->gpu_cmd.num_modules || ct2d->gpu_cmd.num_functions ||
         ct2d->gpu_cmd.num_graphs || ct2d->gpu_cmd.num_graph_execs ||
-        ct2d->gpu_cmd.num_graph_nodes) {
-        qemu_log("CXL Type2: GPU handle tables reset modules live=%u high_water=%u capacity=%zu functions live=%u high_water=%u capacity=%zu graphs live=%u execs live=%u nodes live=%u\n",
+        ct2d->gpu_cmd.num_graph_nodes || ct2d->gpu_cmd.num_link_states ||
+        ct2d->gpu_cmd.num_streams || ct2d->gpu_cmd.num_events) {
+        qemu_log("CXL Type2: GPU handle tables reset modules live=%u high_water=%u capacity=%zu functions live=%u high_water=%u capacity=%zu graphs live=%u execs live=%u nodes live=%u links live=%u streams live=%u events live=%u\n",
                  ct2d->gpu_cmd.num_modules,
                  ct2d->gpu_cmd.modules_high_water,
                  ct2d->gpu_cmd.modules_capacity,
@@ -2390,28 +2412,60 @@ static void cxl_type2_clear_gpu_handles(CXLType2State *ct2d)
                  ct2d->gpu_cmd.functions_capacity,
                  ct2d->gpu_cmd.num_graphs,
                  ct2d->gpu_cmd.num_graph_execs,
-                 ct2d->gpu_cmd.num_graph_nodes);
+                 ct2d->gpu_cmd.num_graph_nodes,
+                 ct2d->gpu_cmd.num_link_states,
+                 ct2d->gpu_cmd.num_streams,
+                 ct2d->gpu_cmd.num_events);
+    }
+    if (hetgpu->initialized) {
+        for (uint32_t i = 0; i < ct2d->gpu_cmd.num_events; i++) {
+            if (ct2d->gpu_cmd.events[i])
+                (void)hetgpu_cuda_event_destroy(hetgpu,
+                                                ct2d->gpu_cmd.events[i]);
+        }
+        for (uint32_t i = 0; i < ct2d->gpu_cmd.num_streams; i++) {
+            if (ct2d->gpu_cmd.streams[i])
+                (void)hetgpu_cuda_stream_destroy(hetgpu,
+                                                 ct2d->gpu_cmd.streams[i]);
+        }
+        for (uint32_t i = 0; i < ct2d->gpu_cmd.num_link_states; i++) {
+            if (ct2d->gpu_cmd.link_states[i])
+                (void)hetgpu_cuda_link_destroy(hetgpu,
+                                               ct2d->gpu_cmd.link_states[i]);
+        }
     }
     g_free(ct2d->gpu_cmd.modules);
     g_free(ct2d->gpu_cmd.functions);
     g_free(ct2d->gpu_cmd.graphs);
     g_free(ct2d->gpu_cmd.graph_execs);
     g_free(ct2d->gpu_cmd.graph_nodes);
+    g_free(ct2d->gpu_cmd.link_states);
+    g_free(ct2d->gpu_cmd.streams);
+    g_free(ct2d->gpu_cmd.events);
     ct2d->gpu_cmd.modules = NULL;
     ct2d->gpu_cmd.functions = NULL;
     ct2d->gpu_cmd.graphs = NULL;
     ct2d->gpu_cmd.graph_execs = NULL;
     ct2d->gpu_cmd.graph_nodes = NULL;
+    ct2d->gpu_cmd.link_states = NULL;
+    ct2d->gpu_cmd.streams = NULL;
+    ct2d->gpu_cmd.events = NULL;
     ct2d->gpu_cmd.modules_capacity = 0;
     ct2d->gpu_cmd.functions_capacity = 0;
     ct2d->gpu_cmd.graphs_capacity = 0;
     ct2d->gpu_cmd.graph_execs_capacity = 0;
     ct2d->gpu_cmd.graph_nodes_capacity = 0;
+    ct2d->gpu_cmd.link_states_capacity = 0;
+    ct2d->gpu_cmd.streams_capacity = 0;
+    ct2d->gpu_cmd.events_capacity = 0;
     ct2d->gpu_cmd.num_modules = 0;
     ct2d->gpu_cmd.num_functions = 0;
     ct2d->gpu_cmd.num_graphs = 0;
     ct2d->gpu_cmd.num_graph_execs = 0;
     ct2d->gpu_cmd.num_graph_nodes = 0;
+    ct2d->gpu_cmd.num_link_states = 0;
+    ct2d->gpu_cmd.num_streams = 0;
+    ct2d->gpu_cmd.num_events = 0;
     ct2d->gpu_cmd.modules_high_water = 0;
     ct2d->gpu_cmd.functions_high_water = 0;
 }
@@ -2731,6 +2785,30 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
     case CXL_GPU_CMD_INIT:
         if (!hetgpu->initialized) {
             ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
+        }
+        break;
+
+    case CXL_GPU_CMD_GET_ERROR_STRING:
+        {
+            const char *string = NULL;
+            size_t length;
+            int result = hetgpu_cuda_get_error_string(
+                hetgpu, (int)ct2d->gpu_cmd.params[0], &string);
+
+            ct2d->gpu_cmd.cmd_result = result;
+            if (result != CXL_GPU_SUCCESS)
+                break;
+            if (!string) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                break;
+            }
+            length = strnlen(string, ct2d->gpu_cmd.data_size);
+            if (length == ct2d->gpu_cmd.data_size) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                break;
+            }
+            memcpy(ct2d->gpu_cmd.data, string, length + 1);
+            ct2d->gpu_cmd.results[0] = length;
         }
         break;
 
@@ -3567,16 +3645,18 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         }
         {
             uint64_t graph_exec_id_raw = ct2d->gpu_cmd.params[0];
-            uint64_t stream_tag = ct2d->gpu_cmd.params[1];
+            void *stream = NULL;
 
-            if (graph_exec_id_raw > UINT32_MAX || stream_tag > 1 ||
+            if (graph_exec_id_raw > UINT32_MAX ||
                 graph_exec_id_raw >= ct2d->gpu_cmd.num_graph_execs ||
-                !ct2d->gpu_cmd.graph_execs[graph_exec_id_raw]) {
+                !ct2d->gpu_cmd.graph_execs[graph_exec_id_raw] ||
+                !cxl_type2_stream_from_wire(ct2d, ct2d->gpu_cmd.params[1],
+                                            &stream)) {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
                 break;
             }
             ct2d->gpu_cmd.cmd_result = hetgpu_cuda_graph_launch(
-                hetgpu, ct2d->gpu_cmd.graph_execs[graph_exec_id_raw], NULL);
+                hetgpu, ct2d->gpu_cmd.graph_execs[graph_exec_id_raw], stream);
         }
         break;
 
@@ -3779,6 +3859,141 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         }
         break;
 
+    case CXL_GPU_CMD_LINK_CREATE:
+        memset(ct2d->gpu_cmd.results, 0xff, sizeof(ct2d->gpu_cmd.results));
+        {
+            void *link_state = NULL;
+            uint32_t id;
+            int result = hetgpu_cuda_link_create(hetgpu, &link_state);
+
+            ct2d->gpu_cmd.cmd_result = result;
+            if (result == CXL_GPU_SUCCESS) {
+                if (!cxl_type2_register_gpu_handle(&ct2d->gpu_cmd.link_states,
+                        &ct2d->gpu_cmd.link_states_capacity,
+                        &ct2d->gpu_cmd.num_link_states, link_state, &id)) {
+                    (void)hetgpu_cuda_link_destroy(hetgpu, link_state);
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_OUT_OF_MEMORY;
+                } else {
+                    ct2d->gpu_cmd.results[0] = id;
+                }
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_LINK_ADD_DATA:
+        {
+            uint64_t id = ct2d->gpu_cmd.params[0];
+            size_t input_size = ct2d->gpu_cmd.params[2];
+            size_t name_size = ct2d->gpu_cmd.params[3];
+
+            if (id > UINT32_MAX || id >= ct2d->gpu_cmd.num_link_states ||
+                !ct2d->gpu_cmd.link_states[id]) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                break;
+            }
+            if (!input_size || input_size > ct2d->gpu_cmd.data_size ||
+                name_size > ct2d->gpu_cmd.data_size - input_size ||
+                (name_size && ct2d->gpu_cmd.data[input_size + name_size - 1] != 0)) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                break;
+            }
+            ct2d->gpu_cmd.cmd_result = hetgpu_cuda_link_add_data(
+                hetgpu, ct2d->gpu_cmd.link_states[id],
+                (int)ct2d->gpu_cmd.params[1], ct2d->gpu_cmd.data, input_size,
+                name_size ? (char *)ct2d->gpu_cmd.data + input_size : NULL);
+        }
+        break;
+
+    case CXL_GPU_CMD_LINK_COMPLETE:
+        memset(ct2d->gpu_cmd.results, 0, sizeof(ct2d->gpu_cmd.results));
+        {
+            uint64_t id = ct2d->gpu_cmd.params[0];
+            void *cubin = NULL;
+            size_t cubin_size = 0;
+
+            if (id > UINT32_MAX || id >= ct2d->gpu_cmd.num_link_states ||
+                !ct2d->gpu_cmd.link_states[id]) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                break;
+            }
+            int result = hetgpu_cuda_link_complete(
+                hetgpu, ct2d->gpu_cmd.link_states[id], &cubin, &cubin_size);
+            ct2d->gpu_cmd.cmd_result = result;
+            if (result == CXL_GPU_SUCCESS) {
+                if (!cubin || cubin_size > ct2d->gpu_cmd.data_size) {
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_SUPPORTED;
+                    break;
+                }
+                memcpy(ct2d->gpu_cmd.data, cubin, cubin_size);
+                ct2d->gpu_cmd.results[0] = cubin_size;
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_LINK_DESTROY:
+        {
+            uint64_t id = ct2d->gpu_cmd.params[0];
+
+            if (id > UINT32_MAX || id >= ct2d->gpu_cmd.num_link_states ||
+                !ct2d->gpu_cmd.link_states[id]) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                break;
+            }
+            int result = hetgpu_cuda_link_destroy(
+                hetgpu, ct2d->gpu_cmd.link_states[id]);
+            ct2d->gpu_cmd.cmd_result = result;
+            if (result == CXL_GPU_SUCCESS)
+                ct2d->gpu_cmd.link_states[id] = NULL;
+        }
+        break;
+
+    case CXL_GPU_CMD_CTX_GET_LIMIT:
+        {
+            size_t value = 0;
+            int result = hetgpu_cuda_ctx_get_limit(
+                hetgpu, &value, (int)ct2d->gpu_cmd.params[0]);
+            ct2d->gpu_cmd.cmd_result = result;
+            if (result == CXL_GPU_SUCCESS)
+                ct2d->gpu_cmd.results[0] = value;
+        }
+        break;
+
+    case CXL_GPU_CMD_DEVICE_CAN_ACCESS_PEER:
+        {
+            int can_access = 0;
+            int result = hetgpu_cuda_device_can_access_peer(
+                hetgpu, &can_access, (int)ct2d->gpu_cmd.params[0],
+                (int)ct2d->gpu_cmd.params[1]);
+            ct2d->gpu_cmd.cmd_result = result;
+            if (result == CXL_GPU_SUCCESS)
+                ct2d->gpu_cmd.results[0] = can_access;
+        }
+        break;
+
+    case CXL_GPU_CMD_CTX_ENABLE_PEER:
+        ct2d->gpu_cmd.cmd_result = hetgpu_cuda_ctx_enable_peer_access(
+            hetgpu, hetgpu->context, (unsigned int)ct2d->gpu_cmd.params[1]);
+        break;
+
+    case CXL_GPU_CMD_CTX_DISABLE_PEER:
+        ct2d->gpu_cmd.cmd_result = hetgpu_cuda_ctx_disable_peer_access(
+            hetgpu, hetgpu->context);
+        break;
+
+    case CXL_GPU_CMD_MEM_PREFETCH_ASYNC:
+        {
+            void *stream = NULL;
+            if (!cxl_type2_stream_from_wire(ct2d, ct2d->gpu_cmd.params[3],
+                                            &stream)) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                break;
+            }
+            ct2d->gpu_cmd.cmd_result = hetgpu_cuda_mem_prefetch_async(
+                hetgpu, ct2d->gpu_cmd.params[0], ct2d->gpu_cmd.params[1],
+                (int)ct2d->gpu_cmd.params[2], stream);
+        }
+        break;
+
     case CXL_GPU_CMD_LAUNCH_KERNEL:
         if (hetgpu->initialized) {
             uint32_t func_id = ct2d->gpu_cmd.params[0];
@@ -3791,7 +4006,12 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 config.block_dim[1] = ct2d->gpu_cmd.params[3] & 0xFFFFFFFF;
                 config.block_dim[2] = (ct2d->gpu_cmd.params[3] >> 32) & 0xFFFFFFFF;
                 config.shared_mem_bytes = ct2d->gpu_cmd.params[4] & 0xFFFFFFFF;
-                config.stream = NULL;
+                if (!cxl_type2_stream_from_wire(ct2d,
+                                                ct2d->gpu_cmd.params[6],
+                                                &config.stream)) {
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                    break;
+                }
 
                 uint32_t num_args = (ct2d->gpu_cmd.params[4] >> 32) & 0xFF;
                 size_t param_extent = ct2d->gpu_cmd.params[5];
@@ -3845,6 +4065,319 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             }
         } else {
             ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
+        }
+        break;
+
+    case CXL_GPU_CMD_STREAM_CREATE:
+        memset(ct2d->gpu_cmd.results, 0xff, sizeof(ct2d->gpu_cmd.results));
+        {
+            void *stream = NULL;
+            uint32_t id;
+            int result = hetgpu_cuda_stream_create(
+                hetgpu, (unsigned int)ct2d->gpu_cmd.params[0], &stream);
+            ct2d->gpu_cmd.cmd_result = result;
+            if (result == CXL_GPU_SUCCESS) {
+                if (!cxl_type2_register_gpu_handle(&ct2d->gpu_cmd.streams,
+                        &ct2d->gpu_cmd.streams_capacity,
+                        &ct2d->gpu_cmd.num_streams, stream, &id)) {
+                    (void)hetgpu_cuda_stream_destroy(hetgpu, stream);
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_OUT_OF_MEMORY;
+                } else {
+                    ct2d->gpu_cmd.results[0] = id;
+                }
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_STREAM_DESTROY:
+        {
+            uint64_t id = ct2d->gpu_cmd.params[0];
+            if (id > UINT32_MAX || id >= ct2d->gpu_cmd.num_streams ||
+                !ct2d->gpu_cmd.streams[id]) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                break;
+            }
+            int result = hetgpu_cuda_stream_destroy(hetgpu,
+                                                     ct2d->gpu_cmd.streams[id]);
+            ct2d->gpu_cmd.cmd_result = result;
+            if (result == CXL_GPU_SUCCESS)
+                ct2d->gpu_cmd.streams[id] = NULL;
+        }
+        break;
+
+    case CXL_GPU_CMD_STREAM_SYNC:
+        {
+            void *stream = NULL;
+            if (!cxl_type2_stream_from_wire(ct2d, ct2d->gpu_cmd.params[0],
+                                            &stream)) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                break;
+            }
+            ct2d->gpu_cmd.cmd_result = hetgpu_cuda_stream_synchronize(hetgpu,
+                                                                      stream);
+        }
+        break;
+
+    case CXL_GPU_CMD_STREAM_WAIT_EVENT:
+        {
+            void *stream = NULL;
+            uint64_t event_id = ct2d->gpu_cmd.params[1];
+            if (!cxl_type2_stream_from_wire(ct2d, ct2d->gpu_cmd.params[0],
+                                            &stream) ||
+                event_id > UINT32_MAX || event_id >= ct2d->gpu_cmd.num_events ||
+                !ct2d->gpu_cmd.events[event_id]) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                break;
+            }
+            ct2d->gpu_cmd.cmd_result = hetgpu_cuda_stream_wait_event(
+                hetgpu, stream, ct2d->gpu_cmd.events[event_id],
+                (unsigned int)ct2d->gpu_cmd.params[2]);
+        }
+        break;
+
+    case CXL_GPU_CMD_STREAM_WAIT_VALUE32:
+        {
+            void *stream = NULL;
+            if (!cxl_type2_stream_from_wire(ct2d, ct2d->gpu_cmd.params[0],
+                                            &stream)) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                break;
+            }
+            ct2d->gpu_cmd.cmd_result = hetgpu_cuda_stream_wait_value32(
+                hetgpu, stream, ct2d->gpu_cmd.params[1],
+                (uint32_t)ct2d->gpu_cmd.params[2],
+                (unsigned int)ct2d->gpu_cmd.params[3]);
+        }
+        break;
+
+    case CXL_GPU_CMD_STREAM_BATCH_MEM_OP:
+        {
+            void *stream = NULL;
+            unsigned int count = ct2d->gpu_cmd.params[1];
+            if (!cxl_type2_stream_from_wire(ct2d, ct2d->gpu_cmd.params[0],
+                                            &stream)) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                break;
+            }
+            if (count >= 256 || count > ct2d->gpu_cmd.data_size / 48) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                break;
+            }
+            ct2d->gpu_cmd.cmd_result = hetgpu_cuda_stream_batch_mem_op(
+                hetgpu, stream, count, count ? ct2d->gpu_cmd.data : NULL,
+                (unsigned int)ct2d->gpu_cmd.params[2]);
+        }
+        break;
+
+    case CXL_GPU_CMD_STREAM_GET_CTX:
+        {
+            void *stream = NULL;
+            void *context = NULL;
+            if (!cxl_type2_stream_from_wire(ct2d, ct2d->gpu_cmd.params[0],
+                                            &stream)) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                break;
+            }
+            int result = hetgpu_cuda_stream_get_ctx(hetgpu, stream, &context);
+            ct2d->gpu_cmd.cmd_result = result;
+            if (result == CXL_GPU_SUCCESS) {
+                if (!context || context != hetgpu->context)
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_CONTEXT;
+                else
+                    ct2d->gpu_cmd.results[0] = 1;
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_STREAM_BEGIN_CAPTURE:
+        {
+            void *stream = NULL;
+            if (!cxl_type2_stream_from_wire(ct2d, ct2d->gpu_cmd.params[0],
+                                            &stream)) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                break;
+            }
+            ct2d->gpu_cmd.cmd_result = hetgpu_cuda_stream_begin_capture(
+                hetgpu, stream, (int)ct2d->gpu_cmd.params[1]);
+        }
+        break;
+
+    case CXL_GPU_CMD_STREAM_END_CAPTURE:
+        memset(ct2d->gpu_cmd.results, 0xff, sizeof(ct2d->gpu_cmd.results));
+        {
+            void *stream = NULL;
+            void *graph = NULL;
+            uint32_t graph_id;
+            if (!cxl_type2_stream_from_wire(ct2d, ct2d->gpu_cmd.params[0],
+                                            &stream)) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                break;
+            }
+            int result = hetgpu_cuda_stream_end_capture(hetgpu, stream, &graph);
+            ct2d->gpu_cmd.cmd_result = result;
+            if (result == CXL_GPU_SUCCESS && graph) {
+                if (!cxl_type2_register_gpu_handle(&ct2d->gpu_cmd.graphs,
+                        &ct2d->gpu_cmd.graphs_capacity,
+                        &ct2d->gpu_cmd.num_graphs, graph, &graph_id)) {
+                    (void)hetgpu_cuda_graph_destroy(hetgpu, graph);
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_OUT_OF_MEMORY;
+                } else {
+                    ct2d->gpu_cmd.results[0] = graph_id;
+                }
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_STREAM_IS_CAPTURING:
+        {
+            void *stream = NULL;
+            int status = 0;
+            if (!cxl_type2_stream_from_wire(ct2d, ct2d->gpu_cmd.params[0],
+                                            &stream)) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                break;
+            }
+            int result = hetgpu_cuda_stream_is_capturing(hetgpu, stream, &status);
+            ct2d->gpu_cmd.cmd_result = result;
+            if (result == CXL_GPU_SUCCESS)
+                ct2d->gpu_cmd.results[0] = status;
+        }
+        break;
+
+    case CXL_GPU_CMD_STREAM_GET_CAPTURE_INFO:
+        memset(ct2d->gpu_cmd.results, 0xff, sizeof(ct2d->gpu_cmd.results));
+        {
+            void *stream = NULL;
+            void *graph = NULL;
+            void **dependencies = NULL;
+            size_t count = 0;
+            int status = 0;
+            uint64_t capture_id = 0;
+            if (!cxl_type2_stream_from_wire(ct2d, ct2d->gpu_cmd.params[0],
+                                            &stream)) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                break;
+            }
+            int result = hetgpu_cuda_stream_get_capture_info(
+                hetgpu, stream, &status, &capture_id, &graph, &dependencies,
+                &count);
+            ct2d->gpu_cmd.cmd_result = result;
+            if (result != CXL_GPU_SUCCESS)
+                break;
+            if (count > ct2d->gpu_cmd.data_size / sizeof(uint64_t)) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_SUPPORTED;
+                break;
+            }
+            ct2d->gpu_cmd.results[0] = (uint64_t)(uint32_t)status;
+            ct2d->gpu_cmd.results[1] = capture_id;
+            ct2d->gpu_cmd.results[2] = count;
+            if (graph) {
+                uint32_t graph_id;
+                if (!cxl_type2_register_gpu_handle(&ct2d->gpu_cmd.graphs,
+                        &ct2d->gpu_cmd.graphs_capacity,
+                        &ct2d->gpu_cmd.num_graphs, graph, &graph_id)) {
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_OUT_OF_MEMORY;
+                    break;
+                }
+                ct2d->gpu_cmd.results[3] = graph_id;
+            }
+            uint64_t *ids = (uint64_t *)ct2d->gpu_cmd.data;
+            for (size_t i = 0; i < count; i++) {
+                uint32_t node_id;
+                if (!dependencies || !cxl_type2_register_gpu_handle(
+                        &ct2d->gpu_cmd.graph_nodes,
+                        &ct2d->gpu_cmd.graph_nodes_capacity,
+                        &ct2d->gpu_cmd.num_graph_nodes, dependencies[i],
+                        &node_id)) {
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_OUT_OF_MEMORY;
+                    break;
+                }
+                ids[i] = node_id;
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_EVENT_CREATE:
+        memset(ct2d->gpu_cmd.results, 0xff, sizeof(ct2d->gpu_cmd.results));
+        {
+            void *event = NULL;
+            uint32_t id;
+            int result = hetgpu_cuda_event_create(
+                hetgpu, (unsigned int)ct2d->gpu_cmd.params[0], &event);
+            ct2d->gpu_cmd.cmd_result = result;
+            if (result == CXL_GPU_SUCCESS) {
+                if (!cxl_type2_register_gpu_handle(&ct2d->gpu_cmd.events,
+                        &ct2d->gpu_cmd.events_capacity,
+                        &ct2d->gpu_cmd.num_events, event, &id)) {
+                    (void)hetgpu_cuda_event_destroy(hetgpu, event);
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_OUT_OF_MEMORY;
+                } else {
+                    ct2d->gpu_cmd.results[0] = id;
+                }
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_EVENT_DESTROY:
+    case CXL_GPU_CMD_EVENT_QUERY:
+    case CXL_GPU_CMD_EVENT_SYNC:
+        {
+            uint64_t id = ct2d->gpu_cmd.params[0];
+            if (id > UINT32_MAX || id >= ct2d->gpu_cmd.num_events ||
+                !ct2d->gpu_cmd.events[id]) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                break;
+            }
+            int result;
+            if (cmd == CXL_GPU_CMD_EVENT_DESTROY)
+                result = hetgpu_cuda_event_destroy(hetgpu, ct2d->gpu_cmd.events[id]);
+            else if (cmd == CXL_GPU_CMD_EVENT_QUERY)
+                result = hetgpu_cuda_event_query(hetgpu, ct2d->gpu_cmd.events[id]);
+            else
+                result = hetgpu_cuda_event_synchronize(hetgpu, ct2d->gpu_cmd.events[id]);
+            ct2d->gpu_cmd.cmd_result = result;
+            if (cmd == CXL_GPU_CMD_EVENT_DESTROY && result == CXL_GPU_SUCCESS)
+                ct2d->gpu_cmd.events[id] = NULL;
+        }
+        break;
+
+    case CXL_GPU_CMD_EVENT_RECORD:
+        {
+            uint64_t event_id = ct2d->gpu_cmd.params[0];
+            void *stream = NULL;
+            if (event_id > UINT32_MAX || event_id >= ct2d->gpu_cmd.num_events ||
+                !ct2d->gpu_cmd.events[event_id] ||
+                !cxl_type2_stream_from_wire(ct2d, ct2d->gpu_cmd.params[1],
+                                            &stream)) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                break;
+            }
+            ct2d->gpu_cmd.cmd_result = hetgpu_cuda_event_record(
+                hetgpu, ct2d->gpu_cmd.events[event_id], stream);
+        }
+        break;
+
+    case CXL_GPU_CMD_EVENT_ELAPSED_TIME:
+        {
+            uint64_t start = ct2d->gpu_cmd.params[0];
+            uint64_t end = ct2d->gpu_cmd.params[1];
+            float milliseconds = 0.0f;
+            uint32_t bits;
+            if (start > UINT32_MAX || end > UINT32_MAX ||
+                start >= ct2d->gpu_cmd.num_events ||
+                end >= ct2d->gpu_cmd.num_events ||
+                !ct2d->gpu_cmd.events[start] || !ct2d->gpu_cmd.events[end]) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                break;
+            }
+            int result = hetgpu_cuda_event_elapsed_time(
+                hetgpu, &milliseconds, ct2d->gpu_cmd.events[start],
+                ct2d->gpu_cmd.events[end]);
+            ct2d->gpu_cmd.cmd_result = result;
+            if (result == CXL_GPU_SUCCESS) {
+                memcpy(&bits, &milliseconds, sizeof(bits));
+                ct2d->gpu_cmd.results[0] = bits;
+            }
         }
         break;
 
