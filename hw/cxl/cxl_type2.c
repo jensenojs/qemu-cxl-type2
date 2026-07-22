@@ -3553,19 +3553,21 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 break;
             }
             while (wire.num_args < 64) {
-                size_t offset = 0;
-                size_t size = 0;
+                size_t param_offset = 0;
+                size_t param_size = 0;
 
-                err = hetgpu_get_param_info(hetgpu, params.func, wire.num_args, &offset, &size);
+                err = hetgpu_get_param_info(hetgpu, params.func, wire.num_args,
+                                            &param_offset, &param_size);
                 if (err == HETGPU_ERROR_INVALID_VALUE) {
                     break;
                 }
                 if (err != HETGPU_SUCCESS || !params.kernel_params || !params.kernel_params[wire.num_args] ||
-                    offset > ct2d->gpu_cmd.data_size || size > ct2d->gpu_cmd.data_size - offset) {
+                    param_offset > ct2d->gpu_cmd.data_size ||
+                    param_size > ct2d->gpu_cmd.data_size - param_offset) {
                     ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
                     break;
                 }
-                param_extent = MAX(param_extent, offset + size);
+                param_extent = MAX(param_extent, param_offset + param_size);
                 wire.num_args++;
             }
             size_t param_wires_size = wire.num_args * sizeof(*param_wires);
@@ -3597,18 +3599,19 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             wire.param_extent = param_extent;
             memcpy(ct2d->gpu_cmd.data, &wire, sizeof(wire));
             for (uint32_t i = 0; i < wire.num_args; i++) {
-                size_t offset = 0;
-                size_t size = 0;
+                size_t param_offset = 0;
+                size_t param_size = 0;
 
-                err = hetgpu_get_param_info(hetgpu, params.func, i, &offset, &size);
+                err = hetgpu_get_param_info(hetgpu, params.func, i,
+                                            &param_offset, &param_size);
                 if (err != HETGPU_SUCCESS) {
                     ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
                     break;
                 }
-                param_wires[i].offset = offset;
-                param_wires[i].size = size;
-                memcpy(ct2d->gpu_cmd.data + sizeof(wire) + param_wires_size + offset,
-                       params.kernel_params[i], size);
+                param_wires[i].offset = param_offset;
+                param_wires[i].size = param_size;
+                memcpy(ct2d->gpu_cmd.data + sizeof(wire) + param_wires_size + param_offset,
+                       params.kernel_params[i], param_size);
             }
             if (ct2d->gpu_cmd.cmd_result == CXL_GPU_SUCCESS)
                 memcpy(ct2d->gpu_cmd.data + sizeof(wire), param_wires, param_wires_size);
