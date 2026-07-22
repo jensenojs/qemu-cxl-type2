@@ -2337,10 +2337,12 @@ static bool cxl_type2_reserve_gpu_handle(void ***handles, size_t *capacity,
     }
 
     next_capacity = *capacity ? *capacity : 64;
-    if (next_capacity > G_MAXUINT32 / 2) {
-        next_capacity = G_MAXUINT32;
-    } else {
-        next_capacity *= 2;
+    while (next_capacity <= count) {
+        if (next_capacity > G_MAXUINT32 / 2) {
+            next_capacity = G_MAXUINT32;
+        } else {
+            next_capacity *= 2;
+        }
     }
     grown = g_try_realloc_n(*handles, next_capacity, sizeof(**handles));
     if (!grown) {
@@ -2348,6 +2350,28 @@ static bool cxl_type2_reserve_gpu_handle(void ***handles, size_t *capacity,
     }
     *handles = grown;
     *capacity = next_capacity;
+    return true;
+}
+
+static bool cxl_type2_register_gpu_handle(void ***handles, size_t *capacity,
+                                          uint32_t *count, void *handle,
+                                          uint32_t *id)
+{
+    if (!handle || !count || !id) {
+        return false;
+    }
+    for (uint32_t i = 0; i < *count; i++) {
+        if ((*handles)[i] == handle) {
+            *id = i;
+            return true;
+        }
+    }
+    if (!cxl_type2_reserve_gpu_handle(handles, capacity, *count)) {
+        return false;
+    }
+    (*handles)[*count] = handle;
+    *id = *count;
+    (*count)++;
     return true;
 }
 
@@ -3471,6 +3495,248 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             }
             if (ct2d->gpu_cmd.cmd_result == CXL_GPU_SUCCESS)
                 memcpy(ct2d->gpu_cmd.data + sizeof(wire), param_wires, param_wires_size);
+        }
+        break;
+
+    case CXL_GPU_CMD_GRAPH_EXEC_DESTROY:
+        if (!hetgpu->initialized) {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
+            break;
+        }
+        {
+            uint64_t graph_exec_id_raw = ct2d->gpu_cmd.params[0];
+
+            if (graph_exec_id_raw > UINT32_MAX ||
+                graph_exec_id_raw >= ct2d->gpu_cmd.num_graph_execs ||
+                !ct2d->gpu_cmd.graph_execs[graph_exec_id_raw]) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                break;
+            }
+            int cuda_result = hetgpu_cuda_graph_exec_destroy(
+                hetgpu, ct2d->gpu_cmd.graph_execs[graph_exec_id_raw]);
+            ct2d->gpu_cmd.cmd_result = cuda_result;
+            if (cuda_result == CXL_GPU_SUCCESS) {
+                ct2d->gpu_cmd.graph_execs[graph_exec_id_raw] = NULL;
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_GRAPH_LAUNCH:
+        if (!hetgpu->initialized) {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
+            break;
+        }
+        {
+            uint64_t graph_exec_id_raw = ct2d->gpu_cmd.params[0];
+            uint64_t stream_tag = ct2d->gpu_cmd.params[1];
+
+            if (graph_exec_id_raw > UINT32_MAX || stream_tag > 1 ||
+                graph_exec_id_raw >= ct2d->gpu_cmd.num_graph_execs ||
+                !ct2d->gpu_cmd.graph_execs[graph_exec_id_raw]) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                break;
+            }
+            ct2d->gpu_cmd.cmd_result = hetgpu_cuda_graph_launch(
+                hetgpu, ct2d->gpu_cmd.graph_execs[graph_exec_id_raw], NULL);
+        }
+        break;
+
+    case CXL_GPU_CMD_GRAPH_DESTROY:
+        if (!hetgpu->initialized) {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
+            break;
+        }
+        {
+            uint64_t graph_id_raw = ct2d->gpu_cmd.params[0];
+
+            if (graph_id_raw > UINT32_MAX ||
+                graph_id_raw >= ct2d->gpu_cmd.num_graphs ||
+                !ct2d->gpu_cmd.graphs[graph_id_raw]) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                break;
+            }
+            int cuda_result = hetgpu_cuda_graph_destroy(
+                hetgpu, ct2d->gpu_cmd.graphs[graph_id_raw]);
+            ct2d->gpu_cmd.cmd_result = cuda_result;
+            if (cuda_result == CXL_GPU_SUCCESS) {
+                ct2d->gpu_cmd.graphs[graph_id_raw] = NULL;
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_GRAPH_INSTANTIATE:
+        memset(ct2d->gpu_cmd.results, 0xff, sizeof(ct2d->gpu_cmd.results));
+        if (!hetgpu->initialized) {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
+            break;
+        }
+        {
+            uint64_t graph_id_raw = ct2d->gpu_cmd.params[0];
+            size_t buffer_size = ct2d->gpu_cmd.params[1];
+            bool want_error_node = ct2d->gpu_cmd.params[2];
+            bool want_log = ct2d->gpu_cmd.params[3];
+            g_autofree char *log_buffer = NULL;
+            char log_dummy = 0;
+            HetGPUGraphExec graph_exec = NULL;
+            HetGPUGraphNode error_node = NULL;
+
+            if (graph_id_raw > UINT32_MAX ||
+                graph_id_raw >= ct2d->gpu_cmd.num_graphs ||
+                !ct2d->gpu_cmd.graphs[graph_id_raw]) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                break;
+            }
+            if (ct2d->gpu_cmd.params[2] > 1 ||
+                ct2d->gpu_cmd.params[3] > 1 ||
+                (!want_log && buffer_size) ||
+                buffer_size > ct2d->gpu_cmd.data_size) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                break;
+            }
+            if (!cxl_type2_reserve_gpu_handle(
+                    &ct2d->gpu_cmd.graph_execs,
+                    &ct2d->gpu_cmd.graph_execs_capacity,
+                    ct2d->gpu_cmd.num_graph_execs)) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_OUT_OF_MEMORY;
+                break;
+            }
+            if (want_log && buffer_size) {
+                log_buffer = g_try_malloc0(buffer_size);
+                if (!log_buffer) {
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_OUT_OF_MEMORY;
+                    break;
+                }
+            }
+            int cuda_result = hetgpu_cuda_graph_instantiate(
+                hetgpu, ct2d->gpu_cmd.graphs[graph_id_raw], &graph_exec,
+                want_error_node ? &error_node : NULL,
+                want_log ? (buffer_size ? log_buffer : &log_dummy) : NULL,
+                buffer_size);
+            ct2d->gpu_cmd.cmd_result = cuda_result;
+            if (want_log && buffer_size) {
+                memcpy(ct2d->gpu_cmd.data, log_buffer, buffer_size);
+            }
+            if (error_node) {
+                uint32_t error_node_id;
+
+                if (cxl_type2_register_gpu_handle(
+                        &ct2d->gpu_cmd.graph_nodes,
+                        &ct2d->gpu_cmd.graph_nodes_capacity,
+                        &ct2d->gpu_cmd.num_graph_nodes, error_node,
+                        &error_node_id)) {
+                    ct2d->gpu_cmd.results[1] = error_node_id;
+                } else {
+                    qemu_log("CXL Type2: failed to register graph instantiate error node\n");
+                }
+            }
+            if (cuda_result == CXL_GPU_SUCCESS) {
+                if (!graph_exec) {
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                    break;
+                }
+                uint32_t graph_exec_id = ct2d->gpu_cmd.num_graph_execs;
+                ct2d->gpu_cmd.graph_execs[graph_exec_id] = graph_exec;
+                ct2d->gpu_cmd.results[0] = graph_exec_id;
+                ct2d->gpu_cmd.num_graph_execs++;
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_GRAPH_GET_NODES:
+        memset(ct2d->gpu_cmd.results, 0, sizeof(ct2d->gpu_cmd.results));
+        if (!hetgpu->initialized) {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
+            break;
+        }
+        {
+            uint64_t graph_id_raw = ct2d->gpu_cmd.params[0];
+            size_t requested = ct2d->gpu_cmd.params[1];
+            bool want_nodes = ct2d->gpu_cmd.params[2];
+            g_autofree HetGPUGraphNode *nodes = NULL;
+            g_autofree uint64_t *node_ids = NULL;
+
+            if (graph_id_raw > UINT32_MAX ||
+                graph_id_raw >= ct2d->gpu_cmd.num_graphs ||
+                !ct2d->gpu_cmd.graphs[graph_id_raw]) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                break;
+            }
+            if (ct2d->gpu_cmd.params[2] > 1 ||
+                (!want_nodes && requested) ||
+                requested > ct2d->gpu_cmd.data_size / sizeof(uint64_t)) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                break;
+            }
+            if (want_nodes) {
+                nodes = g_try_new0(HetGPUGraphNode, MAX(requested, 1));
+                if (!nodes) {
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_OUT_OF_MEMORY;
+                    break;
+                }
+            }
+            size_t count = requested;
+            int cuda_result = hetgpu_cuda_graph_get_nodes(
+                hetgpu, ct2d->gpu_cmd.graphs[graph_id_raw],
+                want_nodes ? nodes : NULL, &count);
+            ct2d->gpu_cmd.cmd_result = cuda_result;
+            if (cuda_result != CXL_GPU_SUCCESS) {
+                break;
+            }
+            if (want_nodes && count > requested) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                break;
+            }
+            ct2d->gpu_cmd.results[0] = count;
+            if (!want_nodes || count == 0) {
+                break;
+            }
+            node_ids = g_try_new(uint64_t, count);
+            if (!node_ids) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_OUT_OF_MEMORY;
+                break;
+            }
+            for (size_t i = 0; i < count; i++) {
+                uint32_t node_id;
+
+                if (!cxl_type2_register_gpu_handle(
+                        &ct2d->gpu_cmd.graph_nodes,
+                        &ct2d->gpu_cmd.graph_nodes_capacity,
+                        &ct2d->gpu_cmd.num_graph_nodes, nodes[i], &node_id)) {
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_OUT_OF_MEMORY;
+                    break;
+                }
+                node_ids[i] = node_id;
+            }
+            if (ct2d->gpu_cmd.cmd_result == CXL_GPU_SUCCESS) {
+                memcpy(ct2d->gpu_cmd.data, node_ids,
+                       count * sizeof(*node_ids));
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_GRAPH_NODE_GET_TYPE:
+        memset(ct2d->gpu_cmd.results, 0, sizeof(ct2d->gpu_cmd.results));
+        if (!hetgpu->initialized) {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
+            break;
+        }
+        {
+            uint64_t graph_node_id_raw = ct2d->gpu_cmd.params[0];
+            int node_type = 0;
+
+            if (graph_node_id_raw > UINT32_MAX ||
+                graph_node_id_raw >= ct2d->gpu_cmd.num_graph_nodes ||
+                !ct2d->gpu_cmd.graph_nodes[graph_node_id_raw]) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                break;
+            }
+            int cuda_result = hetgpu_cuda_graph_node_get_type(
+                hetgpu, ct2d->gpu_cmd.graph_nodes[graph_node_id_raw],
+                &node_type);
+            ct2d->gpu_cmd.cmd_result = cuda_result;
+            if (cuda_result == CXL_GPU_SUCCESS) {
+                ct2d->gpu_cmd.results[0] = (uint64_t)(int64_t)node_type;
+            }
         }
         break;
 

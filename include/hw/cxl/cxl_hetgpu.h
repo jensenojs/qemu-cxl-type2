@@ -568,6 +568,20 @@ int hetgpu_cuda_graph_exec_kernel_node_set_params(
     HetGPUFunction function, const HetGPULaunchConfig *config, void **args);
 int hetgpu_cuda_graph_kernel_node_get_params(HetGPUState *state, HetGPUGraphNode graph_node,
                                              CudaKernelNodeParams *params);
+int hetgpu_cuda_graph_exec_destroy(HetGPUState *state,
+                                   HetGPUGraphExec graph_exec);
+int hetgpu_cuda_graph_launch(HetGPUState *state, HetGPUGraphExec graph_exec,
+                             HetGPUStream stream);
+int hetgpu_cuda_graph_destroy(HetGPUState *state, HetGPUGraph graph);
+int hetgpu_cuda_graph_instantiate(HetGPUState *state, HetGPUGraph graph,
+                                  HetGPUGraphExec *graph_exec,
+                                  HetGPUGraphNode *error_node,
+                                  char *log_buffer, size_t buffer_size);
+int hetgpu_cuda_graph_get_nodes(HetGPUState *state, HetGPUGraph graph,
+                                HetGPUGraphNode *nodes, size_t *num_nodes);
+int hetgpu_cuda_graph_node_get_type(HetGPUState *state,
+                                    HetGPUGraphNode graph_node,
+                                    int *node_type);
 
 /* ========================================================================
  * Stream Management

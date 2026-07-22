@@ -68,6 +68,12 @@ typedef int (*cuLaunchKernel_fn)(void *, unsigned int, unsigned int, unsigned in
 typedef int (*cuGraphExecKernelNodeSetParams_fn)(void *, void *,
                                                   const CudaKernelNodeParams *);
 typedef int (*cuGraphKernelNodeGetParams_fn)(void *, CudaKernelNodeParams *);
+typedef int (*cuGraphExecDestroy_fn)(void *);
+typedef int (*cuGraphLaunch_fn)(void *, void *);
+typedef int (*cuGraphDestroy_fn)(void *);
+typedef int (*cuGraphInstantiate_fn)(void **, void *, void **, char *, size_t);
+typedef int (*cuGraphGetNodes_fn)(void *, void **, size_t *);
+typedef int (*cuGraphNodeGetType_fn)(void *, int *);
 typedef int (*cuCtxPushCurrent_fn)(void *);
 typedef int (*cuCtxPopCurrent_fn)(void **);
 typedef int (*cuCtxSetCurrent_fn)(void *);
@@ -137,6 +143,12 @@ static struct {
     cuLaunchKernel_fn cuLaunchKernel;
     cuGraphExecKernelNodeSetParams_fn cuGraphExecKernelNodeSetParams;
     cuGraphKernelNodeGetParams_fn cuGraphKernelNodeGetParams;
+    cuGraphExecDestroy_fn cuGraphExecDestroy;
+    cuGraphLaunch_fn cuGraphLaunch;
+    cuGraphDestroy_fn cuGraphDestroy;
+    cuGraphInstantiate_fn cuGraphInstantiate;
+    cuGraphGetNodes_fn cuGraphGetNodes;
+    cuGraphNodeGetType_fn cuGraphNodeGetType;
     cuCtxPushCurrent_fn cuCtxPushCurrent;
     cuCtxPopCurrent_fn cuCtxPopCurrent;
     cuCtxSetCurrent_fn cuCtxSetCurrent;
@@ -267,6 +279,18 @@ static HetGPUError hetgpu_init_internal(HetGPUState *state,
                 dlsym(g_cuda_lib_handle, "cuGraphExecKernelNodeSetParams_v2");
             g_cuda_funcs.cuGraphKernelNodeGetParams =
                 dlsym(g_cuda_lib_handle, "cuGraphKernelNodeGetParams_v2");
+            g_cuda_funcs.cuGraphExecDestroy =
+                dlsym(g_cuda_lib_handle, "cuGraphExecDestroy");
+            g_cuda_funcs.cuGraphLaunch =
+                dlsym(g_cuda_lib_handle, "cuGraphLaunch");
+            g_cuda_funcs.cuGraphDestroy =
+                dlsym(g_cuda_lib_handle, "cuGraphDestroy");
+            g_cuda_funcs.cuGraphInstantiate =
+                dlsym(g_cuda_lib_handle, "cuGraphInstantiate_v2");
+            g_cuda_funcs.cuGraphGetNodes =
+                dlsym(g_cuda_lib_handle, "cuGraphGetNodes");
+            g_cuda_funcs.cuGraphNodeGetType =
+                dlsym(g_cuda_lib_handle, "cuGraphNodeGetType");
             g_cuda_funcs.cuCtxPushCurrent = dlsym(g_cuda_lib_handle, "cuCtxPushCurrent_v2");
             g_cuda_funcs.cuCtxPopCurrent = dlsym(g_cuda_lib_handle, "cuCtxPopCurrent_v2");
             g_cuda_funcs.cuCtxSetCurrent = dlsym(g_cuda_lib_handle, "cuCtxSetCurrent");
@@ -1697,6 +1721,147 @@ int hetgpu_cuda_graph_kernel_node_get_params(HetGPUState *state, HetGPUGraphNode
         return CUDA_ERROR_INVALID_CONTEXT;
     }
     result = HETGPU_CUDA_CALL(cuGraphKernelNodeGetParams, graph_node, params);
+    cuda_unlock(state);
+    return result;
+}
+
+int hetgpu_cuda_graph_exec_destroy(HetGPUState *state,
+                                   HetGPUGraphExec graph_exec)
+{
+    int result;
+
+    if (!state || !state->initialized) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    if (!graph_exec) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if (state->backend == HETGPU_BACKEND_SIMULATION ||
+        !g_cuda_funcs.cuGraphExecDestroy) {
+        return CUDA_ERROR_NOT_SUPPORTED;
+    }
+    if (!cuda_lock(state)) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    result = HETGPU_CUDA_CALL(cuGraphExecDestroy, graph_exec);
+    cuda_unlock(state);
+    return result;
+}
+
+int hetgpu_cuda_graph_launch(HetGPUState *state, HetGPUGraphExec graph_exec,
+                             HetGPUStream stream)
+{
+    int result;
+
+    if (!state || !state->initialized) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    if (!graph_exec) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if (state->backend == HETGPU_BACKEND_SIMULATION ||
+        !g_cuda_funcs.cuGraphLaunch) {
+        return CUDA_ERROR_NOT_SUPPORTED;
+    }
+    if (!cuda_lock(state)) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    result = HETGPU_CUDA_CALL(cuGraphLaunch, graph_exec, stream);
+    cuda_unlock(state);
+    return result;
+}
+
+int hetgpu_cuda_graph_destroy(HetGPUState *state, HetGPUGraph graph)
+{
+    int result;
+
+    if (!state || !state->initialized) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    if (!graph) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if (state->backend == HETGPU_BACKEND_SIMULATION ||
+        !g_cuda_funcs.cuGraphDestroy) {
+        return CUDA_ERROR_NOT_SUPPORTED;
+    }
+    if (!cuda_lock(state)) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    result = HETGPU_CUDA_CALL(cuGraphDestroy, graph);
+    cuda_unlock(state);
+    return result;
+}
+
+int hetgpu_cuda_graph_instantiate(HetGPUState *state, HetGPUGraph graph,
+                                  HetGPUGraphExec *graph_exec,
+                                  HetGPUGraphNode *error_node,
+                                  char *log_buffer, size_t buffer_size)
+{
+    int result;
+
+    if (!state || !state->initialized) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    if (!graph || !graph_exec) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if (state->backend == HETGPU_BACKEND_SIMULATION ||
+        !g_cuda_funcs.cuGraphInstantiate) {
+        return CUDA_ERROR_NOT_SUPPORTED;
+    }
+    if (!cuda_lock(state)) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    result = HETGPU_CUDA_CALL(cuGraphInstantiate, graph_exec, graph,
+                              error_node, log_buffer, buffer_size);
+    cuda_unlock(state);
+    return result;
+}
+
+int hetgpu_cuda_graph_get_nodes(HetGPUState *state, HetGPUGraph graph,
+                                HetGPUGraphNode *nodes, size_t *num_nodes)
+{
+    int result;
+
+    if (!state || !state->initialized) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    if (!graph || !num_nodes) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if (state->backend == HETGPU_BACKEND_SIMULATION ||
+        !g_cuda_funcs.cuGraphGetNodes) {
+        return CUDA_ERROR_NOT_SUPPORTED;
+    }
+    if (!cuda_lock(state)) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    result = HETGPU_CUDA_CALL(cuGraphGetNodes, graph, nodes, num_nodes);
+    cuda_unlock(state);
+    return result;
+}
+
+int hetgpu_cuda_graph_node_get_type(HetGPUState *state,
+                                    HetGPUGraphNode graph_node,
+                                    int *node_type)
+{
+    int result;
+
+    if (!state || !state->initialized) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    if (!graph_node || !node_type) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if (state->backend == HETGPU_BACKEND_SIMULATION ||
+        !g_cuda_funcs.cuGraphNodeGetType) {
+        return CUDA_ERROR_NOT_SUPPORTED;
+    }
+    if (!cuda_lock(state)) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    result = HETGPU_CUDA_CALL(cuGraphNodeGetType, graph_node, node_type);
     cuda_unlock(state);
     return result;
 }
