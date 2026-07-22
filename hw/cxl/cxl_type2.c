@@ -2383,8 +2383,16 @@ static bool cxl_type2_stream_from_wire(CXLType2State *ct2d, uint64_t wire,
     if (!stream) {
         return false;
     }
-    if (wire == UINT64_MAX) {
+    if (wire == CXL_GPU_STREAM_WIRE_NULL) {
         *stream = NULL;
+        return true;
+    }
+    if (wire == CXL_GPU_STREAM_WIRE_LEGACY) {
+        *stream = (void *)(uintptr_t)1;
+        return true;
+    }
+    if (wire == CXL_GPU_STREAM_WIRE_PER_THREAD) {
+        *stream = (void *)(uintptr_t)2;
         return true;
     }
     if (wire > UINT32_MAX || wire >= ct2d->gpu_cmd.num_streams ||

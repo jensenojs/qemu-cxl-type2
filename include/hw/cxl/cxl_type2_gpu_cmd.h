@@ -73,7 +73,11 @@
 
 /* Magic number */
 #define CXL_GPU_MAGIC               0x43584C32  /* "CXL2" */
-#define CXL_GPU_VERSION             0x00010700  /* v1.7.0: CUDA link, stream, event and context operations */
+#define CXL_GPU_VERSION             0x00010701  /* v1.7.1: distinct CUDA special-stream wire values */
+
+#define CXL_GPU_STREAM_WIRE_NULL       0xffffffffffffffffULL
+#define CXL_GPU_STREAM_WIRE_LEGACY     0xfffffffffffffffeULL
+#define CXL_GPU_STREAM_WIRE_PER_THREAD 0xfffffffffffffffdULL
 
 #define CXL_GPU_CASE_PROTOCOL_VERSION 1U
 
