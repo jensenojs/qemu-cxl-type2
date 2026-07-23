@@ -73,7 +73,7 @@
 
 /* Magic number */
 #define CXL_GPU_MAGIC               0x43584C32  /* "CXL2" */
-#define CXL_GPU_VERSION             0x00010701  /* v1.7.1: distinct CUDA special-stream wire values */
+#define CXL_GPU_VERSION             0x00010800  /* v1.8.0: function attribute query and real module unload */
 
 #define CXL_GPU_STREAM_WIRE_NULL       0xffffffffffffffffULL
 #define CXL_GPU_STREAM_WIRE_LEGACY     0xfffffffffffffffeULL
@@ -155,6 +155,7 @@ typedef enum {
     CXL_GPU_CMD_LINK_ADD_DATA = 0x43,
     CXL_GPU_CMD_LINK_COMPLETE = 0x44,
     CXL_GPU_CMD_LINK_DESTROY = 0x45,
+    CXL_GPU_CMD_FUNC_GET_ATTRIBUTE = 0x46,
 
     CXL_GPU_CMD_STREAM_CREATE   = 0x50,
     CXL_GPU_CMD_STREAM_DESTROY  = 0x51,

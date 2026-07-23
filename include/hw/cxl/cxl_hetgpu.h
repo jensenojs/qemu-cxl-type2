@@ -525,8 +525,10 @@ HetGPUError hetgpu_load_cubin(HetGPUState *state, const void *cubin_data,
  * hetgpu_unload_module - Unload module
  * @state: Initialized HetGPUState
  * @module: Module to unload
+ *
+ * Returns: HETGPU_SUCCESS on success
  */
-void hetgpu_unload_module(HetGPUState *state, HetGPUModule module);
+HetGPUError hetgpu_unload_module(HetGPUState *state, HetGPUModule module);
 
 /**
  * hetgpu_get_function - Get function handle from module
@@ -560,6 +562,9 @@ HetGPUError hetgpu_get_param_info(HetGPUState *state, HetGPUFunction function,
 HetGPUError hetgpu_set_function_attribute(HetGPUState *state,
                                           HetGPUFunction function,
                                           int attribute, int value);
+HetGPUError hetgpu_get_function_attribute(HetGPUState *state,
+                                          HetGPUFunction function,
+                                          int attribute, int *value);
 HetGPUError hetgpu_get_max_active_blocks_per_multiprocessor(HetGPUState *state,
                                                              HetGPUFunction function,
                                                              int block_size,

@@ -56,10 +56,12 @@ typedef int (*cuMemcpyDtoH_fn)(void *, uint64_t, size_t);
 typedef int (*cuMemcpyDtoD_fn)(uint64_t, uint64_t, size_t);
 typedef int (*cuPointerGetAttribute_fn)(void *, int, uint64_t);
 typedef int (*cuModuleLoadData_fn)(void **, const void *);
+typedef int (*cuModuleUnload_fn)(void *);
 typedef int (*cuModuleGetLoadingMode_fn)(int *);
 typedef int (*cuModuleGetFunction_fn)(void **, void *, const char *);
 typedef int (*cuModuleGetGlobal_fn)(uint64_t *, size_t *, void *, const char *);
 typedef int (*cuFuncGetParamInfo_fn)(void *, size_t, size_t *, size_t *);
+typedef int (*cuFuncGetAttribute_fn)(int *, int, void *);
 typedef int (*cuFuncSetAttribute_fn)(void *, int, int);
 typedef int (*cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags_fn)(int *, void *, int, size_t,
                                                                          unsigned int);
@@ -123,6 +125,7 @@ typedef int (*cuGetErrorName_fn)(int, const char **);
 #define CUDA_ERROR_INVALID_VALUE 1
 #define CUDA_ERROR_NOT_INITIALIZED 3
 #define CUDA_ERROR_INVALID_CONTEXT 201
+#define CUDA_ERROR_INVALID_HANDLE 400
 #define CUDA_ERROR_NOT_SUPPORTED 801
 
 static __thread uint64_t g_cuda_trace_call_id;
@@ -162,10 +165,12 @@ static struct {
     cuMemcpyDtoD_fn cuMemcpyDtoD;
     cuPointerGetAttribute_fn cuPointerGetAttribute;
     cuModuleLoadData_fn cuModuleLoadData;
+    cuModuleUnload_fn cuModuleUnload;
     cuModuleGetLoadingMode_fn cuModuleGetLoadingMode;
     cuModuleGetFunction_fn cuModuleGetFunction;
     cuModuleGetGlobal_fn cuModuleGetGlobal;
     cuFuncGetParamInfo_fn cuFuncGetParamInfo;
+    cuFuncGetAttribute_fn cuFuncGetAttribute;
     cuFuncSetAttribute_fn cuFuncSetAttribute;
     cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags_fn cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags;
     cuLaunchKernel_fn cuLaunchKernel;
@@ -322,10 +327,12 @@ static HetGPUError hetgpu_init_internal(HetGPUState *state,
             g_cuda_funcs.cuMemcpyDtoD = dlsym(g_cuda_lib_handle, "cuMemcpyDtoD_v2");
             g_cuda_funcs.cuPointerGetAttribute = dlsym(g_cuda_lib_handle, "cuPointerGetAttribute");
             g_cuda_funcs.cuModuleLoadData = dlsym(g_cuda_lib_handle, "cuModuleLoadData");
+            g_cuda_funcs.cuModuleUnload = dlsym(g_cuda_lib_handle, "cuModuleUnload");
             g_cuda_funcs.cuModuleGetLoadingMode = dlsym(g_cuda_lib_handle, "cuModuleGetLoadingMode");
             g_cuda_funcs.cuModuleGetFunction = dlsym(g_cuda_lib_handle, "cuModuleGetFunction");
             g_cuda_funcs.cuModuleGetGlobal = dlsym(g_cuda_lib_handle, "cuModuleGetGlobal_v2");
             g_cuda_funcs.cuFuncGetParamInfo = dlsym(g_cuda_lib_handle, "cuFuncGetParamInfo");
+            g_cuda_funcs.cuFuncGetAttribute = dlsym(g_cuda_lib_handle, "cuFuncGetAttribute");
             g_cuda_funcs.cuFuncSetAttribute = dlsym(g_cuda_lib_handle, "cuFuncSetAttribute");
             g_cuda_funcs.cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags =
                 dlsym(g_cuda_lib_handle, "cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags");
@@ -1557,11 +1564,42 @@ HetGPUError hetgpu_load_cubin(HetGPUState *state, const void *cubin_data,
     return HETGPU_ERROR_NOT_INITIALIZED;
 }
 
-void hetgpu_unload_module(HetGPUState *state, HetGPUModule module)
+HetGPUError hetgpu_unload_module(HetGPUState *state, HetGPUModule module)
 {
-    (void)state;
-    (void)module;
-    /* Module unloading is handled by context destruction */
+    if (!state || !state->initialized || !module) {
+        return HETGPU_ERROR_INVALID_VALUE;
+    }
+
+    if (g_cuda_funcs.cuModuleUnload &&
+        state->backend != HETGPU_BACKEND_SIMULATION) {
+        if (!cuda_lock(state)) {
+            return HETGPU_ERROR_INVALID_CONTEXT;
+        }
+        int err = HETGPU_CUDA_CALL(cuModuleUnload, module);
+        cuda_unlock(state);
+
+        switch (err) {
+        case CUDA_SUCCESS:
+            return HETGPU_SUCCESS;
+        case CUDA_ERROR_INVALID_VALUE:
+            return HETGPU_ERROR_INVALID_VALUE;
+        case CUDA_ERROR_NOT_INITIALIZED:
+            return HETGPU_ERROR_NOT_INITIALIZED;
+        case CUDA_ERROR_INVALID_CONTEXT:
+            return HETGPU_ERROR_INVALID_CONTEXT;
+        case CUDA_ERROR_INVALID_HANDLE:
+            return HETGPU_ERROR_INVALID_HANDLE;
+        case CUDA_ERROR_NOT_SUPPORTED:
+            return HETGPU_ERROR_NOT_SUPPORTED;
+        default:
+            return HETGPU_ERROR_UNKNOWN;
+        }
+    }
+
+    if (state->backend == HETGPU_BACKEND_SIMULATION) {
+        return HETGPU_SUCCESS;
+    }
+    return HETGPU_ERROR_NOT_SUPPORTED;
 }
 
 HetGPUError hetgpu_get_function(HetGPUState *state, HetGPUModule module,
@@ -1714,6 +1752,44 @@ HetGPUError hetgpu_set_function_attribute(HetGPUState *state,
         case 400:
             return HETGPU_ERROR_INVALID_HANDLE;
         case 801:
+            return HETGPU_ERROR_NOT_SUPPORTED;
+        default:
+            return HETGPU_ERROR_UNKNOWN;
+        }
+    }
+
+    return HETGPU_ERROR_NOT_SUPPORTED;
+}
+
+HetGPUError hetgpu_get_function_attribute(HetGPUState *state,
+                                          HetGPUFunction function,
+                                          int attribute, int *value)
+{
+    if (!state || !state->initialized || !function || !value) {
+        return HETGPU_ERROR_INVALID_VALUE;
+    }
+
+    if (g_cuda_funcs.cuFuncGetAttribute &&
+        state->backend != HETGPU_BACKEND_SIMULATION) {
+        if (!cuda_lock(state)) {
+            return HETGPU_ERROR_INVALID_CONTEXT;
+        }
+        int err = HETGPU_CUDA_CALL(cuFuncGetAttribute, value, attribute,
+                                   function);
+        cuda_unlock(state);
+
+        switch (err) {
+        case CUDA_SUCCESS:
+            return HETGPU_SUCCESS;
+        case CUDA_ERROR_INVALID_VALUE:
+            return HETGPU_ERROR_INVALID_VALUE;
+        case CUDA_ERROR_NOT_INITIALIZED:
+            return HETGPU_ERROR_NOT_INITIALIZED;
+        case CUDA_ERROR_INVALID_CONTEXT:
+            return HETGPU_ERROR_INVALID_CONTEXT;
+        case CUDA_ERROR_INVALID_HANDLE:
+            return HETGPU_ERROR_INVALID_HANDLE;
+        case CUDA_ERROR_NOT_SUPPORTED:
             return HETGPU_ERROR_NOT_SUPPORTED;
         default:
             return HETGPU_ERROR_UNKNOWN;
