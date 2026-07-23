@@ -2767,8 +2767,8 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
 
     qemu_log("CXL TYPE2 TRACE cmd_begin seq=%" PRIu64
              " call_id=0x%016" PRIx64
-             " cmd=0x%x p0=0x%" PRIx64 " p1=%" PRIu64 "\n",
-             trace_sequence, ct2d->gpu_cmd.call_id, cmd, ct2d->gpu_cmd.params[0],
+             " cmd=0x%x host_ns=%" PRId64 " p0=0x%" PRIx64 " p1=%" PRIu64 "\n",
+             trace_sequence, ct2d->gpu_cmd.call_id, cmd, trace_start_ns, ct2d->gpu_cmd.params[0],
              ct2d->gpu_cmd.params[1]);
 
     qemu_log_mask(LOG_GUEST_ERROR,
@@ -3055,7 +3055,13 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             break;
         }
         if (hetgpu->initialized) {
+            int64_t driver_start_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
             err = hetgpu_memcpy_htod(hetgpu, dev_ptr, ct2d->gpu_cmd.data, size);
+            qemu_log("CXL TYPE2 TRACE copy_driver call_id=0x%016" PRIx64
+                     " direction=htod bytes=%zu driver_duration_ns=%" PRId64
+                     " backend_result=%d implementation=blocking stream_forwarded=0\n",
+                     ct2d->gpu_cmd.call_id, size,
+                     qemu_clock_get_ns(QEMU_CLOCK_HOST) - driver_start_ns, err);
             if (err != HETGPU_SUCCESS) {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
             }
@@ -3106,7 +3112,13 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 cxl_bar_notify_gpu_access(&ct2d->bar_coherency,
                                            dev_ptr, size, false);
             }
+            int64_t driver_start_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
             err = hetgpu_memcpy_dtoh(hetgpu, ct2d->gpu_cmd.data, dev_ptr, size);
+            qemu_log("CXL TYPE2 TRACE copy_driver call_id=0x%016" PRIx64
+                     " direction=dtoh bytes=%zu driver_duration_ns=%" PRId64
+                     " backend_result=%d implementation=blocking stream_forwarded=0\n",
+                     ct2d->gpu_cmd.call_id, size,
+                     qemu_clock_get_ns(QEMU_CLOCK_HOST) - driver_start_ns, err);
             if (err != HETGPU_SUCCESS) {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
             }
@@ -3222,6 +3234,13 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 }
                 cubin_data = decoded;
             }
+
+            qemu_log("CXL TYPE2 TRACE module_payload call_id=0x%016" PRIx64
+                     " encoding=%s input_size=%zu decoded_size=%zu\n",
+                     ct2d->gpu_cmd.call_id,
+                     encoding == CXL_GPU_MODULE_DATA_ZSTD ? "zstd" :
+                     encoding == CXL_GPU_MODULE_DATA_LZ4 ? "lz4" : "raw",
+                     size, cubin_size);
 
             void *module = NULL;
             if (!cxl_type2_reserve_gpu_handle(&ct2d->gpu_cmd.modules,
@@ -4979,13 +4998,13 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
 complete:
     hetgpu_cuda_trace_set_call_id(0);
     ct2d->gpu_cmd.cmd_status = CXL_GPU_CMD_STATUS_COMPLETE;
-    int64_t trace_duration_ns =
-        qemu_clock_get_ns(QEMU_CLOCK_HOST) - trace_start_ns;
+    int64_t trace_end_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+    int64_t trace_duration_ns = trace_end_ns - trace_start_ns;
     qemu_log("CXL TYPE2 TRACE cmd_end seq=%" PRIu64
              " call_id=0x%016" PRIx64
-             " cmd=0x%x result=%u duration_ns=%" PRId64 "\n",
-             trace_sequence, ct2d->gpu_cmd.call_id, cmd, ct2d->gpu_cmd.cmd_result,
-             trace_duration_ns);
+             " cmd=0x%x host_ns=%" PRId64 " result=%u duration_ns=%" PRId64 "\n",
+             trace_sequence, ct2d->gpu_cmd.call_id, cmd, trace_end_ns,
+             ct2d->gpu_cmd.cmd_result, trace_duration_ns);
     qemu_log_mask(LOG_GUEST_ERROR,
                   "CXL GPU: cmd 0x%x done, result=%u results[0]=0x%lx\n",
                   cmd, ct2d->gpu_cmd.cmd_result,
@@ -5061,6 +5080,9 @@ static uint64_t cxl_type2_gpu_cmd_read(void *opaque, hwaddr addr, unsigned size)
         break;
     case CXL_GPU_REG_BACKEND:
         value = hetgpu->backend;
+        break;
+    case CXL_GPU_REG_DRIVER_VERSION:
+        value = hetgpu->driver_version;
         break;
     /* Coherent pool registers */
     case CXL_GPU_REG_COH_POOL_BASE:

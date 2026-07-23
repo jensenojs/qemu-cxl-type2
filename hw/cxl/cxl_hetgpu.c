@@ -40,6 +40,7 @@ static const HetGPUDeviceProps default_props = {
 
 /* Function pointer types for dynamic loading */
 typedef int (*cuInit_fn)(unsigned int);
+typedef int (*cuDriverGetVersion_fn)(int *);
 typedef int (*cuDeviceGetCount_fn)(int *);
 typedef int (*cuDeviceGet_fn)(int *, int);
 typedef int (*cuDeviceGetName_fn)(char *, int, int);
@@ -149,6 +150,7 @@ void hetgpu_cuda_trace_set_call_id(uint64_t call_id)
 /* Loaded function pointers */
 static struct {
     cuInit_fn cuInit;
+    cuDriverGetVersion_fn cuDriverGetVersion;
     cuDeviceGetCount_fn cuDeviceGetCount;
     cuDeviceGet_fn cuDeviceGet;
     cuDeviceGetName_fn cuDeviceGetName;
@@ -222,6 +224,7 @@ static bool g_cuda_mutex_initialized = false;
 static bool g_cuda_lib_initialized = false;
 static void *g_cuda_lib_handle = NULL;
 static char *g_cuda_lib_path;
+static int g_cuda_driver_version;
 
 static void ensure_cuda_mutex_init(void)
 {
@@ -311,6 +314,7 @@ static HetGPUError hetgpu_init_internal(HetGPUState *state,
 
             /* Load function pointers */
             g_cuda_funcs.cuInit = dlsym(g_cuda_lib_handle, "cuInit");
+            g_cuda_funcs.cuDriverGetVersion = dlsym(g_cuda_lib_handle, "cuDriverGetVersion");
             g_cuda_funcs.cuDeviceGetCount = dlsym(g_cuda_lib_handle, "cuDeviceGetCount");
             g_cuda_funcs.cuDeviceGet = dlsym(g_cuda_lib_handle, "cuDeviceGet");
             g_cuda_funcs.cuDeviceGetName = dlsym(g_cuda_lib_handle, "cuDeviceGetName");
@@ -397,9 +401,27 @@ static HetGPUError hetgpu_init_internal(HetGPUState *state,
             g_free(g_cuda_lib_path);
             g_cuda_lib_path = g_canonicalize_filename(lib_path, NULL);
 
-            fprintf(stderr, "CXL hetGPU: Loaded CUDA functions - cuInit=%p, cuCtxSetCurrent=%p\n",
-                     g_cuda_funcs.cuInit, g_cuda_funcs.cuCtxSetCurrent);
+            fprintf(stderr,
+                    "CXL hetGPU: Loaded CUDA functions - cuInit=%p, cuDriverGetVersion=%p, cuCtxSetCurrent=%p\n",
+                    g_cuda_funcs.cuInit, g_cuda_funcs.cuDriverGetVersion,
+                    g_cuda_funcs.cuCtxSetCurrent);
             fflush(stderr);
+
+            if (!g_cuda_funcs.cuDriverGetVersion) {
+                qemu_log("CXL hetGPU: cuDriverGetVersion symbol not found\n");
+                qemu_mutex_unlock(&g_cuda_mutex);
+                goto simulation_fallback;
+            }
+            int version_err = HETGPU_CUDA_CALL(cuDriverGetVersion,
+                                                &g_cuda_driver_version);
+            if (version_err != CUDA_SUCCESS || g_cuda_driver_version <= 0) {
+                qemu_log("CXL hetGPU: cuDriverGetVersion failed result=%d version=%d\n",
+                         version_err, g_cuda_driver_version);
+                qemu_mutex_unlock(&g_cuda_mutex);
+                goto simulation_fallback;
+            }
+            qemu_log("CXL hetGPU: CUDA Driver API version=%d\n",
+                     g_cuda_driver_version);
 
             if (g_cuda_funcs.cuInit) {
                 int err = HETGPU_CUDA_CALL(cuInit, 0);
@@ -417,6 +439,7 @@ static HetGPUError hetgpu_init_internal(HetGPUState *state,
 
     /* Store library handle reference (shared, don't dlclose individually) */
     state->hetgpu_lib = g_cuda_lib_handle;
+    state->driver_version = g_cuda_driver_version;
     if (state->hetgpu_lib) {
         state->kimi_case_begin_v1 = dlsym(state->hetgpu_lib,
                                           "hetgpu_kimi_case_begin_v1");

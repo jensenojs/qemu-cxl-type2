@@ -47,6 +47,7 @@
 #define CXL_GPU_REG_MAX_THREADS     0x015C  /* Max threads per block */
 #define CXL_GPU_REG_WARP_SIZE       0x0160  /* Warp size */
 #define CXL_GPU_REG_BACKEND         0x0164  /* Backend type */
+#define CXL_GPU_REG_DRIVER_VERSION  0x0168  /* Real host CUDA Driver API version */
 
 /* BAR2 command payload.  Compressed module encodings keep the bytes crossing
  * this window independent from the decoded CUBIN size. */
@@ -73,7 +74,7 @@
 
 /* Magic number */
 #define CXL_GPU_MAGIC               0x43584C32  /* "CXL2" */
-#define CXL_GPU_VERSION             0x00010800  /* v1.8.0: function attribute query and real module unload */
+#define CXL_GPU_VERSION             0x00010900  /* v1.9.0: real host CUDA Driver API version */
 
 #define CXL_GPU_STREAM_WIRE_NULL       0xffffffffffffffffULL
 #define CXL_GPU_STREAM_WIRE_LEGACY     0xfffffffffffffffeULL

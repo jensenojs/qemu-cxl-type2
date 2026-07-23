@@ -228,6 +228,7 @@ typedef struct HetGPUState {
     HetGPUContext context;
     int device_index;
     int cuda_device;        /* CUDA device handle from cuDeviceGet */
+    int driver_version;     /* Version returned by the loaded real CUDA Driver */
     HetGPUDeviceProps props;
 
     /* CXL coherency integration */
