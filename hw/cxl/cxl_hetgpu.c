@@ -1840,55 +1840,46 @@ HetGPUError hetgpu_get_param_layout(HetGPUState *state,
     if (g_cuda_funcs.cuFuncGetParamInfo &&
         state->backend != HETGPU_BACKEND_SIMULATION) {
         HetGPUParamLayout *candidate = g_new0(HetGPUParamLayout, 1);
+        HetGPUError result = HETGPU_SUCCESS;
 
-        for (; candidate->num_args < HETGPU_MAX_KERNEL_ARGS;
-             candidate->num_args++) {
+        if (!cuda_lock(state)) {
+            g_free(candidate);
+            return HETGPU_ERROR_INVALID_CONTEXT;
+        }
+        for (uint32_t index = 0; index <= HETGPU_MAX_KERNEL_ARGS; index++) {
             size_t offset = 0;
             size_t size = 0;
-
-            if (!cuda_lock(state)) {
-                g_free(candidate);
-                return HETGPU_ERROR_INVALID_CONTEXT;
-            }
             int err = HETGPU_CUDA_CALL(cuFuncGetParamInfo, function,
-                                       candidate->num_args, &offset, &size);
+                                       index, &offset, &size);
             state->param_info_backend_queries++;
-            cuda_unlock(state);
             if (err == CUDA_ERROR_INVALID_VALUE) {
                 break;
             }
             if (err == CUDA_ERROR_INVALID_HANDLE) {
-                g_free(candidate);
-                return HETGPU_ERROR_INVALID_HANDLE;
+                result = HETGPU_ERROR_INVALID_HANDLE;
+                break;
             }
             if (err == CUDA_ERROR_NOT_SUPPORTED) {
-                g_free(candidate);
-                return HETGPU_ERROR_NOT_SUPPORTED;
+                result = HETGPU_ERROR_NOT_SUPPORTED;
+                break;
             }
             if (err != CUDA_SUCCESS || offset > SIZE_MAX - size) {
-                g_free(candidate);
-                return HETGPU_ERROR_UNKNOWN;
+                result = HETGPU_ERROR_UNKNOWN;
+                break;
             }
-            candidate->offsets[candidate->num_args] = offset;
-            candidate->sizes[candidate->num_args] = size;
+            if (index == HETGPU_MAX_KERNEL_ARGS) {
+                result = HETGPU_ERROR_INVALID_VALUE;
+                break;
+            }
+            candidate->offsets[index] = offset;
+            candidate->sizes[index] = size;
             candidate->extent = MAX(candidate->extent, offset + size);
+            candidate->num_args++;
         }
-        if (candidate->num_args == HETGPU_MAX_KERNEL_ARGS) {
-            size_t offset = 0;
-            size_t size = 0;
-
-            if (!cuda_lock(state)) {
-                g_free(candidate);
-                return HETGPU_ERROR_INVALID_CONTEXT;
-            }
-            int err = HETGPU_CUDA_CALL(cuFuncGetParamInfo, function,
-                                       candidate->num_args, &offset, &size);
-            state->param_info_backend_queries++;
-            cuda_unlock(state);
-            if (err != CUDA_ERROR_INVALID_VALUE) {
-                g_free(candidate);
-                return HETGPU_ERROR_INVALID_VALUE;
-            }
+        cuda_unlock(state);
+        if (result != HETGPU_SUCCESS) {
+            g_free(candidate);
+            return result;
         }
 
         if (!state->param_info_cache) {
