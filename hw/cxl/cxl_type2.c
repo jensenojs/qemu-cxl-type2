@@ -2276,6 +2276,61 @@ static const char *cxl_type2_paired_case_name(uint32_t case_kind)
     }
 }
 
+static void cxl_type2_log_kimi_case_stage(uint64_t run_binding,
+                                          uint32_t case_kind, uint64_t epoch,
+                                          const char *operation,
+                                          const char *state, int status,
+                                          bool status_valid)
+{
+    int64_t host_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+
+    if (status_valid) {
+        qemu_log("KIMI_CASE_STAGE run_binding=%" PRIu64
+                 " case=%s epoch=%" PRIu64
+                 " operation=%s state=%s host_ns=%" PRId64 " status=%d\n",
+                 run_binding, cxl_type2_paired_case_name(case_kind), epoch,
+                 operation, state, host_ns, status);
+    } else {
+        qemu_log("KIMI_CASE_STAGE run_binding=%" PRIu64
+                 " case=%s epoch=%" PRIu64
+                 " operation=%s state=%s host_ns=%" PRId64
+                 " status=not-applicable\n",
+                 run_binding, cxl_type2_paired_case_name(case_kind), epoch,
+                 operation, state, host_ns);
+    }
+}
+
+static void cxl_type2_log_kimi_cleanup_progress(
+    uint64_t run_binding, uint32_t case_kind, uint64_t epoch,
+    const char *operation, const char *state, uint32_t completed,
+    uint32_t total, int status, bool status_valid)
+{
+    int64_t host_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+
+    if (status_valid) {
+        qemu_log("KIMI_CASE_STAGE run_binding=%" PRIu64
+                 " case=%s epoch=%" PRIu64
+                 " operation=%s state=%s host_ns=%" PRId64
+                 " completed=%u total=%u status=%d\n",
+                 run_binding, cxl_type2_paired_case_name(case_kind), epoch,
+                 operation, state, host_ns, completed, total, status);
+    } else {
+        qemu_log("KIMI_CASE_STAGE run_binding=%" PRIu64
+                 " case=%s epoch=%" PRIu64
+                 " operation=%s state=%s host_ns=%" PRId64
+                 " completed=%u total=%u status=not-applicable\n",
+                 run_binding, cxl_type2_paired_case_name(case_kind), epoch,
+                 operation, state, host_ns, completed, total);
+    }
+}
+
+static bool cxl_type2_cleanup_progress_due(uint32_t completed, uint32_t total)
+{
+    return completed == total || completed % 256 == 0;
+}
+
+
+
 static bool cxl_type2_command_requires_formal_case(uint32_t cmd)
 {
     switch (cmd) {
@@ -2403,49 +2458,194 @@ static bool cxl_type2_stream_from_wire(CXLType2State *ct2d, uint64_t wire,
     return true;
 }
 
-static void cxl_type2_clear_gpu_handles(CXLType2State *ct2d)
+static uint32_t cxl_type2_count_live_handles(void **handles, uint32_t count)
+{
+    uint32_t live = 0;
+
+    for (uint32_t i = 0; i < count; i++) {
+        if (handles[i]) {
+            live++;
+        }
+    }
+    return live;
+}
+
+static int cxl_type2_clear_gpu_handles(CXLType2State *ct2d,
+                                       uint64_t run_binding, uint32_t case_kind,
+                                       uint64_t epoch)
 {
     HetGPUState *hetgpu = &ct2d->gpu_info.hetgpu_state;
+    const char *operations[] = {
+        "event_cleanup",
+        "stream_cleanup",
+        "link_cleanup",
+        "module_cleanup",
+    };
+    int first_error = 0;
+    int category_error;
+    uint32_t completed;
+    uint32_t total;
+    bool log_stages =
+        run_binding != 0 && epoch != 0 && case_kind != CXL_GPU_CASE_NONE;
 
     if (ct2d->gpu_cmd.num_modules || ct2d->gpu_cmd.num_functions ||
         ct2d->gpu_cmd.num_graphs || ct2d->gpu_cmd.num_graph_execs ||
         ct2d->gpu_cmd.num_graph_nodes || ct2d->gpu_cmd.num_link_states ||
         ct2d->gpu_cmd.num_streams || ct2d->gpu_cmd.num_events) {
-        qemu_log("CXL Type2: GPU handle tables reset modules live=%u high_water=%u capacity=%zu functions live=%u high_water=%u capacity=%zu graphs live=%u execs live=%u nodes live=%u links live=%u streams live=%u events live=%u\n",
-                 ct2d->gpu_cmd.num_modules,
-                 ct2d->gpu_cmd.modules_high_water,
-                 ct2d->gpu_cmd.modules_capacity,
-                 ct2d->gpu_cmd.num_functions,
-                 ct2d->gpu_cmd.functions_high_water,
-                 ct2d->gpu_cmd.functions_capacity,
-                 ct2d->gpu_cmd.num_graphs,
-                 ct2d->gpu_cmd.num_graph_execs,
-                 ct2d->gpu_cmd.num_graph_nodes,
-                 ct2d->gpu_cmd.num_link_states,
-                 ct2d->gpu_cmd.num_streams,
-                 ct2d->gpu_cmd.num_events);
+        qemu_log(
+            "CXL Type2: GPU handle tables reset modules live=%u high_water=%u "
+            "capacity=%zu functions live=%u high_water=%u capacity=%zu graphs "
+            "live=%u execs live=%u nodes live=%u links live=%u streams "
+            "live=%u events live=%u\n",
+            ct2d->gpu_cmd.num_modules, ct2d->gpu_cmd.modules_high_water,
+            ct2d->gpu_cmd.modules_capacity, ct2d->gpu_cmd.num_functions,
+            ct2d->gpu_cmd.functions_high_water,
+            ct2d->gpu_cmd.functions_capacity, ct2d->gpu_cmd.num_graphs,
+            ct2d->gpu_cmd.num_graph_execs, ct2d->gpu_cmd.num_graph_nodes,
+            ct2d->gpu_cmd.num_link_states, ct2d->gpu_cmd.num_streams,
+            ct2d->gpu_cmd.num_events);
     }
     if (hetgpu->initialized) {
+        category_error = 0;
+        completed = 0;
+        total = cxl_type2_count_live_handles(ct2d->gpu_cmd.events,
+                                             ct2d->gpu_cmd.num_events);
+        if (log_stages) {
+            cxl_type2_log_kimi_cleanup_progress(run_binding, case_kind, epoch,
+                                                operations[0], "begin",
+                                                completed, total, 0, false);
+        }
         for (uint32_t i = 0; i < ct2d->gpu_cmd.num_events; i++) {
-            if (ct2d->gpu_cmd.events[i])
-                (void)hetgpu_cuda_event_destroy(hetgpu,
-                                                ct2d->gpu_cmd.events[i]);
+            if (ct2d->gpu_cmd.events[i]) {
+                int error =
+                    hetgpu_cuda_event_destroy(hetgpu, ct2d->gpu_cmd.events[i]);
+                if (category_error == 0 && error != 0) {
+                    category_error = error;
+                }
+                if (first_error == 0 && error != 0) {
+                    first_error = error;
+                }
+                completed++;
+                if (log_stages &&
+                    cxl_type2_cleanup_progress_due(completed, total)) {
+                    cxl_type2_log_kimi_cleanup_progress(
+                        run_binding, case_kind, epoch, operations[0],
+                        "progress", completed, total, category_error, true);
+                }
+            }
+        }
+        if (log_stages) {
+            cxl_type2_log_kimi_cleanup_progress(run_binding, case_kind, epoch,
+                                                operations[0], "end", completed,
+                                                total, category_error, true);
+        }
+
+        category_error = 0;
+        completed = 0;
+        total = cxl_type2_count_live_handles(ct2d->gpu_cmd.streams,
+                                             ct2d->gpu_cmd.num_streams);
+        if (log_stages) {
+            cxl_type2_log_kimi_cleanup_progress(run_binding, case_kind, epoch,
+                                                operations[1], "begin",
+                                                completed, total, 0, false);
         }
         for (uint32_t i = 0; i < ct2d->gpu_cmd.num_streams; i++) {
-            if (ct2d->gpu_cmd.streams[i])
-                (void)hetgpu_cuda_stream_destroy(hetgpu,
-                                                 ct2d->gpu_cmd.streams[i]);
+            if (ct2d->gpu_cmd.streams[i]) {
+                int error = hetgpu_cuda_stream_destroy(
+                    hetgpu, ct2d->gpu_cmd.streams[i]);
+                if (category_error == 0 && error != 0) {
+                    category_error = error;
+                }
+                if (first_error == 0 && error != 0) {
+                    first_error = error;
+                }
+                completed++;
+                if (log_stages &&
+                    cxl_type2_cleanup_progress_due(completed, total)) {
+                    cxl_type2_log_kimi_cleanup_progress(
+                        run_binding, case_kind, epoch, operations[1],
+                        "progress", completed, total, category_error, true);
+                }
+            }
+        }
+        if (log_stages) {
+            cxl_type2_log_kimi_cleanup_progress(run_binding, case_kind, epoch,
+                                                operations[1], "end", completed,
+                                                total, category_error, true);
+        }
+
+        category_error = 0;
+        completed = 0;
+        total = cxl_type2_count_live_handles(ct2d->gpu_cmd.link_states,
+                                             ct2d->gpu_cmd.num_link_states);
+        if (log_stages) {
+            cxl_type2_log_kimi_cleanup_progress(run_binding, case_kind, epoch,
+                                                operations[2], "begin",
+                                                completed, total, 0, false);
         }
         for (uint32_t i = 0; i < ct2d->gpu_cmd.num_link_states; i++) {
-            if (ct2d->gpu_cmd.link_states[i])
-                (void)hetgpu_cuda_link_destroy(hetgpu,
-                                               ct2d->gpu_cmd.link_states[i]);
+            if (ct2d->gpu_cmd.link_states[i]) {
+                int error = hetgpu_cuda_link_destroy(
+                    hetgpu, ct2d->gpu_cmd.link_states[i]);
+                if (category_error == 0 && error != 0) {
+                    category_error = error;
+                }
+                if (first_error == 0 && error != 0) {
+                    first_error = error;
+                }
+                completed++;
+                if (log_stages &&
+                    cxl_type2_cleanup_progress_due(completed, total)) {
+                    cxl_type2_log_kimi_cleanup_progress(
+                        run_binding, case_kind, epoch, operations[2],
+                        "progress", completed, total, category_error, true);
+                }
+            }
+        }
+        if (log_stages) {
+            cxl_type2_log_kimi_cleanup_progress(run_binding, case_kind, epoch,
+                                                operations[2], "end", completed,
+                                                total, category_error, true);
+        }
+
+        category_error = 0;
+        completed = 0;
+        total = cxl_type2_count_live_handles(ct2d->gpu_cmd.modules,
+                                             ct2d->gpu_cmd.num_modules);
+        if (log_stages) {
+            cxl_type2_log_kimi_cleanup_progress(run_binding, case_kind, epoch,
+                                                operations[3], "begin",
+                                                completed, total, 0, false);
         }
         for (uint32_t i = 0; i < ct2d->gpu_cmd.num_modules; i++) {
-            if (ct2d->gpu_cmd.modules[i])
-                (void)hetgpu_unload_module(hetgpu,
-                                           ct2d->gpu_cmd.modules[i]);
+            if (ct2d->gpu_cmd.modules[i]) {
+                int error =
+                    hetgpu_unload_module(hetgpu, ct2d->gpu_cmd.modules[i]);
+                if (category_error == 0 && error != 0) {
+                    category_error = error;
+                }
+                if (first_error == 0 && error != 0) {
+                    first_error = error;
+                }
+                completed++;
+                if (log_stages &&
+                    cxl_type2_cleanup_progress_due(completed, total)) {
+                    cxl_type2_log_kimi_cleanup_progress(
+                        run_binding, case_kind, epoch, operations[3],
+                        "progress", completed, total, category_error, true);
+                }
+            }
         }
+        if (log_stages) {
+            cxl_type2_log_kimi_cleanup_progress(run_binding, case_kind, epoch,
+                                                operations[3], "end", completed,
+                                                total, category_error, true);
+        }
+    }
+    if (log_stages) {
+        cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
+                                      "handle_table_release", "begin", 0,
+                                      false);
     }
     g_free(ct2d->gpu_cmd.modules);
     g_free(ct2d->gpu_cmd.functions);
@@ -2481,6 +2681,11 @@ static void cxl_type2_clear_gpu_handles(CXLType2State *ct2d)
     ct2d->gpu_cmd.num_events = 0;
     ct2d->gpu_cmd.modules_high_water = 0;
     ct2d->gpu_cmd.functions_high_water = 0;
+    if (log_stages) {
+        cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
+                                      "handle_table_release", "end", 0, false);
+    }
+    return first_error;
 }
 
 static uint64_t cxl_type2_paired_config_binding(
@@ -2511,16 +2716,32 @@ static uint64_t cxl_type2_paired_config_binding(
     return binding ? binding : 1;
 }
 
-static HetGPUError cxl_type2_reset_formal_backend(CXLType2State *ct2d)
+static HetGPUError cxl_type2_reset_formal_backend(CXLType2State *ct2d,
+                                                  uint64_t run_binding,
+                                                  uint32_t case_kind,
+                                                  uint64_t epoch)
 {
     HetGPUState *hetgpu = &ct2d->gpu_info.hetgpu_state;
     HetGPUError error;
+    int cleanup_error;
 
-    cxl_type2_clear_gpu_handles(ct2d);
+    cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
+                                  "handle_cleanup_before_reset", "begin", 0,
+                                  false);
+    cleanup_error =
+        cxl_type2_clear_gpu_handles(ct2d, run_binding, case_kind, epoch);
+    cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
+                                  "handle_cleanup_before_reset", "end",
+                                  cleanup_error, true);
+    cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
+                                  "formal_backend_reset", "begin", 0, false);
     error = hetgpu_reset_formal(hetgpu, HETGPU_BACKEND_NVIDIA,
                                 ct2d->gpu_info.hetgpu_device_index,
                                 ct2d->gpu_info.hetgpu_lib_path);
     if (error != HETGPU_SUCCESS) {
+        cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
+                                      "formal_backend_reset", "end", error,
+                                      true);
         return error;
     }
     if (!hetgpu->initialized || hetgpu->backend != HETGPU_BACKEND_NVIDIA ||
@@ -2530,14 +2751,20 @@ static HetGPUError cxl_type2_reset_formal_backend(CXLType2State *ct2d)
                  "initialized=%d backend=%u context=%p begin=%p end=%p\n",
                  hetgpu->initialized, hetgpu->backend, hetgpu->context,
                  hetgpu->kimi_case_begin_v1, hetgpu->kimi_case_end_v1);
-        return HETGPU_ERROR_INVALID_CONTEXT;
+        error = HETGPU_ERROR_INVALID_CONTEXT;
+        cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
+                                      "formal_backend_reset", "end", error,
+                                      true);
+        return error;
     }
 
-    hetgpu_set_coherency_callback(hetgpu,
-                                  cxl_type2_hetgpu_coherency_callback,
+    hetgpu_set_coherency_callback(hetgpu, cxl_type2_hetgpu_coherency_callback,
                                   ct2d);
     ct2d->gpu_info.passthrough_enabled = true;
     ct2d->gpu_info.gpu_mem_size = hetgpu->props.total_memory;
+    cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
+                                  "formal_backend_reset", "end", HETGPU_SUCCESS,
+                                  true);
     return HETGPU_SUCCESS;
 }
 
@@ -2594,11 +2821,15 @@ static void cxl_type2_paired_case_begin(CXLType2State *ct2d,
     config_binding = cxl_type2_paired_config_binding(
         ct2d, case_kind, aof_path, restore_path, manifest_path);
 
-    error = cxl_type2_reset_formal_backend(ct2d);
+    cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch, "case_begin",
+                                  "begin", 0, false);
+    error = cxl_type2_reset_formal_backend(ct2d, run_binding, case_kind, epoch);
     if (error != HETGPU_SUCCESS) {
         ct2d->paired_case.failed = true;
         ct2d->paired_case.failure_code = error;
         ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_CONTEXT;
+        cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
+                                      "case_begin", "end", error, true);
         return;
     }
 
@@ -2621,7 +2852,11 @@ static void cxl_type2_paired_case_begin(CXLType2State *ct2d,
     input.manifest_path = (const uint8_t *)manifest_path;
     input.manifest_path_len = strlen(manifest_path);
 
+    cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
+                                  "concordia_case_begin", "begin", 0, false);
     error = hetgpu_kimi_case_begin(hetgpu, &input, &result);
+    cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
+                                  "concordia_case_begin", "end", error, true);
     if (error != HETGPU_SUCCESS ||
         result.abi_version != HETGPU_KIMI_CASE_ABI_VERSION ||
         result.struct_size != sizeof(result) ||
@@ -2630,26 +2865,42 @@ static void cxl_type2_paired_case_begin(CXLType2State *ct2d,
         result.run_binding != run_binding ||
         result.config_binding != config_binding) {
         HetGPUError cleanup_error;
+        int handle_error;
+        int cleanup_status;
 
         qemu_log("CXL Type2: Concordia case begin failed error=%u "
                  "outcome=%u reason=%u detail=%.*s\n",
                  error, result.outcome, result.reason,
                  (int)MIN(result.error_len, HETGPU_KIMI_CASE_ERROR_BYTES),
                  result.error);
+        cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
+                                      "failed_begin_cleanup", "begin", 0,
+                                      false);
         cleanup_error = hetgpu_cleanup_formal(hetgpu);
         if (cleanup_error != HETGPU_SUCCESS) {
             qemu_log("CXL Type2: cleanup after failed case begin also "
                      "failed: %u\n",
                      cleanup_error);
         }
-        cxl_type2_clear_gpu_handles(ct2d);
+        handle_error =
+            cxl_type2_clear_gpu_handles(ct2d, run_binding, case_kind, epoch);
+        cleanup_status =
+            cleanup_error != HETGPU_SUCCESS ? cleanup_error : handle_error;
+        cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
+                                      "failed_begin_cleanup", "end",
+                                      cleanup_status, true);
         ct2d->gpu_info.passthrough_enabled = false;
         ct2d->paired_case.failed = true;
-        ct2d->paired_case.failure_code = error != HETGPU_SUCCESS ?
-                                         error :
-                                         result.reason ? result.reason :
-                                         HETGPU_ERROR_UNKNOWN;
+        ct2d->paired_case.failure_code = error != HETGPU_SUCCESS ? error
+                                         : result.reason         ? result.reason
+                                                         : HETGPU_ERROR_UNKNOWN;
         ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_UNKNOWN;
+        cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
+                                      "case_begin", "end",
+                                      error != HETGPU_SUCCESS ? error
+                                      : result.reason         ? result.reason
+                                                      : HETGPU_ERROR_UNKNOWN,
+                                      true);
         return;
     }
 
@@ -2662,6 +2913,8 @@ static void cxl_type2_paired_case_begin(CXLType2State *ct2d,
     ct2d->gpu_cmd.results[1] = case_kind;
     ct2d->gpu_cmd.results[2] = trace_sequence;
     ct2d->gpu_cmd.results[3] = config_binding;
+    cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch, "case_begin",
+                                  "end", HETGPU_SUCCESS, true);
     qemu_log("KIMI_CASE_BEGIN run_binding=%" PRIu64 " case=%s epoch=%" PRIu64
              " first_sequence=%" PRIu64 " config_binding=%" PRIu64
              " gpu_backend=%s\n",
@@ -2698,22 +2951,39 @@ static void cxl_type2_paired_case_end(CXLType2State *ct2d,
         return;
     }
 
+    cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch, "case_end",
+                                  "begin", 0, false);
+    cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
+                                  "backend_synchronize", "begin", 0, false);
     sync_error = hetgpu_synchronize(hetgpu);
+    cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
+                                  "backend_synchronize", "end", sync_error,
+                                  true);
     input.abi_version = HETGPU_KIMI_CASE_ABI_VERSION;
     input.struct_size = sizeof(input);
     input.epoch = epoch;
     input.run_binding = run_binding;
     input.config_binding = ct2d->paired_case.active_config_binding;
     input.application_exit = application_exit;
+    cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
+                                  "concordia_case_end", "begin", 0, false);
     concordia_error = hetgpu_kimi_case_end(hetgpu, &input, &result);
+    cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
+                                  "concordia_case_end", "end", concordia_error,
+                                  true);
+    cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
+                                  "formal_backend_cleanup", "begin", 0, false);
     reset_error = hetgpu_cleanup_formal(hetgpu);
+    cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
+                                  "formal_backend_cleanup", "end", reset_error,
+                                  true);
     result_valid = result.abi_version == HETGPU_KIMI_CASE_ABI_VERSION &&
                    result.struct_size == sizeof(result) &&
                    result.outcome == HETGPU_KIMI_CASE_SUCCEEDED &&
                    result.case_kind == case_kind && result.epoch == epoch &&
                    result.run_binding == run_binding &&
                    result.config_binding == input.config_binding;
-    cxl_type2_clear_gpu_handles(ct2d);
+    (void)cxl_type2_clear_gpu_handles(ct2d, run_binding, case_kind, epoch);
     ct2d->gpu_info.passthrough_enabled = false;
 
     ct2d->gpu_cmd.results[0] = epoch;
@@ -2723,12 +2993,22 @@ static void cxl_type2_paired_case_end(CXLType2State *ct2d,
 
     qemu_log("KIMI_CASE_END run_binding=%" PRIu64 " case=%s epoch=%" PRIu64
              " last_sequence=%" PRIu64 " app_exit=%d sync_status=%u"
-             " concordia_status=%u concordia_reason=%u reset_status=%u detail=%.*s\n",
+             " concordia_status=%u concordia_reason=%u reset_status=%u "
+             "detail=%.*s\n",
              run_binding, cxl_type2_paired_case_name(case_kind), epoch,
              trace_sequence, application_exit, sync_error, result.outcome,
              result.reason, reset_error,
              (int)MIN(result.error_len, HETGPU_KIMI_CASE_ERROR_BYTES),
              result.error);
+
+    cxl_type2_log_kimi_case_stage(
+        run_binding, case_kind, epoch, "case_end", "end",
+        application_exit != 0               ? HETGPU_ERROR_UNKNOWN
+        : sync_error != HETGPU_SUCCESS      ? sync_error
+        : concordia_error != HETGPU_SUCCESS ? concordia_error
+        : !result_valid ? (result.reason ? result.reason : HETGPU_ERROR_UNKNOWN)
+        : reset_error != HETGPU_SUCCESS ? reset_error : HETGPU_SUCCESS,
+        true);
 
     ct2d->paired_case.active_case = CXL_GPU_CASE_NONE;
     ct2d->paired_case.active_epoch = 0;
@@ -2746,9 +3026,8 @@ static void cxl_type2_paired_case_end(CXLType2State *ct2d,
         } else if (concordia_error != HETGPU_SUCCESS) {
             ct2d->paired_case.failure_code = concordia_error;
         } else if (!result_valid) {
-            ct2d->paired_case.failure_code = result.reason ?
-                                             result.reason :
-                                             HETGPU_ERROR_UNKNOWN;
+            ct2d->paired_case.failure_code =
+                result.reason ? result.reason : HETGPU_ERROR_UNKNOWN;
         } else {
             ct2d->paired_case.failure_code = reset_error;
         }
@@ -5556,7 +5835,7 @@ static void cxl_type2_exit(PCIDevice *pci_dev)
     cxlmemsim_disconnect(ct2d);
     qemu_mutex_destroy(&ct2d->memsim.lock);
 
-    cxl_type2_clear_gpu_handles(ct2d);
+    (void)cxl_type2_clear_gpu_handles(ct2d, 0, CXL_GPU_CASE_NONE, 0);
 
     /* Cleanup GPU passthrough */
     cxl_type2_gpu_cleanup(ct2d);

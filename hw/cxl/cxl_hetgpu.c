@@ -11,6 +11,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/thread.h"
+#include "qemu/timer.h"
 #include "hw/cxl/cxl_hetgpu.h"
 #include <dlfcn.h>
 
@@ -130,22 +131,30 @@ typedef int (*cuGetErrorName_fn)(int, const char **);
 #define CUDA_ERROR_NOT_SUPPORTED 801
 
 static __thread uint64_t g_cuda_trace_call_id;
+static __thread uint32_t g_cuda_trace_occurrence;
 
-void hetgpu_cuda_trace_set_call_id(uint64_t call_id)
-{
-    g_cuda_trace_call_id = call_id;
+void hetgpu_cuda_trace_set_call_id(uint64_t call_id) {
+  g_cuda_trace_call_id = call_id;
+  g_cuda_trace_occurrence = 0;
 }
 
 #define HETGPU_CUDA_CALL(field, ...)                                           \
-    ({                                                                         \
-        qemu_log("CXL TYPE2 TRACE driver_begin call_id=0x%016" PRIx64         \
-                 " symbol=%s\n", g_cuda_trace_call_id, #field);              \
-        int _driver_result = g_cuda_funcs.field(__VA_ARGS__);                  \
-        qemu_log("CXL TYPE2 TRACE driver_end call_id=0x%016" PRIx64           \
-                 " symbol=%s result=%d\n", g_cuda_trace_call_id, #field,     \
-                 _driver_result);                                              \
-        _driver_result;                                                        \
-    })
+  ({                                                                           \
+    uint32_t _driver_occurrence = ++g_cuda_trace_occurrence;                   \
+    int64_t _driver_start_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);             \
+    qemu_log("CXL TYPE2 TRACE driver_begin call_id=0x%016" PRIx64              \
+             " occurrence=%u symbol=%s host_ns=%" PRId64 "\n",                 \
+             g_cuda_trace_call_id, _driver_occurrence, #field,                 \
+             _driver_start_ns);                                                \
+    int _driver_result = g_cuda_funcs.field(__VA_ARGS__);                      \
+    int64_t _driver_end_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);               \
+    qemu_log("CXL TYPE2 TRACE driver_end call_id=0x%016" PRIx64                \
+             " occurrence=%u symbol=%s host_ns=%" PRId64                       \
+             " duration_ns=%" PRId64 " result=%d\n",                           \
+             g_cuda_trace_call_id, _driver_occurrence, #field, _driver_end_ns, \
+             _driver_end_ns - _driver_start_ns, _driver_result);               \
+    _driver_result;                                                            \
+  })
 
 /* Loaded function pointers */
 static struct {
