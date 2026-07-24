@@ -4,7 +4,7 @@
   lfs: false
 
 .qemu-cxl-type2-component-tools: &qemu-cxl-type2-component-tools
-  image: docker.cnb.cool/gevico.online/jensen/cxl-lab@sha256:f5199f028c436e6d08b698602ce8207abf5ad650dba6c95eb6388aaa8393a77f
+  image: docker.cnb.cool/gevico.online/jensen/cxl-lab@sha256:17ed5b5fe2e57522ab61d253aaf1d28f4665cfb7ce8a1b5dfa7b73eefb261e12
 
 .qemu-cxl-type2-docker-service: &qemu-cxl-type2-docker-service
   - docker
