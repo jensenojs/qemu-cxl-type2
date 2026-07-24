@@ -74,7 +74,7 @@
 
 /* Magic number */
 #define CXL_GPU_MAGIC               0x43584C32  /* "CXL2" */
-#define CXL_GPU_VERSION             0x00010900  /* v1.9.0: real host CUDA Driver API version */
+#define CXL_GPU_VERSION             0x00010A00  /* v1.10.0: stream-aware HtoD async */
 
 #define CXL_GPU_STREAM_WIRE_NULL       0xffffffffffffffffULL
 #define CXL_GPU_STREAM_WIRE_LEGACY     0xfffffffffffffffeULL
@@ -132,6 +132,7 @@ typedef enum {
     CXL_GPU_CMD_MEM_GET_INFO    = 0x26,
     CXL_GPU_CMD_MEM_GET_POINTER_MEMORY_TYPE = 0x27,
     CXL_GPU_CMD_MEM_PREFETCH_ASYNC = 0x28,
+    CXL_GPU_CMD_MEM_COPY_HTOD_ASYNC = 0x29,
 
     CXL_GPU_CMD_MODULE_LOAD_PTX = 0x30,
     CXL_GPU_CMD_MODULE_UNLOAD   = 0x31,

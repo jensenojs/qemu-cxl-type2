@@ -2458,6 +2458,116 @@ static bool cxl_type2_stream_from_wire(CXLType2State *ct2d, uint64_t wire,
     return true;
 }
 
+static int cxl_type2_release_pending_htod(CXLType2State *ct2d,
+                                          HetGPUStream stream,
+                                          bool all_streams,
+                                          uint64_t through_sequence,
+                                          const char *completion)
+{
+    CXLType2PendingHtoD **cursor = &ct2d->pending_htod;
+    int first_error = CXL_GPU_SUCCESS;
+
+    while (*cursor) {
+        CXLType2PendingHtoD *pending = *cursor;
+
+        if ((!all_streams && pending->stream != stream) ||
+            pending->sequence > through_sequence) {
+            cursor = &pending->next;
+            continue;
+        }
+        *cursor = pending->next;
+        if (pending->dev_ptr + pending->size <= ct2d->device_mem_size &&
+            cxl_type2_fabric_access_allowed(ct2d, pending->dev_ptr,
+                                            pending->size, true, false)) {
+            uint8_t *mem = memory_region_get_ram_ptr(&ct2d->device_mem);
+            if (mem) {
+                memcpy(mem + pending->dev_ptr, pending->staging,
+                       pending->size);
+                if (ct2d->bar_coherency.enabled) {
+                    cxl_bar_notify_gpu_access(&ct2d->bar_coherency,
+                                              pending->dev_ptr,
+                                              pending->size, true);
+                }
+            }
+        }
+        int result = hetgpu_cuda_mem_free_host(
+            &ct2d->gpu_info.hetgpu_state, pending->staging);
+        qemu_log("CXL TYPE2 TRACE copy_completion original_call_id=0x%016"
+                 PRIx64 " completion_call_id=0x%016" PRIx64
+                 " direction=htod sequence=%" PRIu64 " bytes=%zu "
+                 "completion=%s lifetime_ns=%" PRId64 " free_result=%d\n",
+                 pending->call_id, ct2d->gpu_cmd.call_id,
+                 pending->sequence, pending->size, completion,
+                 qemu_clock_get_ns(QEMU_CLOCK_HOST) -
+                     pending->enqueue_host_ns,
+                 result);
+        if (first_error == CXL_GPU_SUCCESS && result != CXL_GPU_SUCCESS) {
+            first_error = result;
+        }
+        g_free(pending);
+    }
+    return first_error;
+}
+
+static uint64_t cxl_type2_latest_pending_htod_sequence(
+    CXLType2State *ct2d, HetGPUStream stream)
+{
+    uint64_t latest = 0;
+
+    for (CXLType2PendingHtoD *pending = ct2d->pending_htod; pending;
+         pending = pending->next) {
+        if (pending->stream == stream && pending->sequence > latest) {
+            latest = pending->sequence;
+        }
+    }
+    return latest;
+}
+
+static CXLType2EventHtoDMark *cxl_type2_event_htod_mark(
+    CXLType2State *ct2d, void *event, bool create)
+{
+    CXLType2EventHtoDMark *mark;
+
+    for (mark = ct2d->event_htod_marks; mark; mark = mark->next) {
+        if (mark->event == event) {
+            return mark;
+        }
+    }
+    if (!create) {
+        return NULL;
+    }
+    mark = g_new0(CXLType2EventHtoDMark, 1);
+    mark->event = event;
+    mark->next = ct2d->event_htod_marks;
+    ct2d->event_htod_marks = mark;
+    return mark;
+}
+
+static void cxl_type2_remove_event_htod_mark(CXLType2State *ct2d,
+                                              void *event)
+{
+    CXLType2EventHtoDMark **cursor = &ct2d->event_htod_marks;
+
+    while (*cursor) {
+        CXLType2EventHtoDMark *mark = *cursor;
+        if (mark->event == event) {
+            *cursor = mark->next;
+            g_free(mark);
+            return;
+        }
+        cursor = &mark->next;
+    }
+}
+
+static void cxl_type2_clear_event_htod_marks(CXLType2State *ct2d)
+{
+    while (ct2d->event_htod_marks) {
+        CXLType2EventHtoDMark *mark = ct2d->event_htod_marks;
+        ct2d->event_htod_marks = mark->next;
+        g_free(mark);
+    }
+}
+
 static uint32_t cxl_type2_count_live_handles(void **handles, uint32_t count)
 {
     uint32_t live = 0;
@@ -2655,6 +2765,7 @@ static int cxl_type2_clear_gpu_handles(CXLType2State *ct2d,
     g_free(ct2d->gpu_cmd.link_states);
     g_free(ct2d->gpu_cmd.streams);
     g_free(ct2d->gpu_cmd.events);
+    cxl_type2_clear_event_htod_marks(ct2d);
     ct2d->gpu_cmd.modules = NULL;
     ct2d->gpu_cmd.functions = NULL;
     ct2d->gpu_cmd.graphs = NULL;
@@ -2956,6 +3067,12 @@ static void cxl_type2_paired_case_end(CXLType2State *ct2d,
     cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
                                   "backend_synchronize", "begin", 0, false);
     sync_error = hetgpu_synchronize(hetgpu);
+    if (sync_error == HETGPU_SUCCESS &&
+        cxl_type2_release_pending_htod(ct2d, NULL, true, UINT64_MAX,
+                                       "case-end") !=
+            CXL_GPU_SUCCESS) {
+        sync_error = HETGPU_ERROR_UNKNOWN;
+    }
     cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
                                   "backend_synchronize", "end", sync_error,
                                   true);
@@ -3243,6 +3360,12 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
     case CXL_GPU_CMD_CTX_SYNC:
         if (hetgpu->initialized) {
             err = hetgpu_synchronize(hetgpu);
+            if (err == HETGPU_SUCCESS &&
+                cxl_type2_release_pending_htod(ct2d, NULL, true,
+                                               UINT64_MAX, "context-sync") !=
+                    CXL_GPU_SUCCESS) {
+                err = HETGPU_ERROR_UNKNOWN;
+            }
             if (err != HETGPU_SUCCESS) {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_UNKNOWN;
             }
@@ -3375,6 +3498,72 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             } else {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
             }
+        }
+        break;
+
+    case CXL_GPU_CMD_MEM_COPY_HTOD_ASYNC:
+        {
+            void *stream = NULL;
+            void *staging = NULL;
+            CXLType2PendingHtoD *pending;
+            int result;
+            int64_t allocation_start_ns;
+            int64_t allocation_duration_ns;
+            int64_t staging_start_ns;
+            int64_t staging_duration_ns;
+            int64_t enqueue_start_ns;
+            int64_t enqueue_duration_ns;
+
+            dev_ptr = ct2d->gpu_cmd.params[0];
+            size = ct2d->gpu_cmd.params[1];
+            if (!size || size > ct2d->gpu_cmd.data_size ||
+                !cxl_type2_stream_from_wire(ct2d,
+                                            ct2d->gpu_cmd.params[2],
+                                            &stream)) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                break;
+            }
+            allocation_start_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+            result = hetgpu_cuda_mem_host_alloc(hetgpu, &staging, size);
+            allocation_duration_ns =
+                qemu_clock_get_ns(QEMU_CLOCK_HOST) - allocation_start_ns;
+            if (result != CXL_GPU_SUCCESS) {
+                ct2d->gpu_cmd.cmd_result = result;
+                break;
+            }
+            staging_start_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+            memcpy(staging, ct2d->gpu_cmd.data, size);
+            staging_duration_ns =
+                qemu_clock_get_ns(QEMU_CLOCK_HOST) - staging_start_ns;
+            enqueue_start_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+            result = hetgpu_cuda_memcpy_htod_async(
+                hetgpu, dev_ptr, staging, size, stream);
+            enqueue_duration_ns =
+                qemu_clock_get_ns(QEMU_CLOCK_HOST) - enqueue_start_ns;
+            if (result != CXL_GPU_SUCCESS) {
+                (void)hetgpu_cuda_mem_free_host(hetgpu, staging);
+                ct2d->gpu_cmd.cmd_result = result;
+                break;
+            }
+            pending = g_new0(CXLType2PendingHtoD, 1);
+            pending->stream = stream;
+            pending->staging = staging;
+            pending->dev_ptr = dev_ptr;
+            pending->sequence = ++ct2d->next_htod_sequence;
+            pending->call_id = ct2d->gpu_cmd.call_id;
+            pending->enqueue_host_ns = enqueue_start_ns;
+            pending->size = size;
+            pending->next = ct2d->pending_htod;
+            ct2d->pending_htod = pending;
+            qemu_log("CXL TYPE2 TRACE copy_driver call_id=0x%016" PRIx64
+                     " direction=htod bytes=%zu backend_result=%d "
+                     "implementation=async-enqueue stream_forwarded=1 "
+                     "host_alloc_duration_ns=%" PRId64
+                     " staging_memcpy_duration_ns=%" PRId64
+                     " driver_enqueue_duration_ns=%" PRId64 "\n",
+                     ct2d->gpu_cmd.call_id, size, result,
+                     allocation_duration_ns, staging_duration_ns,
+                     enqueue_duration_ns);
         }
         break;
 
@@ -4477,8 +4666,15 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
                 break;
             }
-            int result = hetgpu_cuda_stream_destroy(hetgpu,
-                                                     ct2d->gpu_cmd.streams[id]);
+            void *stream = ct2d->gpu_cmd.streams[id];
+            int result = hetgpu_cuda_stream_synchronize(hetgpu, stream);
+            if (result == CXL_GPU_SUCCESS) {
+                result = cxl_type2_release_pending_htod(
+                    ct2d, stream, false, UINT64_MAX, "stream-destroy");
+            }
+            if (result == CXL_GPU_SUCCESS) {
+                result = hetgpu_cuda_stream_destroy(hetgpu, stream);
+            }
             ct2d->gpu_cmd.cmd_result = result;
             if (result == CXL_GPU_SUCCESS)
                 ct2d->gpu_cmd.streams[id] = NULL;
@@ -4495,6 +4691,14 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             }
             ct2d->gpu_cmd.cmd_result = hetgpu_cuda_stream_synchronize(hetgpu,
                                                                       stream);
+            if (ct2d->gpu_cmd.cmd_result == CXL_GPU_SUCCESS) {
+                int release_result =
+                    cxl_type2_release_pending_htod(ct2d, stream, false,
+                                                   UINT64_MAX, "stream-sync");
+                if (release_result != CXL_GPU_SUCCESS) {
+                    ct2d->gpu_cmd.cmd_result = release_result;
+                }
+            }
         }
         break;
 
@@ -4709,15 +4913,33 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 break;
             }
             int result;
+            void *event = ct2d->gpu_cmd.events[id];
             if (cmd == CXL_GPU_CMD_EVENT_DESTROY)
-                result = hetgpu_cuda_event_destroy(hetgpu, ct2d->gpu_cmd.events[id]);
+                result = hetgpu_cuda_event_destroy(hetgpu, event);
             else if (cmd == CXL_GPU_CMD_EVENT_QUERY)
-                result = hetgpu_cuda_event_query(hetgpu, ct2d->gpu_cmd.events[id]);
+                result = hetgpu_cuda_event_query(hetgpu, event);
             else
-                result = hetgpu_cuda_event_synchronize(hetgpu, ct2d->gpu_cmd.events[id]);
+                result = hetgpu_cuda_event_synchronize(hetgpu, event);
             ct2d->gpu_cmd.cmd_result = result;
-            if (cmd == CXL_GPU_CMD_EVENT_DESTROY && result == CXL_GPU_SUCCESS)
+            if ((cmd == CXL_GPU_CMD_EVENT_QUERY ||
+                 cmd == CXL_GPU_CMD_EVENT_SYNC) &&
+                result == CXL_GPU_SUCCESS) {
+                CXLType2EventHtoDMark *mark =
+                    cxl_type2_event_htod_mark(ct2d, event, false);
+                if (mark) {
+                    int release_result = cxl_type2_release_pending_htod(
+                        ct2d, mark->stream, false, mark->sequence,
+                        cmd == CXL_GPU_CMD_EVENT_QUERY ? "event-query"
+                                                       : "event-sync");
+                    if (release_result != CXL_GPU_SUCCESS) {
+                        ct2d->gpu_cmd.cmd_result = release_result;
+                    }
+                }
+            }
+            if (cmd == CXL_GPU_CMD_EVENT_DESTROY && result == CXL_GPU_SUCCESS) {
+                cxl_type2_remove_event_htod_mark(ct2d, event);
                 ct2d->gpu_cmd.events[id] = NULL;
+            }
         }
         break;
 
@@ -4734,6 +4956,13 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             }
             ct2d->gpu_cmd.cmd_result = hetgpu_cuda_event_record(
                 hetgpu, ct2d->gpu_cmd.events[event_id], stream);
+            if (ct2d->gpu_cmd.cmd_result == CXL_GPU_SUCCESS) {
+                CXLType2EventHtoDMark *mark = cxl_type2_event_htod_mark(
+                    ct2d, ct2d->gpu_cmd.events[event_id], true);
+                mark->stream = stream;
+                mark->sequence =
+                    cxl_type2_latest_pending_htod_sequence(ct2d, stream);
+            }
         }
         break;
 
@@ -5420,15 +5649,8 @@ static uint64_t cxl_type2_gpu_cmd_read(void *opaque, hwaddr addr, unsigned size)
         break;
 
     default:
-        /* Data region */
-        if (addr >= CXL_GPU_DATA_OFFSET &&
-            addr < CXL_GPU_DATA_OFFSET + CXL_GPU_DATA_SIZE) {
-            size_t offset = addr - CXL_GPU_DATA_OFFSET;
-            if (offset + size <= ct2d->gpu_cmd.data_size) {
-                memcpy(&value, &ct2d->gpu_cmd.data[offset], MIN(size, 8));
-            }
-        } else if (addr >= CXL_GPU_REG_DEV_NAME &&
-                   addr < CXL_GPU_REG_DEV_NAME + 64) {
+        if (addr >= CXL_GPU_REG_DEV_NAME &&
+            addr < CXL_GPU_REG_DEV_NAME + 64) {
             /* Device name */
             size_t offset = addr - CXL_GPU_REG_DEV_NAME;
             if (hetgpu->initialized) {
@@ -5479,14 +5701,6 @@ static void cxl_type2_gpu_cmd_write(void *opaque, hwaddr addr,
         ct2d->gpu_cmd.params[7] = value;
         break;
     default:
-        /* Data region */
-        if (addr >= CXL_GPU_DATA_OFFSET &&
-            addr < CXL_GPU_DATA_OFFSET + CXL_GPU_DATA_SIZE) {
-            size_t offset = addr - CXL_GPU_DATA_OFFSET;
-            if (offset + size <= ct2d->gpu_cmd.data_size) {
-                memcpy(&ct2d->gpu_cmd.data[offset], &value, MIN(size, 8));
-            }
-        }
         break;
     }
 }
@@ -5713,6 +5927,20 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
 
     memory_region_add_subregion_overlap(&ct2d->cache_mem, 0, &ct2d->cache_io, 1);
 
+    /* The command data window is a payload mailbox, not a CXL cache access.
+     * Expose it as RAM so guest bulk copies do not dispatch one device callback
+     * per store through cache_io. */
+    memory_region_init_ram(&ct2d->gpu_data_mem, OBJECT(ct2d),
+                           "cxl-type2-gpu-data", CXL_GPU_DATA_SIZE,
+                           &local_err);
+    if (local_err) {
+        error_propagate(errp, local_err);
+        return;
+    }
+    memory_region_add_subregion_overlap(&ct2d->cache_mem,
+                                        CXL_GPU_DATA_OFFSET,
+                                        &ct2d->gpu_data_mem, 2);
+
     pci_register_bar(pci_dev, 2,
                     PCI_BASE_ADDRESS_SPACE_MEMORY |
                     PCI_BASE_ADDRESS_MEM_TYPE_64 |
@@ -5757,11 +5985,7 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
     ct2d->gpu_cmd.cmd_status = CXL_GPU_CMD_STATUS_IDLE;
 
     ct2d->gpu_cmd.data_size = CXL_GPU_DATA_SIZE;
-    ct2d->gpu_cmd.data = g_malloc0(ct2d->gpu_cmd.data_size);
-    if (!ct2d->gpu_cmd.data) {
-        error_setg(errp, "Failed to allocate GPU command data buffer");
-        return;
-    }
+    ct2d->gpu_cmd.data = memory_region_get_ram_ptr(&ct2d->gpu_data_mem);
 
     /* Set capabilities */
     ct2d->gpu_cmd.capabilities = CXL_GPU_CAP_BULK_TRANSFER |
@@ -5835,6 +6059,12 @@ static void cxl_type2_exit(PCIDevice *pci_dev)
     cxlmemsim_disconnect(ct2d);
     qemu_mutex_destroy(&ct2d->memsim.lock);
 
+    if (ct2d->gpu_info.hetgpu_state.initialized) {
+        (void)hetgpu_synchronize(&ct2d->gpu_info.hetgpu_state);
+        (void)cxl_type2_release_pending_htod(ct2d, NULL, true, UINT64_MAX,
+                                             "device-exit");
+    }
+
     (void)cxl_type2_clear_gpu_handles(ct2d, 0, CXL_GPU_CASE_NONE, 0);
 
     /* Cleanup GPU passthrough */
@@ -5865,11 +6095,7 @@ static void cxl_type2_exit(PCIDevice *pci_dev)
     }
     qemu_mutex_destroy(&ct2d->coherent_pool.lock);
 
-    /* Free GPU command data buffer */
-    if (ct2d->gpu_cmd.data) {
-        g_free(ct2d->gpu_cmd.data);
-        ct2d->gpu_cmd.data = NULL;
-    }
+    ct2d->gpu_cmd.data = NULL;
 
     /* Free bulk transfer region if allocated */
     if (ct2d->bulk_transfer_ptr) {

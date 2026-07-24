@@ -400,6 +400,11 @@ int hetgpu_pointer_get_memory_type(HetGPUState *state, HetGPUDevicePtr ptr,
  */
 HetGPUError hetgpu_memcpy_htod(HetGPUState *state, HetGPUDevicePtr dst,
                                const void *src, size_t size);
+int hetgpu_cuda_mem_host_alloc(HetGPUState *state, void **ptr, size_t size);
+int hetgpu_cuda_mem_free_host(HetGPUState *state, void *ptr);
+int hetgpu_cuda_memcpy_htod_async(HetGPUState *state, HetGPUDevicePtr dst,
+                                  const void *src, size_t size,
+                                  HetGPUStream stream);
 
 /**
  * hetgpu_memcpy_dtoh - Copy memory from device to host

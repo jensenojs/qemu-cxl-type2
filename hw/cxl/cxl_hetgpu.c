@@ -55,6 +55,9 @@ typedef int (*cuMemAlloc_fn)(uint64_t *, size_t);
 typedef int (*cuMemFree_fn)(uint64_t);
 typedef int (*cuMemcpyHtoD_fn)(uint64_t, const void *, size_t);
 typedef int (*cuMemcpyDtoH_fn)(void *, uint64_t, size_t);
+typedef int (*cuMemcpyHtoDAsync_fn)(uint64_t, const void *, size_t, void *);
+typedef int (*cuMemHostAlloc_fn)(void **, size_t, unsigned int);
+typedef int (*cuMemFreeHost_fn)(void *);
 typedef int (*cuMemcpyDtoD_fn)(uint64_t, uint64_t, size_t);
 typedef int (*cuPointerGetAttribute_fn)(void *, int, uint64_t);
 typedef int (*cuModuleLoadData_fn)(void **, const void *);
@@ -173,6 +176,9 @@ static struct {
     cuMemFree_fn cuMemFree;
     cuMemcpyHtoD_fn cuMemcpyHtoD;
     cuMemcpyDtoH_fn cuMemcpyDtoH;
+    cuMemcpyHtoDAsync_fn cuMemcpyHtoDAsync;
+    cuMemHostAlloc_fn cuMemHostAlloc;
+    cuMemFreeHost_fn cuMemFreeHost;
     cuMemcpyDtoD_fn cuMemcpyDtoD;
     cuPointerGetAttribute_fn cuPointerGetAttribute;
     cuModuleLoadData_fn cuModuleLoadData;
@@ -337,6 +343,12 @@ static HetGPUError hetgpu_init_internal(HetGPUState *state,
             g_cuda_funcs.cuMemFree = dlsym(g_cuda_lib_handle, "cuMemFree_v2");
             g_cuda_funcs.cuMemcpyHtoD = dlsym(g_cuda_lib_handle, "cuMemcpyHtoD_v2");
             g_cuda_funcs.cuMemcpyDtoH = dlsym(g_cuda_lib_handle, "cuMemcpyDtoH_v2");
+            g_cuda_funcs.cuMemcpyHtoDAsync =
+                dlsym(g_cuda_lib_handle, "cuMemcpyHtoDAsync_v2");
+            g_cuda_funcs.cuMemHostAlloc =
+                dlsym(g_cuda_lib_handle, "cuMemHostAlloc");
+            g_cuda_funcs.cuMemFreeHost =
+                dlsym(g_cuda_lib_handle, "cuMemFreeHost");
             g_cuda_funcs.cuMemcpyDtoD = dlsym(g_cuda_lib_handle, "cuMemcpyDtoD_v2");
             g_cuda_funcs.cuPointerGetAttribute = dlsym(g_cuda_lib_handle, "cuPointerGetAttribute");
             g_cuda_funcs.cuModuleLoadData = dlsym(g_cuda_lib_handle, "cuModuleLoadData");
@@ -1300,6 +1312,49 @@ HetGPUError hetgpu_memcpy_htod(HetGPUState *state, HetGPUDevicePtr dst,
     }
 
     return HETGPU_SUCCESS;
+}
+
+int hetgpu_cuda_mem_host_alloc(HetGPUState *state, void **ptr, size_t size)
+{
+    if (!state || !state->initialized || !ptr || !size ||
+        !g_cuda_funcs.cuMemHostAlloc) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if (!cuda_lock(state)) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    int result = HETGPU_CUDA_CALL(cuMemHostAlloc, ptr, size, 0);
+    cuda_unlock(state);
+    return result;
+}
+
+int hetgpu_cuda_mem_free_host(HetGPUState *state, void *ptr)
+{
+    if (!ptr) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if (!cuda_lock(state)) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    int result = HETGPU_CUDA_CALL(cuMemFreeHost, ptr);
+    cuda_unlock(state);
+    return result;
+}
+
+int hetgpu_cuda_memcpy_htod_async(HetGPUState *state, HetGPUDevicePtr dst,
+                                  const void *src, size_t size,
+                                  HetGPUStream stream)
+{
+    if (!state || !state->initialized || !src ||
+        !g_cuda_funcs.cuMemcpyHtoDAsync) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if (!cuda_lock(state)) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    int result = HETGPU_CUDA_CALL(cuMemcpyHtoDAsync, dst, src, size, stream);
+    cuda_unlock(state);
+    return result;
 }
 
 HetGPUError hetgpu_memcpy_dtoh(HetGPUState *state, void *dst,

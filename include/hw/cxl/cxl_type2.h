@@ -179,6 +179,24 @@ typedef struct CXLType2MHSLDState {
     QemuMutex lock;
 } CXLType2MHSLDState;
 
+typedef struct CXLType2PendingHtoD {
+    HetGPUStream stream;
+    void *staging;
+    uint64_t dev_ptr;
+    uint64_t sequence;
+    uint64_t call_id;
+    int64_t enqueue_host_ns;
+    size_t size;
+    struct CXLType2PendingHtoD *next;
+} CXLType2PendingHtoD;
+
+typedef struct CXLType2EventHtoDMark {
+    void *event;
+    HetGPUStream stream;
+    uint64_t sequence;
+    struct CXLType2EventHtoDMark *next;
+} CXLType2EventHtoDMark;
+
 /* Main Type 2 device state */
 typedef struct CXLType2State {
     PCIDevice parent_obj;
@@ -191,6 +209,7 @@ typedef struct CXLType2State {
     MemoryRegion bar0;                 /* Component registers */
     MemoryRegion cache_mem;            /* Type 1: Cache for coherent access */
     MemoryRegion cache_io;             /* Cache access interceptor */
+    MemoryRegion gpu_data_mem;         /* RAM-backed BAR2 command data window */
     MemoryRegion device_mem;           /* Type 3: Device-attached memory */
     MemoryRegion device_mem_io;        /* Device memory interceptor */
     MemoryRegion gpu_cmd_region;       /* GPU command registers */
@@ -204,7 +223,7 @@ typedef struct CXLType2State {
         uint64_t call_id;
         uint64_t params[8];
         uint64_t results[4];
-        uint8_t  *data;                /* Data buffer - dynamically allocated (1MB) */
+        uint8_t  *data;                /* Host pointer into gpu_data_mem */
         size_t   data_size;            /* Size of data buffer */
         /* Guest-visible IDs are indexes into tables that grow with the active
          * CUDA workload. A case reset releases both tables and invalidates all
@@ -237,6 +256,10 @@ typedef struct CXLType2State {
         uint32_t functions_high_water;
         uint32_t capabilities;         /* Device capabilities (bulk transfer, etc.) */
     } gpu_cmd;
+
+    CXLType2PendingHtoD *pending_htod;
+    CXLType2EventHtoDMark *event_htod_marks;
+    uint64_t next_htod_sequence;
 
     struct {
         bool required;
