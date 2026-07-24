@@ -3929,6 +3929,60 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         }
         break;
 
+    case CXL_GPU_CMD_FUNC_GET_PARAM_LAYOUT:
+        if (hetgpu->initialized) {
+            uint32_t func_id = ct2d->gpu_cmd.params[0];
+            CXLFunctionParamLayoutWire wire = {0};
+            uint64_t backend_queries_before = hetgpu->param_info_backend_queries;
+
+            if (func_id >= ct2d->gpu_cmd.num_functions) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                break;
+            }
+            while (wire.num_args < ARRAY_SIZE(wire.params)) {
+                size_t offset = 0;
+                size_t param_size = 0;
+
+                err = hetgpu_get_param_info(hetgpu,
+                                            ct2d->gpu_cmd.functions[func_id],
+                                            wire.num_args, &offset, &param_size);
+                if (err == HETGPU_ERROR_INVALID_VALUE) {
+                    break;
+                }
+                if (err != HETGPU_SUCCESS ||
+                    offset > ct2d->gpu_cmd.data_size ||
+                    param_size > ct2d->gpu_cmd.data_size - offset) {
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                    break;
+                }
+                wire.params[wire.num_args].offset = offset;
+                wire.params[wire.num_args].size = param_size;
+                wire.extent = MAX(wire.extent, offset + param_size);
+                wire.num_args++;
+            }
+            if (ct2d->gpu_cmd.cmd_result != CXL_GPU_SUCCESS) {
+                break;
+            }
+            if (wire.num_args == ARRAY_SIZE(wire.params)) {
+                size_t offset = 0;
+                size_t param_size = 0;
+
+                err = hetgpu_get_param_info(hetgpu,
+                                            ct2d->gpu_cmd.functions[func_id],
+                                            wire.num_args, &offset, &param_size);
+                if (err != HETGPU_ERROR_INVALID_VALUE) {
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                    break;
+                }
+            }
+            memcpy(ct2d->gpu_cmd.data, &wire, sizeof(wire));
+            ct2d->gpu_cmd.results[0] =
+                hetgpu->param_info_backend_queries - backend_queries_before;
+        } else {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
+        }
+        break;
+
     case CXL_GPU_CMD_FUNC_SET_ATTRIBUTE:
         if (hetgpu->initialized) {
             uint32_t func_id = ct2d->gpu_cmd.params[0];

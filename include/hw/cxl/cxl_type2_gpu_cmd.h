@@ -158,6 +158,7 @@ typedef enum {
     CXL_GPU_CMD_LINK_COMPLETE = 0x44,
     CXL_GPU_CMD_LINK_DESTROY = 0x45,
     CXL_GPU_CMD_FUNC_GET_ATTRIBUTE = 0x46,
+    CXL_GPU_CMD_FUNC_GET_PARAM_LAYOUT = 0x47,
 
     CXL_GPU_CMD_STREAM_CREATE   = 0x50,
     CXL_GPU_CMD_STREAM_DESTROY  = 0x51,
@@ -238,6 +239,13 @@ typedef struct CXLGraphKernelNodeParamWire {
     uint64_t offset;
     uint64_t size;
 } CXLGraphKernelNodeParamWire;
+
+typedef struct CXLFunctionParamLayoutWire {
+    uint32_t num_args;
+    uint32_t reserved;
+    uint64_t extent;
+    CXLGraphKernelNodeParamWire params[64];
+} CXLFunctionParamLayoutWire;
 
 /* P2P register offsets and peer types: defined in cxl_p2p_dma.h */
 
