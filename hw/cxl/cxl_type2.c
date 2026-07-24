@@ -3675,6 +3675,72 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         }
         break;
 
+    case CXL_GPU_CMD_MEM_COPY_2D_DTOD:
+        {
+            uint64_t dst_dev_ptr = ct2d->gpu_cmd.params[0];
+            uint64_t src_dev_ptr = ct2d->gpu_cmd.params[1];
+            size_t dst_pitch = ct2d->gpu_cmd.params[2];
+            size_t src_pitch = ct2d->gpu_cmd.params[3];
+            size_t width = ct2d->gpu_cmd.params[4];
+            size_t height = ct2d->gpu_cmd.params[5];
+            size_t total_bytes;
+
+            if (!width || !height || width > src_pitch || width > dst_pitch ||
+                height > SIZE_MAX / width || src_dev_ptr > UINT64_MAX - width ||
+                dst_dev_ptr > UINT64_MAX - width ||
+                (height - 1 && (src_pitch > (UINT64_MAX - src_dev_ptr - width) / (height - 1) ||
+                                dst_pitch > (UINT64_MAX - dst_dev_ptr - width) / (height - 1)))) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                break;
+            }
+            total_bytes = width * height;
+
+            int64_t driver_start_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+            if (hetgpu->initialized && hetgpu->backend != HETGPU_BACKEND_SIMULATION) {
+                err = hetgpu_memcpy2d_dtod(hetgpu, dst_dev_ptr, dst_pitch,
+                                           src_dev_ptr, src_pitch, width, height);
+            } else if (hetgpu->backend == HETGPU_BACKEND_SIMULATION) {
+                err = HETGPU_SUCCESS;
+                for (size_t row = 0; row < height; row++) {
+                    err = hetgpu_memcpy_dtod(hetgpu, dst_dev_ptr + row * dst_pitch,
+                                             src_dev_ptr + row * src_pitch, width);
+                    if (err != HETGPU_SUCCESS) {
+                        break;
+                    }
+                }
+            } else {
+                err = HETGPU_ERROR_INVALID_CONTEXT;
+            }
+            qemu_log("CXL TYPE2 TRACE copy_driver call_id=0x%016" PRIx64
+                     " direction=dtod bytes=%zu rows=%zu row_commands_eliminated=%zu "
+                     "driver_duration_ns=%" PRId64
+                     " backend_result=%d implementation=blocking-direct-2d "
+                     "stream_forwarded=0\n",
+                     ct2d->gpu_cmd.call_id, total_bytes, height, height - 1,
+                     qemu_clock_get_ns(QEMU_CLOCK_HOST) - driver_start_ns, err);
+            if (err != HETGPU_SUCCESS) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                break;
+            }
+
+            for (size_t row = 0; row < height; row++) {
+                uint64_t src = src_dev_ptr + row * src_pitch;
+                uint64_t dst = dst_dev_ptr + row * dst_pitch;
+                if (ct2d->bar_coherency.enabled) {
+                    cxl_bar_notify_gpu_access(&ct2d->bar_coherency, src, width, false);
+                    cxl_bar_notify_gpu_access(&ct2d->bar_coherency, dst, width, true);
+                }
+                if (src <= ct2d->device_mem_size && width <= ct2d->device_mem_size - src &&
+                    dst <= ct2d->device_mem_size && width <= ct2d->device_mem_size - dst) {
+                    uint8_t *mem = memory_region_get_ram_ptr(&ct2d->device_mem);
+                    if (mem) {
+                        memmove(mem + dst, mem + src, width);
+                    }
+                }
+            }
+        }
+        break;
+
     case CXL_GPU_CMD_MODULE_LOAD_PTX:
         if (hetgpu->initialized) {
             /* PTX source is in data buffer */

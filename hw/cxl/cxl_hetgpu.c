@@ -59,6 +59,25 @@ typedef int (*cuMemcpyHtoDAsync_fn)(uint64_t, const void *, size_t, void *);
 typedef int (*cuMemHostAlloc_fn)(void **, size_t, unsigned int);
 typedef int (*cuMemFreeHost_fn)(void *);
 typedef int (*cuMemcpyDtoD_fn)(uint64_t, uint64_t, size_t);
+typedef struct CudaMemcpy2D {
+    size_t src_x_bytes;
+    size_t src_y;
+    unsigned int src_memory_type;
+    const void *src_host;
+    uint64_t src_device;
+    void *src_array;
+    size_t src_pitch;
+    size_t dst_x_bytes;
+    size_t dst_y;
+    unsigned int dst_memory_type;
+    void *dst_host;
+    uint64_t dst_device;
+    void *dst_array;
+    size_t dst_pitch;
+    size_t width_bytes;
+    size_t height;
+} CudaMemcpy2D;
+typedef int (*cuMemcpy2D_fn)(const CudaMemcpy2D *);
 typedef int (*cuPointerGetAttribute_fn)(void *, int, uint64_t);
 typedef int (*cuModuleLoadData_fn)(void **, const void *);
 typedef int (*cuModuleUnload_fn)(void *);
@@ -180,6 +199,7 @@ static struct {
     cuMemHostAlloc_fn cuMemHostAlloc;
     cuMemFreeHost_fn cuMemFreeHost;
     cuMemcpyDtoD_fn cuMemcpyDtoD;
+    cuMemcpy2D_fn cuMemcpy2D;
     cuPointerGetAttribute_fn cuPointerGetAttribute;
     cuModuleLoadData_fn cuModuleLoadData;
     cuModuleUnload_fn cuModuleUnload;
@@ -350,6 +370,7 @@ static HetGPUError hetgpu_init_internal(HetGPUState *state,
             g_cuda_funcs.cuMemFreeHost =
                 dlsym(g_cuda_lib_handle, "cuMemFreeHost");
             g_cuda_funcs.cuMemcpyDtoD = dlsym(g_cuda_lib_handle, "cuMemcpyDtoD_v2");
+            g_cuda_funcs.cuMemcpy2D = dlsym(g_cuda_lib_handle, "cuMemcpy2D_v2");
             g_cuda_funcs.cuPointerGetAttribute = dlsym(g_cuda_lib_handle, "cuPointerGetAttribute");
             g_cuda_funcs.cuModuleLoadData = dlsym(g_cuda_lib_handle, "cuModuleLoadData");
             g_cuda_funcs.cuModuleUnload = dlsym(g_cuda_lib_handle, "cuModuleUnload");
@@ -1478,6 +1499,44 @@ HetGPUError hetgpu_memcpy_dtod(HetGPUState *state, HetGPUDevicePtr dst,
         return HETGPU_ERROR_INVALID_VALUE;
     }
 
+    return HETGPU_SUCCESS;
+}
+
+HetGPUError hetgpu_memcpy2d_dtod(HetGPUState *state, HetGPUDevicePtr dst,
+                                 size_t dst_pitch, HetGPUDevicePtr src,
+                                 size_t src_pitch, size_t width, size_t height)
+{
+    if (!state || !state->initialized || !g_cuda_funcs.cuMemcpy2D ||
+        state->backend == HETGPU_BACKEND_SIMULATION) {
+        return HETGPU_ERROR_INVALID_VALUE;
+    }
+
+    CudaMemcpy2D copy = {
+        .src_memory_type = 2,
+        .src_device = src,
+        .src_pitch = src_pitch,
+        .dst_memory_type = 2,
+        .dst_device = dst,
+        .dst_pitch = dst_pitch,
+        .width_bytes = width,
+        .height = height,
+    };
+
+    state->memory_ops++;
+    if (!cuda_lock(state)) {
+        return HETGPU_ERROR_INVALID_CONTEXT;
+    }
+    int err = HETGPU_CUDA_CALL(cuMemcpy2D, &copy);
+    cuda_unlock(state);
+    if (err != 0) {
+        const char *err_name = "UNKNOWN";
+        if (g_cuda_funcs.cuGetErrorName) {
+            HETGPU_CUDA_CALL(cuGetErrorName, err, &err_name);
+        }
+        qemu_log("CXL hetGPU: [dev%d] cuMemcpy2D DtoD failed: %s (%d)\n",
+                 state->device_index, err_name, err);
+        return HETGPU_ERROR_INVALID_VALUE;
+    }
     return HETGPU_SUCCESS;
 }
 
