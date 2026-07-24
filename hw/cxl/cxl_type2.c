@@ -3619,6 +3619,62 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         }
         break;
 
+    case CXL_GPU_CMD_MEM_COPY_DTOD:
+        {
+            uint64_t dst_dev_ptr = ct2d->gpu_cmd.params[0];
+            uint64_t src_dev_ptr = ct2d->gpu_cmd.params[1];
+            size_t xfer_size = ct2d->gpu_cmd.params[2];
+
+            if (hetgpu->initialized) {
+                int64_t driver_start_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+                err = hetgpu_memcpy_dtod(hetgpu, dst_dev_ptr, src_dev_ptr,
+                                         xfer_size);
+                qemu_log("CXL TYPE2 TRACE copy_driver call_id=0x%016" PRIx64
+                         " direction=dtod bytes=%zu driver_duration_ns=%" PRId64
+                         " backend_result=%d implementation=blocking-direct "
+                         "stream_forwarded=0\n",
+                         ct2d->gpu_cmd.call_id, xfer_size,
+                         qemu_clock_get_ns(QEMU_CLOCK_HOST) - driver_start_ns,
+                         err);
+                if (err != HETGPU_SUCCESS) {
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                    break;
+                }
+            } else {
+                uint8_t *mem = memory_region_get_ram_ptr(&ct2d->device_mem);
+                if (!mem || src_dev_ptr > ct2d->device_mem_size ||
+                    xfer_size > ct2d->device_mem_size - src_dev_ptr ||
+                    dst_dev_ptr > ct2d->device_mem_size ||
+                    xfer_size > ct2d->device_mem_size - dst_dev_ptr ||
+                    !cxl_type2_fabric_access_allowed(ct2d, src_dev_ptr,
+                                                     xfer_size, false, false) ||
+                    !cxl_type2_fabric_access_allowed(ct2d, dst_dev_ptr,
+                                                     xfer_size, true, false)) {
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                    break;
+                }
+                memmove(mem + dst_dev_ptr, mem + src_dev_ptr, xfer_size);
+            }
+
+            if (ct2d->bar_coherency.enabled) {
+                cxl_bar_notify_gpu_access(&ct2d->bar_coherency,
+                                          src_dev_ptr, xfer_size, false);
+                cxl_bar_notify_gpu_access(&ct2d->bar_coherency,
+                                          dst_dev_ptr, xfer_size, true);
+            }
+            if (hetgpu->initialized &&
+                src_dev_ptr <= ct2d->device_mem_size &&
+                xfer_size <= ct2d->device_mem_size - src_dev_ptr &&
+                dst_dev_ptr <= ct2d->device_mem_size &&
+                xfer_size <= ct2d->device_mem_size - dst_dev_ptr) {
+                uint8_t *mem = memory_region_get_ram_ptr(&ct2d->device_mem);
+                if (mem) {
+                    memmove(mem + dst_dev_ptr, mem + src_dev_ptr, xfer_size);
+                }
+            }
+        }
+        break;
+
     case CXL_GPU_CMD_MODULE_LOAD_PTX:
         if (hetgpu->initialized) {
             /* PTX source is in data buffer */
