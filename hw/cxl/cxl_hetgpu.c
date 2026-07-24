@@ -706,25 +706,13 @@ static HetGPUSimAlloc *find_sim_alloc(HetGPUState *state, HetGPUDevicePtr dev_pt
     return NULL;
 }
 
-typedef struct HetGPUParamInfoCacheValue {
-    size_t offset;
-    size_t size;
-    HetGPUError result;
-} HetGPUParamInfoCacheValue;
-
 static void hetgpu_clear_param_info_cache(HetGPUState *state,
                                           const char *reason)
 {
     uint64_t entries = 0;
 
     if (state && state->param_info_cache) {
-        GHashTableIter iter;
-        gpointer value;
-
-        g_hash_table_iter_init(&iter, state->param_info_cache);
-        while (g_hash_table_iter_next(&iter, NULL, &value)) {
-            entries += g_hash_table_size(value);
-        }
+        entries = g_hash_table_size(state->param_info_cache);
         g_hash_table_destroy(state->param_info_cache);
         state->param_info_cache = NULL;
     }
@@ -1818,68 +1806,98 @@ HetGPUError hetgpu_get_param_info(HetGPUState *state, HetGPUFunction function,
                                   size_t param_index, size_t *param_offset,
                                   size_t *param_size)
 {
-    if (!state || !state->initialized || !function || !param_offset ||
-        !param_size) {
+    const HetGPUParamLayout *layout;
+    HetGPUError result = hetgpu_get_param_layout(state, function, &layout);
+
+    if (result != HETGPU_SUCCESS) {
+        return result;
+    }
+    if (!param_offset || !param_size || param_index >= layout->num_args) {
+        return HETGPU_ERROR_INVALID_VALUE;
+    }
+    *param_offset = layout->offsets[param_index];
+    *param_size = layout->sizes[param_index];
+    return HETGPU_SUCCESS;
+}
+
+HetGPUError hetgpu_get_param_layout(HetGPUState *state,
+                                    HetGPUFunction function,
+                                    const HetGPUParamLayout **layout)
+{
+    if (!state || !state->initialized || !function || !layout) {
         return HETGPU_ERROR_INVALID_VALUE;
     }
 
-    GHashTable *function_cache = state->param_info_cache ?
+    HetGPUParamLayout *cached = state->param_info_cache ?
         g_hash_table_lookup(state->param_info_cache, function) : NULL;
-    HetGPUParamInfoCacheValue *cached = function_cache ?
-        g_hash_table_lookup(function_cache, GSIZE_TO_POINTER(param_index + 1)) : NULL;
     if (cached) {
         state->param_info_cache_hits++;
-        if (cached->result == HETGPU_SUCCESS) {
-            *param_offset = cached->offset;
-            *param_size = cached->size;
-        }
-        return cached->result;
+        *layout = cached;
+        return HETGPU_SUCCESS;
     }
     state->param_info_cache_misses++;
 
     if (g_cuda_funcs.cuFuncGetParamInfo &&
         state->backend != HETGPU_BACKEND_SIMULATION) {
-        if (!cuda_lock(state)) {
-            return HETGPU_ERROR_INVALID_CONTEXT;
-        }
-        int err = HETGPU_CUDA_CALL(cuFuncGetParamInfo, function, param_index,
-                                   param_offset, param_size);
-        state->param_info_backend_queries++;
-        cuda_unlock(state);
+        HetGPUParamLayout *candidate = g_new0(HetGPUParamLayout, 1);
 
-        HetGPUError result;
-        switch (err) {
-        case 0:
-            result = HETGPU_SUCCESS;
-            break;
-        case 1:
-            result = HETGPU_ERROR_INVALID_VALUE;
-            break;
-        case 400:
-            return HETGPU_ERROR_INVALID_HANDLE;
-        case 801:
-            return HETGPU_ERROR_NOT_SUPPORTED;
-        default:
-            return HETGPU_ERROR_UNKNOWN;
+        for (; candidate->num_args < HETGPU_MAX_KERNEL_ARGS;
+             candidate->num_args++) {
+            size_t offset = 0;
+            size_t size = 0;
+
+            if (!cuda_lock(state)) {
+                g_free(candidate);
+                return HETGPU_ERROR_INVALID_CONTEXT;
+            }
+            int err = HETGPU_CUDA_CALL(cuFuncGetParamInfo, function,
+                                       candidate->num_args, &offset, &size);
+            state->param_info_backend_queries++;
+            cuda_unlock(state);
+            if (err == CUDA_ERROR_INVALID_VALUE) {
+                break;
+            }
+            if (err == CUDA_ERROR_INVALID_HANDLE) {
+                g_free(candidate);
+                return HETGPU_ERROR_INVALID_HANDLE;
+            }
+            if (err == CUDA_ERROR_NOT_SUPPORTED) {
+                g_free(candidate);
+                return HETGPU_ERROR_NOT_SUPPORTED;
+            }
+            if (err != CUDA_SUCCESS || offset > SIZE_MAX - size) {
+                g_free(candidate);
+                return HETGPU_ERROR_UNKNOWN;
+            }
+            candidate->offsets[candidate->num_args] = offset;
+            candidate->sizes[candidate->num_args] = size;
+            candidate->extent = MAX(candidate->extent, offset + size);
+        }
+        if (candidate->num_args == HETGPU_MAX_KERNEL_ARGS) {
+            size_t offset = 0;
+            size_t size = 0;
+
+            if (!cuda_lock(state)) {
+                g_free(candidate);
+                return HETGPU_ERROR_INVALID_CONTEXT;
+            }
+            int err = HETGPU_CUDA_CALL(cuFuncGetParamInfo, function,
+                                       candidate->num_args, &offset, &size);
+            state->param_info_backend_queries++;
+            cuda_unlock(state);
+            if (err != CUDA_ERROR_INVALID_VALUE) {
+                g_free(candidate);
+                return HETGPU_ERROR_INVALID_VALUE;
+            }
         }
 
         if (!state->param_info_cache) {
             state->param_info_cache = g_hash_table_new_full(
-                g_direct_hash, g_direct_equal, NULL,
-                (GDestroyNotify)g_hash_table_destroy);
-        }
-        function_cache = g_hash_table_lookup(state->param_info_cache, function);
-        if (!function_cache) {
-            function_cache = g_hash_table_new_full(
                 g_direct_hash, g_direct_equal, NULL, g_free);
-            g_hash_table_insert(state->param_info_cache, function, function_cache);
         }
-        HetGPUParamInfoCacheValue *value = g_new0(HetGPUParamInfoCacheValue, 1);
-        value->offset = result == HETGPU_SUCCESS ? *param_offset : 0;
-        value->size = result == HETGPU_SUCCESS ? *param_size : 0;
-        value->result = result;
-        g_hash_table_insert(function_cache, GSIZE_TO_POINTER(param_index + 1), value);
-        return result;
+        g_hash_table_insert(state->param_info_cache, function, candidate);
+        *layout = candidate;
+        return HETGPU_SUCCESS;
     }
 
     return HETGPU_ERROR_NOT_SUPPORTED;

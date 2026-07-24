@@ -171,6 +171,15 @@ typedef struct HetGPUDeviceProps {
 typedef void* HetGPUContext;
 typedef void* HetGPUModule;
 typedef void* HetGPUFunction;
+
+#define HETGPU_MAX_KERNEL_ARGS 256
+
+typedef struct HetGPUParamLayout {
+    uint32_t num_args;
+    size_t extent;
+    size_t offsets[HETGPU_MAX_KERNEL_ARGS];
+    size_t sizes[HETGPU_MAX_KERNEL_ARGS];
+} HetGPUParamLayout;
 typedef void* HetGPUStream;
 typedef void* HetGPUEvent;
 typedef void* HetGPUGraph;
@@ -572,6 +581,9 @@ HetGPUError hetgpu_get_global(HetGPUState *state, HetGPUModule module,
 HetGPUError hetgpu_get_param_info(HetGPUState *state, HetGPUFunction function,
                                   size_t param_index, size_t *param_offset,
                                   size_t *param_size);
+HetGPUError hetgpu_get_param_layout(HetGPUState *state,
+                                    HetGPUFunction function,
+                                    const HetGPUParamLayout **layout);
 HetGPUError hetgpu_set_function_attribute(HetGPUState *state,
                                           HetGPUFunction function,
                                           int attribute, int value);
