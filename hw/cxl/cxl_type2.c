@@ -4585,6 +4585,9 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 uint32_t num_args = (ct2d->gpu_cmd.params[4] >> 32) & 0xFF;
                 size_t param_extent = ct2d->gpu_cmd.params[5];
                 void *args[256];
+                uint64_t cache_hits_before = hetgpu->param_info_cache_hits;
+                uint64_t cache_misses_before = hetgpu->param_info_cache_misses;
+                uint64_t backend_queries_before = hetgpu->param_info_backend_queries;
 
                 if (num_args > ARRAY_SIZE(args) ||
                     param_extent > ct2d->gpu_cmd.data_size) {
@@ -4622,6 +4625,15 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                         break;
                     }
                 }
+
+                qemu_log(
+                    "CXL TYPE2 TRACE function_param_layout event=launch "
+                    "layer=qemu function_id=%u args=%u extent=%zu hits=%" PRIu64
+                    " misses=%" PRIu64 " backend_queries=%" PRIu64 "\n",
+                    func_id, num_args, param_extent,
+                    hetgpu->param_info_cache_hits - cache_hits_before,
+                    hetgpu->param_info_cache_misses - cache_misses_before,
+                    hetgpu->param_info_backend_queries - backend_queries_before);
 
                 err = hetgpu_launch_kernel(hetgpu,
                                            ct2d->gpu_cmd.functions[func_id],

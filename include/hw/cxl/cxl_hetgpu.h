@@ -248,6 +248,13 @@ typedef struct HetGPUState {
     size_t num_modules;
     size_t modules_capacity;
 
+    /* Parameter ABI belongs to a CUfunction and remains stable until its
+     * module or context is destroyed. */
+    GHashTable *param_info_cache;
+    uint64_t param_info_cache_hits;
+    uint64_t param_info_cache_misses;
+    uint64_t param_info_backend_queries;
+
     /* Library handle for dynamic loading */
     void *hetgpu_lib;
     bool formal_case_strict;
