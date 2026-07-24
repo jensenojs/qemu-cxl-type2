@@ -35,6 +35,11 @@ $:
         - name: publish QEMU Type-2 component
           script: |
             bash scripts/publish_component.sh "$PWD/.work/component/payload"
+        - name: recover and verify published QEMU Type-2 component
+          script: |
+            bash scripts/pull_component.sh \
+              "$PWD/.work/component/publish/candidate.json" \
+              "$PWD/.work/component/verified"
 
   # Pull the candidate artifact by digest into an empty directory and verify every file.
   api_trigger_component_fresh_pull:
