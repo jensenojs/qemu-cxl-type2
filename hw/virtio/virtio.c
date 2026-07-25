@@ -3121,7 +3121,7 @@ VirtioSharedMemoryMapping *virtio_shared_memory_mapping_new(uint8_t shmid,
     /* Determine RAM flags */
     ram_flags = RAM_SHARED;
     if (!allow_write) {
-        ram_flags |= RAM_READONLY_FD;
+        ram_flags |= RAM_READONLY | RAM_READONLY_FD;
     }
 
     /* Create the VirtioSharedMemoryMapping */
