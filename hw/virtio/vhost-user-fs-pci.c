@@ -50,6 +50,9 @@ static void vhost_user_fs_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
         vpci_dev->nvectors = dev->vdev.conf.num_request_queues + 2;
     }
 
+    /* Reserve BAR 4/5 for the 64-bit DAX shared-memory window. */
+    vpci_dev->modern_mem_bar_idx = 2;
+
     if (!qdev_realize(dev_state, BUS(&vpci_dev->bus), errp)) {
         return;
     }
@@ -65,7 +68,6 @@ static void vhost_user_fs_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
         return;
     }
 
-    vpci_dev->modern_mem_bar_idx = 2;
     memory_region_init(&dev->shmembar, OBJECT(vpci_dev),
                        "vhost-user-fs-pci-dax", memory_region_size(&shmem->mr));
     memory_region_add_subregion(&dev->shmembar, 0, &shmem->mr);
