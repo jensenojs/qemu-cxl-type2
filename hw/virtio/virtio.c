@@ -3045,17 +3045,29 @@ int virtio_save(VirtIODevice *vdev, QEMUFile *f)
     return vmstate_save_state(f, &vmstate_virtio, vdev, NULL);
 }
 
-VirtioSharedMemory *virtio_new_shmem_region(VirtIODevice *vdev, uint8_t shmid, uint64_t size)
+VirtioSharedMemory *virtio_new_shmem_region(VirtIODevice *vdev, uint8_t shmid,
+                                            uint64_t size, Error **errp)
 {
     VirtioSharedMemory *elem;
     g_autofree char *name = NULL;
+    void *host_addr;
+
+    host_addr = mmap(NULL, size, PROT_NONE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (host_addr == MAP_FAILED) {
+        error_setg_errno(errp, errno,
+                         "Unable to reserve VIRTIO shared-memory window");
+        return NULL;
+    }
 
     elem = g_new0(VirtioSharedMemory, 1);
     elem->shmid = shmid;
+    elem->host_addr = host_addr;
+    elem->size = size;
 
-    /* Initialize embedded MemoryRegion as container for shmem mappings */
     name = g_strdup_printf("virtio-shmem-%d", shmid);
-    memory_region_init(&elem->mr, OBJECT(vdev), name, size);
+    memory_region_init_ram_device_ptr(&elem->mr, OBJECT(vdev), name, size,
+                                      host_addr);
     QTAILQ_INIT(&elem->mmaps);
     QSIMPLEQ_INSERT_TAIL(&vdev->shmem_list, elem, entry);
     return elem;
@@ -3079,18 +3091,18 @@ static void virtio_shared_memory_mapping_instance_init(Object *obj)
     mapping->shmid = 0;
     mapping->offset = 0;
     mapping->len = 0;
-    mapping->mr = NULL;
+    mapping->fd = -1;
+    mapping->fd_offset = 0;
+    mapping->allow_write = false;
 }
 
 static void virtio_shared_memory_mapping_instance_finalize(Object *obj)
 {
     VirtioSharedMemoryMapping *mapping = VIRTIO_SHARED_MEMORY_MAPPING(obj);
 
-    /* Clean up MemoryRegion if it exists */
-    if (mapping->mr) {
-        /* Unparent the MemoryRegion to trigger cleanup */
-        object_unparent(OBJECT(mapping->mr));
-        mapping->mr = NULL;
+    if (mapping->fd >= 0) {
+        close(mapping->fd);
+        mapping->fd = -1;
     }
 }
 
@@ -3102,11 +3114,6 @@ VirtioSharedMemoryMapping *virtio_shared_memory_mapping_new(uint8_t shmid,
                                                             bool allow_write)
 {
     VirtioSharedMemoryMapping *mapping;
-    MemoryRegion *mr;
-    g_autoptr(GString) mr_name = g_string_new(NULL);
-    uint32_t ram_flags;
-    Error *local_err = NULL;
-
     if (len == 0) {
         error_report("Shared memory mapping size cannot be zero");
         return NULL;
@@ -3118,37 +3125,14 @@ VirtioSharedMemoryMapping *virtio_shared_memory_mapping_new(uint8_t shmid,
         return NULL;
     }
 
-    /* Determine RAM flags */
-    ram_flags = RAM_SHARED;
-    if (!allow_write) {
-        ram_flags |= RAM_READONLY | RAM_READONLY_FD;
-    }
-
-    /* Create the VirtioSharedMemoryMapping */
     mapping = VIRTIO_SHARED_MEMORY_MAPPING(
         object_new(TYPE_VIRTIO_SHARED_MEMORY_MAPPING));
-
-    /* Set up object properties */
     mapping->shmid = shmid;
     mapping->offset = shm_offset;
     mapping->len = len;
-
-    /* Create MemoryRegion as a child of this object */
-    mr = g_new0(MemoryRegion, 1);
-    g_string_printf(mr_name, "virtio-shmem-%d-%" PRIx64, shmid, shm_offset);
-
-    /* Initialize MemoryRegion with file descriptor */
-    if (!memory_region_init_ram_from_fd(mr, OBJECT(mapping), mr_name->str,
-                                        len, ram_flags, fd, fd_offset,
-                                        &local_err)) {
-        error_report_err(local_err);
-        g_free(mr);
-        close(fd);
-        object_unref(OBJECT(mapping));
-        return NULL;
-    }
-
-    mapping->mr = mr;
+    mapping->fd = fd;
+    mapping->fd_offset = fd_offset;
+    mapping->allow_write = allow_write;
     return mapping;
 }
 
@@ -3159,8 +3143,8 @@ int virtio_add_shmem_map(VirtioSharedMemory *shmem,
         error_report("VirtioSharedMemoryMapping cannot be NULL");
         return -1;
     }
-    if (!mapping->mr) {
-        error_report("VirtioSharedMemoryMapping has no MemoryRegion");
+    if (mapping->fd < 0) {
+        error_report("VirtioSharedMemoryMapping has no file descriptor");
         return -1;
     }
 
@@ -3170,8 +3154,22 @@ int virtio_add_shmem_map(VirtioSharedMemory *shmem,
         return -1;
     }
 
-    /* Add as subregion to the VIRTIO shared memory */
-    memory_region_add_subregion(&shmem->mr, mapping->offset, mapping->mr);
+    if (mapping->offset % qemu_real_host_page_size() != 0 ||
+        mapping->len % qemu_real_host_page_size() != 0 ||
+        mapping->fd_offset % qemu_real_host_page_size() != 0) {
+        error_report("VIRTIO Shared Memory mapping is not host-page aligned");
+        return -1;
+    }
+
+    void *addr = shmem->host_addr + mapping->offset;
+    int prot = PROT_READ | (mapping->allow_write ? PROT_WRITE : 0);
+    void *mapped = mmap(addr, mapping->len, prot, MAP_SHARED | MAP_FIXED,
+                        mapping->fd, mapping->fd_offset);
+    if (mapped != addr) {
+        error_report("Unable to map VIRTIO Shared Memory range: %s",
+                     strerror(errno));
+        return -1;
+    }
 
     /* Add to the mapped regions list */
     QTAILQ_INSERT_TAIL(&shmem->mmaps, mapping, link);
@@ -3199,10 +3197,15 @@ void virtio_del_shmem_map(VirtioSharedMemory *shmem, hwaddr offset,
         return;
     }
 
-    /*
-     * Remove from memory region first
-     */
-    memory_region_del_subregion(&shmem->mr, mapping->mr);
+    void *addr = shmem->host_addr + mapping->offset;
+    void *reserved = mmap(addr, mapping->len, PROT_NONE,
+                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED |
+                          MAP_NORESERVE, -1, 0);
+    if (reserved != addr) {
+        error_report("Unable to revoke VIRTIO Shared Memory range: %s",
+                     strerror(errno));
+        abort();
+    }
 
     /*
      * Remove from list and unref the mapping which will trigger automatic cleanup
@@ -3373,8 +3376,7 @@ void virtio_reset(void *opaque)
         }
         while (!QTAILQ_EMPTY(&shmem->mmaps)) {
             mapping = QTAILQ_FIRST(&shmem->mmaps);
-            virtio_del_shmem_map(shmem, mapping->offset,
-                                 memory_region_size(mapping->mr));
+            virtio_del_shmem_map(shmem, mapping->offset, mapping->len);
             removed++;
         }
         QTAILQ_FOREACH(mapping, &shmem->mmaps, link) {
@@ -4234,12 +4236,17 @@ static void virtio_device_instance_finalize(Object *obj)
         shmem = QSIMPLEQ_FIRST(&vdev->shmem_list);
         while (!QTAILQ_EMPTY(&shmem->mmaps)) {
             VirtioSharedMemoryMapping *mapping = QTAILQ_FIRST(&shmem->mmaps);
-            virtio_del_shmem_map(shmem, mapping->offset,
-                                 memory_region_size(mapping->mr));
+            virtio_del_shmem_map(shmem, mapping->offset, mapping->len);
         }
 
-        /* Clean up the embedded MemoryRegion */
+        void *host_addr = shmem->host_addr;
+        uint64_t size = shmem->size;
+
         object_unparent(OBJECT(&shmem->mr));
+        if (munmap(host_addr, size) != 0) {
+            error_report("Unable to release VIRTIO shared-memory window: %s",
+                         strerror(errno));
+        }
         QSIMPLEQ_REMOVE_HEAD(&vdev->shmem_list, entry);
         g_free(shmem);
     }

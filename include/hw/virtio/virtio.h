@@ -109,15 +109,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(VirtioSharedMemoryMapping, VIRTIO_SHARED_MEMORY_MAPPI
  * @shmid: VIRTIO Shared Memory Region ID
  * @offset: Offset within the VIRTIO Shared Memory Region
  * @len: Size of the mapping
- * @mr: MemoryRegion associated with this shared memory mapping
+ * @fd: Duplicated file descriptor backing this mapping
+ * @fd_offset: Offset in @fd backing the shared-memory window range
+ * @allow_write: Whether the file mapping is writable
  * @link: List entry for the shared memory region's mapping list
  *
  * A QOM object that represents an individual file descriptor-based shared
- * memory mapping within a VIRTIO Shared Memory Region. It manages the
- * MemoryRegion lifecycle and file descriptor cleanup through QOM reference
- * counting. When the object is unreferenced and its reference count drops
- * to zero, it automatically cleans up the MemoryRegion and closes the file
- * descriptor.
+ * memory mapping within a VIRTIO Shared Memory Region. The shared-memory
+ * region owns one fixed RAM device window; mappings replace backing within
+ * that window without creating per-mapping MemoryRegions.
  */
 struct VirtioSharedMemoryMapping {
     Object parent;
@@ -125,13 +125,17 @@ struct VirtioSharedMemoryMapping {
     uint8_t shmid;
     hwaddr offset;
     uint64_t len;
-    MemoryRegion *mr;
+    int fd;
+    uint64_t fd_offset;
+    bool allow_write;
     QTAILQ_ENTRY(VirtioSharedMemoryMapping) link;
 };
 
 struct VirtioSharedMemory {
     uint8_t shmid;
     MemoryRegion mr;
+    void *host_addr;
+    uint64_t size;
     QTAILQ_HEAD(, VirtioSharedMemoryMapping) mmaps;
     QSIMPLEQ_ENTRY(VirtioSharedMemory) entry;
 };
@@ -350,7 +354,8 @@ int virtio_save(VirtIODevice *vdev, QEMUFile *f);
  *
  * Returns: Pointer to the new VirtioSharedMemory region, or NULL on failure
  */
-VirtioSharedMemory *virtio_new_shmem_region(VirtIODevice *vdev, uint8_t shmid, uint64_t size);
+VirtioSharedMemory *virtio_new_shmem_region(VirtIODevice *vdev, uint8_t shmid,
+                                            uint64_t size, Error **errp);
 
 /**
  * virtio_find_shmem_region() - Find an existing shared memory region
@@ -373,10 +378,8 @@ VirtioSharedMemory *virtio_find_shmem_region(VirtIODevice *vdev, uint8_t shmid);
  * @len: Size of the mapping
  * @allow_write: Whether to allow write access to the mapping
  *
- * Creates a new VirtioSharedMemoryMapping that manages a shared memory mapping.
- * The object will create a MemoryRegion using memory_region_init_ram_from_fd()
- * as a child object. When the object is finalized, it will automatically
- * clean up the MemoryRegion and close the file descriptor.
+ * Creates a new mapping identity and takes ownership of a duplicated @fd.
+ * virtio_add_shmem_map() installs it into the fixed shared-memory window.
  *
  * Return: A new VirtioSharedMemoryMapping on success, NULL on error.
  */
@@ -392,10 +395,8 @@ VirtioSharedMemoryMapping *virtio_shared_memory_mapping_new(uint8_t shmid,
  * @shmem: VirtioSharedMemory region
  * @mapping: VirtioSharedMemoryMapping to add (transfers ownership)
  *
- * Adds a memory mapping to the shared memory region. The VirtioSharedMemoryMapping
- * ownership is transferred to the shared memory region and will be automatically
- * cleaned up through QOM reference counting when virtio_del_shmem_map() is
- * called or when the shared memory region is destroyed.
+ * Maps the file range into the fixed shared-memory window. Mapping ownership
+ * transfers to the shared-memory region on success.
  *
  * Returns: 0 on success, negative errno on failure
  */
@@ -423,10 +424,8 @@ VirtioSharedMemoryMapping *virtio_find_shmem_map(VirtioSharedMemory *shmem,
  * @offset: Offset of the mapping to remove
  * @size: Size of the mapping to remove
  *
- * Removes a memory mapping from the shared memory region. This will
- * automatically unref the associated VhostUserShmemObject, which may
- * trigger its finalization and cleanup if no other references exist.
- * The mapping's MemoryRegion will be properly unmapped and cleaned up.
+ * Replaces the file range with an inaccessible anonymous reservation and
+ * releases the mapping identity and duplicated file descriptor.
  */
 void virtio_del_shmem_map(VirtioSharedMemory *shmem, hwaddr offset,
                           uint64_t size);

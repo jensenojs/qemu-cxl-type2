@@ -369,7 +369,9 @@ static void vub_device_realize(DeviceState *dev, Error **errp)
                 goto err;
             }
 
-            virtio_new_shmem_region(vdev, i, memory_sizes[i]);
+            if (!virtio_new_shmem_region(vdev, i, memory_sizes[i], errp)) {
+                goto err;
+            }
         }
     }
 

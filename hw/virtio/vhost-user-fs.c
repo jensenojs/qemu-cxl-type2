@@ -337,8 +337,10 @@ static void vuf_device_realize(DeviceState *dev, Error **errp)
             }
         }
 
-        virtio_new_shmem_region(vdev, VIRTIO_FS_SHMCAP_ID_CACHE,
-                                memory_sizes[0]);
+        if (!virtio_new_shmem_region(vdev, VIRTIO_FS_SHMCAP_ID_CACHE,
+                                     memory_sizes[0], errp)) {
+            goto err_vhost;
+        }
     }
 
     qemu_chr_fe_set_handlers(&fs->conf.chardev, NULL, NULL, vuf_event, NULL,
