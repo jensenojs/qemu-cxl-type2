@@ -3139,8 +3139,6 @@ VirtioSharedMemoryMapping *virtio_shared_memory_mapping_new(uint8_t shmid,
 int virtio_add_shmem_map(VirtioSharedMemory *shmem,
                          VirtioSharedMemoryMapping *mapping)
 {
-    struct stat st;
-    uint64_t file_bytes;
     size_t host_page_size = qemu_real_host_page_size();
 
     if (!mapping) {
@@ -3165,22 +3163,9 @@ int virtio_add_shmem_map(VirtioSharedMemory *shmem,
         return -1;
     }
 
-    if (fstat(mapping->fd, &st) != 0) {
-        error_report("Unable to stat VIRTIO Shared Memory backing: %s",
-                     strerror(errno));
-        return -1;
-    }
-    if (st.st_size < 0 || mapping->fd_offset >= (uint64_t)st.st_size) {
-        error_report("VIRTIO Shared Memory mapping starts beyond backing file");
-        return -1;
-    }
-
-    file_bytes = MIN(mapping->len,
-                     (uint64_t)st.st_size - mapping->fd_offset);
-
     void *addr = shmem->host_addr + mapping->offset;
     int prot = PROT_READ | (mapping->allow_write ? PROT_WRITE : 0);
-    void *mapped = mmap(addr, file_bytes, prot, MAP_SHARED | MAP_FIXED,
+    void *mapped = mmap(addr, mapping->len, prot, MAP_SHARED | MAP_FIXED,
                         mapping->fd, mapping->fd_offset);
     if (mapped != addr) {
         error_report("Unable to map VIRTIO Shared Memory range: %s",
