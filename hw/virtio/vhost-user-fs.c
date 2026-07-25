@@ -194,6 +194,38 @@ static bool vuf_guest_notifier_pending(VirtIODevice *vdev, int idx)
     return vhost_virtqueue_pending(&fs->vhost_dev, idx);
 }
 
+static void vuf_event(void *opaque, QEMUChrEvent event);
+
+static void vuf_disconnect(DeviceState *dev)
+{
+    VirtIODevice *vdev = VIRTIO_DEVICE(dev);
+    VHostUserFS *fs = VHOST_USER_FS(vdev);
+
+    virtio_reset(vdev);
+
+    /* Keep observing the chardev if a replacement backend reconnects. */
+    qemu_chr_fe_set_handlers(&fs->conf.chardev, NULL, NULL, vuf_event, NULL,
+                             dev, NULL, true);
+}
+
+static void vuf_event(void *opaque, QEMUChrEvent event)
+{
+    DeviceState *dev = opaque;
+    VHostUserFS *fs = VHOST_USER_FS(dev);
+
+    switch (event) {
+    case CHR_EVENT_CLOSED:
+        vhost_user_async_close(dev, &fs->conf.chardev, &fs->vhost_dev,
+                               vuf_disconnect);
+        break;
+    case CHR_EVENT_OPENED:
+    case CHR_EVENT_BREAK:
+    case CHR_EVENT_MUX_IN:
+    case CHR_EVENT_MUX_OUT:
+        break;
+    }
+}
+
 static void vuf_device_realize(DeviceState *dev, Error **errp)
 {
     VirtIODevice *vdev = VIRTIO_DEVICE(dev);
@@ -309,6 +341,9 @@ static void vuf_device_realize(DeviceState *dev, Error **errp)
                                 memory_sizes[0]);
     }
 
+    qemu_chr_fe_set_handlers(&fs->conf.chardev, NULL, NULL, vuf_event, NULL,
+                             dev, NULL, true);
+
     return;
 
 err_vhost:
@@ -331,6 +366,9 @@ static void vuf_device_unrealize(DeviceState *dev)
     VHostUserFS *fs = VHOST_USER_FS(dev);
     struct vhost_virtqueue *vhost_vqs = fs->vhost_dev.vqs;
     int i;
+
+    qemu_chr_fe_set_handlers(&fs->conf.chardev, NULL, NULL, NULL, NULL,
+                             NULL, NULL, false);
 
     /* This will stop vhost backend if appropriate. */
     vuf_set_status(vdev, 0);
