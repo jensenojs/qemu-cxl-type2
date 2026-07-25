@@ -582,9 +582,6 @@ HetGPUError hetgpu_get_global(HetGPUState *state, HetGPUModule module,
                               const char *name, HetGPUDevicePtr *dev_ptr,
                               size_t *size);
 
-HetGPUError hetgpu_get_param_info(HetGPUState *state, HetGPUFunction function,
-                                  size_t param_index, size_t *param_offset,
-                                  size_t *param_size);
 HetGPUError hetgpu_get_param_layout(HetGPUState *state,
                                     HetGPUFunction function,
                                     const HetGPUParamLayout **layout);

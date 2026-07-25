@@ -3964,37 +3964,6 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         }
         break;
 
-    case CXL_GPU_CMD_FUNC_GET_PARAM_INFO:
-        if (hetgpu->initialized) {
-            uint32_t func_id = ct2d->gpu_cmd.params[0];
-            size_t param_offset = 0;
-            size_t param_size = 0;
-
-            if (func_id >= ct2d->gpu_cmd.num_functions) {
-                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
-                break;
-            }
-            err = hetgpu_get_param_info(hetgpu,
-                                        ct2d->gpu_cmd.functions[func_id],
-                                        ct2d->gpu_cmd.params[1],
-                                        &param_offset, &param_size);
-            if (err == HETGPU_SUCCESS) {
-                ct2d->gpu_cmd.results[0] = param_offset;
-                ct2d->gpu_cmd.results[1] = param_size;
-            } else if (err == HETGPU_ERROR_INVALID_VALUE) {
-                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
-            } else if (err == HETGPU_ERROR_INVALID_HANDLE) {
-                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
-            } else if (err == HETGPU_ERROR_NOT_SUPPORTED) {
-                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_SUPPORTED;
-            } else {
-                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_UNKNOWN;
-            }
-        } else {
-            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
-        }
-        break;
-
     case CXL_GPU_CMD_FUNC_GET_PARAM_LAYOUT:
         if (hetgpu->initialized) {
             uint32_t func_id = ct2d->gpu_cmd.params[0];

@@ -1861,24 +1861,6 @@ HetGPUError hetgpu_get_global(HetGPUState *state, HetGPUModule module,
     return HETGPU_ERROR_NOT_SUPPORTED;
 }
 
-HetGPUError hetgpu_get_param_info(HetGPUState *state, HetGPUFunction function,
-                                  size_t param_index, size_t *param_offset,
-                                  size_t *param_size)
-{
-    const HetGPUParamLayout *layout;
-    HetGPUError result = hetgpu_get_param_layout(state, function, &layout);
-
-    if (result != HETGPU_SUCCESS) {
-        return result;
-    }
-    if (!param_offset || !param_size || param_index >= layout->num_args) {
-        return HETGPU_ERROR_INVALID_VALUE;
-    }
-    *param_offset = layout->offsets[param_index];
-    *param_size = layout->sizes[param_index];
-    return HETGPU_SUCCESS;
-}
-
 HetGPUError hetgpu_get_param_layout(HetGPUState *state,
                                     HetGPUFunction function,
                                     const HetGPUParamLayout **layout)
