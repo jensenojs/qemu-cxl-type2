@@ -3363,11 +3363,25 @@ void virtio_reset(void *opaque)
 
     /* Mappings are removed to prevent stale fds from remaining open. */
     QSIMPLEQ_FOREACH(shmem, &vdev->shmem_list, entry) {
+        unsigned int mapped = 0;
+        unsigned int removed = 0;
+        unsigned int remaining = 0;
+        VirtioSharedMemoryMapping *mapping;
+
+        QTAILQ_FOREACH(mapping, &shmem->mmaps, link) {
+            mapped++;
+        }
         while (!QTAILQ_EMPTY(&shmem->mmaps)) {
-            VirtioSharedMemoryMapping *mapping = QTAILQ_FIRST(&shmem->mmaps);
+            mapping = QTAILQ_FIRST(&shmem->mmaps);
             virtio_del_shmem_map(shmem, mapping->offset,
                                  memory_region_size(mapping->mr));
+            removed++;
         }
+        QTAILQ_FOREACH(mapping, &shmem->mmaps, link) {
+            remaining++;
+        }
+        trace_virtio_shmem_reset_cleanup(shmem->shmid, mapped, removed,
+                                         remaining);
     }
 }
 

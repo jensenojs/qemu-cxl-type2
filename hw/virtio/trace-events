@@ -72,6 +72,7 @@ vhost_vdpa_get_iova_range(void *dev, uint64_t first, uint64_t last) "dev: %p fir
 vhost_vdpa_set_config_call(void *dev, int fd)"dev: %p fd: %d"
 
 # virtio.c
+virtio_shmem_reset_cleanup(uint8_t shmid, unsigned int mapped, unsigned int removed, unsigned int remaining) "shmid=%u mapped=%u removed=%u remaining=%u"
 virtqueue_alloc_element(void *elem, size_t sz, unsigned in_num, unsigned out_num) "elem %p size %zd in_num %u out_num %u"
 virtqueue_fill(void *vq, const void *elem, unsigned int len, unsigned int idx) "vq %p elem %p len %u idx %u"
 virtqueue_flush(void *vq, unsigned int count) "vq %p count %u"
