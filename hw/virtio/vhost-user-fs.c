@@ -13,6 +13,7 @@
 
 #include "qemu/osdep.h"
 #include <sys/ioctl.h>
+#include "migration/blocker.h"
 #include "standard-headers/linux/virtio_fs.h"
 #include "qapi/error.h"
 #include "hw/qdev-properties.h"
@@ -197,9 +198,11 @@ static void vuf_device_realize(DeviceState *dev, Error **errp)
 {
     VirtIODevice *vdev = VIRTIO_DEVICE(dev);
     VHostUserFS *fs = VHOST_USER_FS(dev);
+    struct vhost_virtqueue *vhost_vqs = NULL;
+    uint64_t memory_sizes[VIRTIO_MAX_SHMEM_REGIONS] = { 0 };
     unsigned int i;
     size_t len;
-    int ret;
+    int ret, nregions;
 
     if (!fs->conf.chardev.chr) {
         error_setg(errp, "missing chardev");
@@ -255,13 +258,61 @@ static void vuf_device_realize(DeviceState *dev, Error **errp)
     /* 1 high prio queue, plus the number configured */
     fs->vhost_dev.nvqs = 1 + fs->conf.num_request_queues;
     fs->vhost_dev.vqs = g_new0(struct vhost_virtqueue, fs->vhost_dev.nvqs);
+    vhost_vqs = fs->vhost_dev.vqs;
     ret = vhost_dev_init(&fs->vhost_dev, &fs->vhost_user,
                          VHOST_BACKEND_TYPE_USER, 0, errp);
     if (ret < 0) {
         goto err_virtio;
     }
 
+    ret = fs->vhost_dev.vhost_ops->vhost_get_shmem_config(
+        &fs->vhost_dev, &nregions, memory_sizes, errp);
+    if (ret < 0) {
+        goto err_vhost;
+    }
+
+    if (nregions > 1 ||
+        (nregions == 0 && memory_sizes[0] != 0) ||
+        (nregions == 1 && memory_sizes[0] == 0)) {
+        error_setg(errp,
+                   "virtio-fs DAX requires exactly one non-zero region at id 0");
+        goto err_vhost;
+    }
+
+    for (i = 1; i < VIRTIO_MAX_SHMEM_REGIONS; i++) {
+        if (memory_sizes[i] != 0) {
+            error_setg(errp,
+                       "virtio-fs DAX does not support shared-memory region %u",
+                       i);
+            goto err_vhost;
+        }
+    }
+
+    if (nregions == 1) {
+        if (memory_sizes[0] % qemu_real_host_page_size() != 0) {
+            error_setg(errp,
+                       "virtio-fs DAX region size must be a multiple of the host page size");
+            goto err_vhost;
+        }
+
+        if (fs->vhost_dev.migration_blocker == NULL) {
+            error_setg(&fs->vhost_dev.migration_blocker,
+                       "Migration disabled: virtio-fs DAX mappings cannot be migrated");
+            ret = migrate_add_blocker_normal(&fs->vhost_dev.migration_blocker,
+                                             errp);
+            if (ret < 0) {
+                goto err_vhost;
+            }
+        }
+
+        virtio_new_shmem_region(vdev, VIRTIO_FS_SHMCAP_ID_CACHE,
+                                memory_sizes[0]);
+    }
+
     return;
+
+err_vhost:
+    vhost_dev_cleanup(&fs->vhost_dev);
 
 err_virtio:
     vhost_user_cleanup(&fs->vhost_user);
@@ -271,7 +322,7 @@ err_virtio:
     }
     g_free(fs->req_vqs);
     virtio_cleanup(vdev);
-    g_free(fs->vhost_dev.vqs);
+    g_free(vhost_vqs);
 }
 
 static void vuf_device_unrealize(DeviceState *dev)

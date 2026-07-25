@@ -1884,6 +1884,9 @@ vhost_user_backend_handle_shmem_map(struct vhost_dev *dev,
     }
 
 send_reply_commit:
+    trace_vhost_user_shmem_map(vu_mmap->shmid, vu_mmap->fd_offset,
+                               vu_mmap->shm_offset, vu_mmap->len,
+                               vu_mmap->flags, ret);
     /* Send reply and commit after transaction started */
     if (hdr->flags & VHOST_USER_NEED_REPLY_MASK) {
         payload->u64 = !!ret;
@@ -1898,6 +1901,9 @@ send_reply_commit:
     return 0;
 
 send_reply:
+    trace_vhost_user_shmem_map(vu_mmap->shmid, vu_mmap->fd_offset,
+                               vu_mmap->shm_offset, vu_mmap->len,
+                               vu_mmap->flags, ret);
     if (hdr->flags & VHOST_USER_NEED_REPLY_MASK) {
         payload->u64 = !!ret;
         hdr->size = sizeof(payload->u64);
@@ -1969,6 +1975,8 @@ vhost_user_backend_handle_shmem_unmap(struct vhost_dev *dev,
     }
 
 send_reply:
+    trace_vhost_user_shmem_unmap(vu_mmap->shmid, vu_mmap->shm_offset,
+                                 vu_mmap->len, ret);
     if (hdr->flags & VHOST_USER_NEED_REPLY_MASK) {
         payload->u64 = !!ret;
         hdr->size = sizeof(payload->u64);
@@ -2056,7 +2064,6 @@ static gboolean backend_read(QIOChannel *ioc, GIOCondition condition,
         break;
     case VHOST_USER_BACKEND_SHMEM_MAP:
         /* Handler manages its own response, check error and close connection */
-        reply_ack = false;
         if (vhost_user_backend_handle_shmem_map(dev, ioc, &hdr, &payload,
                                                 fd ? fd[0] : -1) < 0) {
             goto err;
@@ -2064,7 +2071,6 @@ static gboolean backend_read(QIOChannel *ioc, GIOCondition condition,
         break;
     case VHOST_USER_BACKEND_SHMEM_UNMAP:
         /* Handler manages its own response, check error and close connection */
-        reply_ack = false;
         if (vhost_user_backend_handle_shmem_unmap(dev, ioc, &hdr, &payload) < 0) {
             goto err;
         }
@@ -3254,9 +3260,12 @@ static int vhost_user_get_shmem_config(struct vhost_dev *dev,
         .hdr.flags = VHOST_USER_VERSION,
     };
 
-    if (!vhost_user_has_protocol_feature(dev,
-                                         VHOST_USER_PROTOCOL_F_SHMEM)) {
+    QEMU_BUILD_BUG_ON(sizeof(VhostUserMMap) != 40);
+    QEMU_BUILD_BUG_ON(sizeof(VhostUserShMemConfig) != 2056);
+
+    if (!(dev->protocol_features & (1ULL << VHOST_USER_PROTOCOL_F_SHMEM))) {
         *nregions = 0;
+        trace_vhost_user_shmem_config(dev->protocol_features, 0, 0);
         return 0;
     }
 
@@ -3270,6 +3279,20 @@ static int vhost_user_get_shmem_config(struct vhost_dev *dev,
         return ret;
     }
 
+    if (msg.hdr.request != VHOST_USER_GET_SHMEM_CONFIG) {
+        error_setg(errp,
+                   "Received unexpected message type for GET_SHMEM_CONFIG: %u",
+                   msg.hdr.request);
+        return -EPROTO;
+    }
+
+    if (msg.hdr.size != sizeof(msg.payload.shmem)) {
+        error_setg(errp,
+                   "Received bad GET_SHMEM_CONFIG size: %u, expected %zu",
+                   msg.hdr.size, sizeof(msg.payload.shmem));
+        return -EPROTO;
+    }
+
     if (msg.payload.shmem.nregions > VIRTIO_MAX_SHMEM_REGIONS) {
         error_setg(errp, "Received too many shared memory regions: %d",
                    msg.payload.shmem.nregions);
@@ -3280,6 +3303,8 @@ static int vhost_user_get_shmem_config(struct vhost_dev *dev,
     memcpy(memory_sizes,
            &msg.payload.shmem.memory_sizes,
            sizeof(uint64_t) * VIRTIO_MAX_SHMEM_REGIONS);
+    trace_vhost_user_shmem_config(dev->protocol_features, *nregions,
+                                  memory_sizes[0]);
     return 0;
 }
 const VhostOps user_ops = {

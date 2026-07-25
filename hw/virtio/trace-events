@@ -28,6 +28,9 @@ vhost_user_postcopy_waker_nomatch(const char *rb, uint64_t rb_offset) "%s + 0x%"
 vhost_user_read(uint32_t req, uint32_t flags) "req:%d flags:0x%"PRIx32""
 vhost_user_write(uint32_t req, uint32_t flags) "req:%d flags:0x%"PRIx32""
 vhost_user_create_notifier(int idx, void *n) "idx:%d n:%p"
+vhost_user_shmem_config(uint64_t protocol_features, uint32_t nregions, uint64_t cache_bytes) "protocol_features=0x%"PRIx64" nregions=%"PRIu32" cache_bytes=%"PRIu64
+vhost_user_shmem_map(uint8_t shmid, uint64_t fd_offset, uint64_t shm_offset, uint64_t bytes, uint64_t flags, int result) "shmid=%"PRIu8" fd_offset=%"PRIu64" shm_offset=%"PRIu64" bytes=%"PRIu64" flags=0x%"PRIx64" result=%d"
+vhost_user_shmem_unmap(uint8_t shmid, uint64_t shm_offset, uint64_t bytes, int result) "shmid=%"PRIu8" shm_offset=%"PRIu64" bytes=%"PRIu64" result=%d"
 
 # vhost-vdpa.c
 vhost_vdpa_skipped_memory_section(int is_ram, int is_iommu, int is_protected, int is_ram_device, uint64_t first, uint64_t last, int page_mask) "is_ram=%d, is_iommu=%d, is_protected=%d, is_ram_device=%d iova_min=0x%"PRIx64" iova_last=0x%"PRIx64" page_mask=0x%x"
