@@ -235,6 +235,9 @@ typedef struct HetGPUState {
     bool initialized;
     HetGPUBackendType backend;
     HetGPUContext context;
+    uint64_t context_generation;
+    uint64_t context_binding_hits;
+    uint64_t context_binding_misses;
     int device_index;
     int cuda_device;        /* CUDA device handle from cuDeviceGet */
     int driver_version;     /* Version returned by the loaded real CUDA Driver */

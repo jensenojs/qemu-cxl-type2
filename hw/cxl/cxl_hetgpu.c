@@ -10,6 +10,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/atomic.h"
 #include "qemu/thread.h"
 #include "qemu/timer.h"
 #include "hw/cxl/cxl_hetgpu.h"
@@ -154,6 +155,49 @@ typedef int (*cuGetErrorName_fn)(int, const char **);
 
 static __thread uint64_t g_cuda_trace_call_id;
 static __thread uint32_t g_cuda_trace_occurrence;
+
+typedef struct CudaThreadBinding {
+    void *context;
+    uint64_t generation;
+} CudaThreadBinding;
+
+/* CUDA current contexts are host-thread local.  The generation prevents a
+ * reset context whose address was reused from matching stale thread state. */
+static __thread CudaThreadBinding g_cuda_thread_binding;
+static uint64_t g_cuda_context_generation;
+
+static uint64_t cuda_next_context_generation(void)
+{
+    return qatomic_fetch_inc(&g_cuda_context_generation) + 1;
+}
+
+static void cuda_thread_binding_clear(void)
+{
+    g_cuda_thread_binding = (CudaThreadBinding) { 0 };
+}
+
+static bool cuda_thread_binding_matches(HetGPUState *state)
+{
+    return g_cuda_thread_binding.context == state->context &&
+           g_cuda_thread_binding.generation == state->context_generation;
+}
+
+static void cuda_thread_binding_record(HetGPUState *state)
+{
+    g_cuda_thread_binding = (CudaThreadBinding) {
+        .context = state->context,
+        .generation = state->context_generation,
+    };
+}
+
+static void cuda_context_install(HetGPUState *state, void *context)
+{
+    state->context = context;
+    state->context_generation = cuda_next_context_generation();
+}
+
+static bool cuda_lock(HetGPUState *state);
+static void cuda_unlock(HetGPUState *state);
 
 void hetgpu_cuda_trace_set_call_id(uint64_t call_id) {
   g_cuda_trace_call_id = call_id;
@@ -578,6 +622,7 @@ static HetGPUError hetgpu_init_internal(HetGPUState *state,
             if (g_cuda_funcs.cuCtxPopCurrent) {
                 void *popped = NULL;
                 HETGPU_CUDA_CALL(cuCtxPopCurrent, &popped);
+                cuda_thread_binding_clear();
             }
         } else {
             qemu_log("CXL hetGPU: cuCtxCreate_v2 symbol not found\n");
@@ -587,7 +632,7 @@ static HetGPUError hetgpu_init_internal(HetGPUState *state,
         state->initialized = true;
         state->backend = HETGPU_BACKEND_NVIDIA;
         state->cuda_device = cuda_dev;
-        state->context = ctx;
+        cuda_context_install(state, ctx);
 
         /* Query real GPU properties */
         state->props = default_props;
@@ -775,6 +820,9 @@ static HetGPUError hetgpu_cleanup_internal(HetGPUState *state)
 
         qemu_mutex_lock(&g_cuda_mutex);
         err = HETGPU_CUDA_CALL(cuCtxDestroy, state->context);
+        if (cuda_thread_binding_matches(state)) {
+            cuda_thread_binding_clear();
+        }
         qemu_mutex_unlock(&g_cuda_mutex);
         if (err != 0) {
             qemu_log("CXL hetGPU: cuCtxDestroy failed context=%p error=%d\n",
@@ -787,6 +835,10 @@ static HetGPUError hetgpu_cleanup_internal(HetGPUState *state)
 
     qemu_log("CXL hetGPU: Stats - Kernel launches: %lu, Memory ops: %lu, Coherency ops: %lu\n",
              state->kernel_launches, state->memory_ops, state->coherency_ops);
+    qemu_log("CXL TYPE2 TRACE context_binding event=clear generation=%" PRIu64
+             " hits=%" PRIu64 " misses=%" PRIu64 "\n",
+             state->context_generation, state->context_binding_hits,
+             state->context_binding_misses);
 
     memset(state, 0, sizeof(*state));
     return result;
@@ -959,32 +1011,24 @@ int hetgpu_cuda_module_get_loading_mode(HetGPUState *state, int *mode)
 int hetgpu_cuda_mem_get_info(HetGPUState *state, size_t *free_bytes,
                              size_t *total_bytes)
 {
-    int result;
-
     if (!free_bytes || !total_bytes) {
         return CUDA_ERROR_INVALID_VALUE;
     }
     if (!state || !state->initialized || !state->context ||
         state->backend == HETGPU_BACKEND_SIMULATION ||
-        !g_cuda_mutex_initialized || !g_cuda_funcs.cuCtxSetCurrent ||
-        !g_cuda_funcs.cuMemGetInfo) {
+        !g_cuda_mutex_initialized || !g_cuda_funcs.cuMemGetInfo) {
         return CUDA_ERROR_INVALID_CONTEXT;
     }
 
-    qemu_mutex_lock(&g_cuda_mutex);
-    result = HETGPU_CUDA_CALL(cuCtxSetCurrent, state->context);
-    if (result == CUDA_SUCCESS) {
-        int driver_result = HETGPU_CUDA_CALL(cuMemGetInfo, free_bytes, total_bytes);
-
-        qemu_log("CXL TYPE2 CUDA mem_info_driver context_activation_result=%d "
-                 "driver_called=1 driver_result=%d free=%zu total=%zu\n",
-                 result, driver_result, *free_bytes, *total_bytes);
-        result = driver_result;
-    } else {
-        qemu_log("CXL TYPE2 CUDA mem_info_driver context_activation_result=%d "
-                 "driver_called=0\n", result);
+    if (!cuda_lock(state)) {
+        qemu_log("CXL TYPE2 CUDA mem_info_driver driver_called=0\n");
+        return CUDA_ERROR_INVALID_CONTEXT;
     }
-    qemu_mutex_unlock(&g_cuda_mutex);
+    int result = HETGPU_CUDA_CALL(cuMemGetInfo, free_bytes, total_bytes);
+    cuda_unlock(state);
+    qemu_log("CXL TYPE2 CUDA mem_info_driver driver_called=1 "
+             "driver_result=%d free=%zu total=%zu\n",
+             result, *free_bytes, *total_bytes);
     return result;
 }
 
@@ -1020,7 +1064,7 @@ HetGPUError hetgpu_create_context(HetGPUState *state)
         void *ctx = NULL;
         int err = HETGPU_CUDA_CALL(cuCtxCreate, &ctx, 0, state->cuda_device);
         if (err == 0 && ctx != NULL) {
-            state->context = ctx;
+            cuda_context_install(state, ctx);
             qemu_log("CXL hetGPU: Created new CUDA context %p\n", ctx);
             return HETGPU_SUCCESS;
         }
@@ -1038,10 +1082,16 @@ void hetgpu_destroy_context(HetGPUState *state)
     }
 
     if (state->backend != HETGPU_BACKEND_SIMULATION && g_cuda_funcs.cuCtxDestroy) {
+        qemu_mutex_lock(&g_cuda_mutex);
         HETGPU_CUDA_CALL(cuCtxDestroy, state->context);
+        if (cuda_thread_binding_matches(state)) {
+            cuda_thread_binding_clear();
+        }
+        qemu_mutex_unlock(&g_cuda_mutex);
     }
 
     state->context = NULL;
+    state->context_generation = 0;
 }
 
 /*
@@ -1058,9 +1108,19 @@ static bool cuda_lock(HetGPUState *state)
     qemu_mutex_lock(&g_cuda_mutex);
 
     if (state->context) {
+        if (cuda_thread_binding_matches(state)) {
+            state->context_binding_hits++;
+            return true;
+        }
+        state->context_binding_misses++;
         /* Use cuCtxSetCurrent — does NOT grow the context stack */
         if (g_cuda_funcs.cuCtxSetCurrent) {
             int err = HETGPU_CUDA_CALL(cuCtxSetCurrent, state->context);
+            if (err == CUDA_SUCCESS) {
+                cuda_thread_binding_record(state);
+            } else {
+                cuda_thread_binding_clear();
+            }
             if (err != 0) {
                 if (state->formal_case_strict) {
                     qemu_log("CXL hetGPU: formal context activation failed "
@@ -1080,8 +1140,10 @@ static bool cuda_lock(HetGPUState *state)
                             void *popped = NULL;
                             HETGPU_CUDA_CALL(cuCtxPopCurrent, &popped);
                         }
-                        state->context = ctx;
-                        HETGPU_CUDA_CALL(cuCtxSetCurrent, ctx);
+                        cuda_context_install(state, ctx);
+                        if (HETGPU_CUDA_CALL(cuCtxSetCurrent, ctx) == CUDA_SUCCESS) {
+                            cuda_thread_binding_record(state);
+                        }
                         qemu_log("CXL hetGPU: Re-created CUDA context %p\n", ctx);
                     }
                 }
@@ -1109,9 +1171,11 @@ static bool cuda_lock(HetGPUState *state)
                 void *popped = NULL;
                 HETGPU_CUDA_CALL(cuCtxPopCurrent, &popped);
             }
-            state->context = ctx;
+            cuda_context_install(state, ctx);
             if (g_cuda_funcs.cuCtxSetCurrent) {
-                HETGPU_CUDA_CALL(cuCtxSetCurrent, ctx);
+                if (HETGPU_CUDA_CALL(cuCtxSetCurrent, ctx) == CUDA_SUCCESS) {
+                    cuda_thread_binding_record(state);
+                }
             }
             qemu_log("CXL hetGPU: Created CUDA context on demand: %p\n", ctx);
         }

@@ -5602,9 +5602,14 @@ complete:
     int64_t trace_duration_ns = trace_end_ns - trace_start_ns;
     qemu_log("CXL TYPE2 TRACE cmd_end seq=%" PRIu64
              " call_id=0x%016" PRIx64
-             " cmd=0x%x host_ns=%" PRId64 " result=%u duration_ns=%" PRId64 "\n",
+             " cmd=0x%x host_ns=%" PRId64 " result=%u duration_ns=%" PRId64
+             " context_generation=%" PRIu64
+             " context_binding_hits=%" PRIu64
+             " context_binding_misses=%" PRIu64 "\n",
              trace_sequence, ct2d->gpu_cmd.call_id, cmd, trace_end_ns,
-             ct2d->gpu_cmd.cmd_result, trace_duration_ns);
+             ct2d->gpu_cmd.cmd_result, trace_duration_ns,
+             hetgpu->context_generation, hetgpu->context_binding_hits,
+             hetgpu->context_binding_misses);
     qemu_log_mask(LOG_GUEST_ERROR,
                   "CXL GPU: cmd 0x%x done, result=%u results[0]=0x%lx\n",
                   cmd, ct2d->gpu_cmd.cmd_result,
