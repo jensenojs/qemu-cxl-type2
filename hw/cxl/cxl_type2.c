@@ -2458,6 +2458,116 @@ static bool cxl_type2_stream_from_wire(CXLType2State *ct2d, uint64_t wire,
     return true;
 }
 
+static int cxl_type2_htod_staging_free(CXLType2State *ct2d, void *data)
+{
+    int result = hetgpu_cuda_mem_free_host(&ct2d->gpu_info.hetgpu_state,
+                                           data);
+
+    if (result == CXL_GPU_SUCCESS) {
+        ct2d->htod_driver_frees++;
+    }
+    return result;
+}
+
+static int cxl_type2_htod_staging_acquire(CXLType2State *ct2d,
+                                           size_t request_bytes,
+                                           void **data,
+                                           size_t *capacity,
+                                           uint64_t *buffer_id,
+                                           bool *pool_hit)
+{
+    CXLType2HtoDStagingBuffer **best = NULL;
+    CXLType2HtoDStagingBuffer **cursor = &ct2d->htod_staging_pool;
+    CXLType2HtoDStagingBuffer *buffer;
+    int result;
+
+    while (*cursor) {
+        if ((*cursor)->capacity >= request_bytes &&
+            (!best || (*cursor)->capacity < (*best)->capacity)) {
+            best = cursor;
+        }
+        cursor = &(*cursor)->next;
+    }
+    if (best) {
+        buffer = *best;
+        *best = buffer->next;
+        ct2d->htod_pooled_buffers--;
+        ct2d->htod_pooled_bytes -= buffer->capacity;
+        ct2d->htod_pool_hits++;
+        *data = buffer->data;
+        *capacity = buffer->capacity;
+        *buffer_id = buffer->id;
+        *pool_hit = true;
+        g_free(buffer);
+        return CXL_GPU_SUCCESS;
+    }
+
+    ct2d->htod_pool_misses++;
+    result = hetgpu_cuda_mem_host_alloc(&ct2d->gpu_info.hetgpu_state,
+                                        data, request_bytes);
+    if (result != CXL_GPU_SUCCESS) {
+        return result;
+    }
+    ct2d->htod_driver_allocations++;
+    *capacity = request_bytes;
+    *buffer_id = ++ct2d->next_htod_staging_id;
+    *pool_hit = false;
+    return CXL_GPU_SUCCESS;
+}
+
+static int cxl_type2_htod_staging_release(CXLType2State *ct2d,
+                                           void *data,
+                                           size_t capacity,
+                                           uint64_t buffer_id,
+                                           bool *pooled)
+{
+    CXLType2HtoDStagingBuffer *buffer;
+
+    if (ct2d->htod_staging_pool_size >= capacity &&
+        ct2d->htod_pooled_bytes <=
+            ct2d->htod_staging_pool_size - capacity) {
+        buffer = g_new0(CXLType2HtoDStagingBuffer, 1);
+        buffer->data = data;
+        buffer->capacity = capacity;
+        buffer->id = buffer_id;
+        buffer->next = ct2d->htod_staging_pool;
+        ct2d->htod_staging_pool = buffer;
+        ct2d->htod_pooled_buffers++;
+        ct2d->htod_pooled_bytes += capacity;
+        ct2d->htod_peak_pooled_bytes = MAX(ct2d->htod_peak_pooled_bytes,
+                                           ct2d->htod_pooled_bytes);
+        *pooled = true;
+        return CXL_GPU_SUCCESS;
+    }
+
+    if (ct2d->htod_staging_pool_size) {
+        ct2d->htod_pool_evictions++;
+    }
+    *pooled = false;
+    return cxl_type2_htod_staging_free(ct2d, data);
+}
+
+static int cxl_type2_clear_htod_staging_pool(CXLType2State *ct2d)
+{
+    CXLType2HtoDStagingBuffer *buffer = ct2d->htod_staging_pool;
+    int first_error = CXL_GPU_SUCCESS;
+
+    ct2d->htod_staging_pool = NULL;
+    while (buffer) {
+        CXLType2HtoDStagingBuffer *next = buffer->next;
+        int result = cxl_type2_htod_staging_free(ct2d, buffer->data);
+
+        if (first_error == CXL_GPU_SUCCESS && result != CXL_GPU_SUCCESS) {
+            first_error = result;
+        }
+        g_free(buffer);
+        buffer = next;
+    }
+    ct2d->htod_pooled_buffers = 0;
+    ct2d->htod_pooled_bytes = 0;
+    return first_error;
+}
+
 static int cxl_type2_release_pending_htod(CXLType2State *ct2d,
                                           HetGPUStream stream,
                                           bool all_streams,
@@ -2490,17 +2600,42 @@ static int cxl_type2_release_pending_htod(CXLType2State *ct2d,
                 }
             }
         }
-        int result = hetgpu_cuda_mem_free_host(
-            &ct2d->gpu_info.hetgpu_state, pending->staging);
+        bool pooled;
+        int64_t release_start_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+        int result = cxl_type2_htod_staging_release(
+            ct2d, pending->staging, pending->staging_capacity,
+            pending->staging_id, &pooled);
+        int64_t release_duration_ns =
+            qemu_clock_get_ns(QEMU_CLOCK_HOST) - release_start_ns;
+
+        ct2d->htod_pending_copies--;
+        ct2d->htod_pending_bytes -= pending->staging_capacity;
         qemu_log("CXL TYPE2 TRACE copy_completion original_call_id=0x%016"
                  PRIx64 " completion_call_id=0x%016" PRIx64
-                 " direction=htod sequence=%" PRIu64 " bytes=%zu "
-                 "completion=%s lifetime_ns=%" PRId64 " free_result=%d\n",
+                 " direction=htod sequence=%" PRIu64 " bytes=%zu"
+                 " staging_id=%" PRIu64 " capacity_bytes=%zu"
+                 " completion=%s lifetime_ns=%" PRId64
+                 " disposition=%s release_duration_ns=%" PRId64
+                 " free_result=%d pending_copies=%" PRIu64
+                 " pending_bytes=%" PRIu64 " peak_pending_copies=%" PRIu64
+                 " peak_pending_bytes=%" PRIu64 " pooled_buffers=%" PRIu64
+                 " pooled_bytes=%" PRIu64 " peak_pooled_bytes=%" PRIu64
+                 " pool_hits=%" PRIu64 " pool_misses=%" PRIu64
+                 " driver_allocations=%" PRIu64 " driver_frees=%" PRIu64
+                 " evictions=%" PRIu64 "\n",
                  pending->call_id, ct2d->gpu_cmd.call_id,
-                 pending->sequence, pending->size, completion,
+                 pending->sequence, pending->size, pending->staging_id,
+                 pending->staging_capacity, completion,
                  qemu_clock_get_ns(QEMU_CLOCK_HOST) -
                      pending->enqueue_host_ns,
-                 result);
+                 pooled ? "pool" : "driver-free", release_duration_ns,
+                 result, ct2d->htod_pending_copies,
+                 ct2d->htod_pending_bytes, ct2d->htod_peak_pending_copies,
+                 ct2d->htod_peak_pending_bytes, ct2d->htod_pooled_buffers,
+                 ct2d->htod_pooled_bytes, ct2d->htod_peak_pooled_bytes,
+                 ct2d->htod_pool_hits, ct2d->htod_pool_misses,
+                 ct2d->htod_driver_allocations, ct2d->htod_driver_frees,
+                 ct2d->htod_pool_evictions);
         if (first_error == CXL_GPU_SUCCESS && result != CXL_GPU_SUCCESS) {
             first_error = result;
         }
@@ -3048,6 +3183,7 @@ static void cxl_type2_paired_case_end(CXLType2State *ct2d,
     HetGPUError sync_error;
     HetGPUError concordia_error;
     HetGPUError reset_error;
+    int pool_clear_result;
     bool result_valid;
 
     memset(ct2d->gpu_cmd.results, 0, sizeof(ct2d->gpu_cmd.results));
@@ -3071,6 +3207,11 @@ static void cxl_type2_paired_case_end(CXLType2State *ct2d,
         cxl_type2_release_pending_htod(ct2d, NULL, true, UINT64_MAX,
                                        "case-end") !=
             CXL_GPU_SUCCESS) {
+        sync_error = HETGPU_ERROR_UNKNOWN;
+    }
+    pool_clear_result = cxl_type2_clear_htod_staging_pool(ct2d);
+    if (sync_error == HETGPU_SUCCESS &&
+        pool_clear_result != CXL_GPU_SUCCESS) {
         sync_error = HETGPU_ERROR_UNKNOWN;
     }
     cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
@@ -3507,12 +3648,15 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             void *staging = NULL;
             CXLType2PendingHtoD *pending;
             int result;
-            int64_t allocation_start_ns;
-            int64_t allocation_duration_ns;
+            int64_t acquire_start_ns;
+            int64_t acquire_duration_ns;
             int64_t staging_start_ns;
             int64_t staging_duration_ns;
             int64_t enqueue_start_ns;
             int64_t enqueue_duration_ns;
+            size_t staging_capacity;
+            uint64_t staging_id;
+            bool pool_hit;
 
             dev_ptr = ct2d->gpu_cmd.params[0];
             size = ct2d->gpu_cmd.params[1];
@@ -3523,10 +3667,12 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
                 break;
             }
-            allocation_start_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
-            result = hetgpu_cuda_mem_host_alloc(hetgpu, &staging, size);
-            allocation_duration_ns =
-                qemu_clock_get_ns(QEMU_CLOCK_HOST) - allocation_start_ns;
+            acquire_start_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+            result = cxl_type2_htod_staging_acquire(
+                ct2d, size, &staging, &staging_capacity, &staging_id,
+                &pool_hit);
+            acquire_duration_ns =
+                qemu_clock_get_ns(QEMU_CLOCK_HOST) - acquire_start_ns;
             if (result != CXL_GPU_SUCCESS) {
                 ct2d->gpu_cmd.cmd_result = result;
                 break;
@@ -3541,13 +3687,17 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             enqueue_duration_ns =
                 qemu_clock_get_ns(QEMU_CLOCK_HOST) - enqueue_start_ns;
             if (result != CXL_GPU_SUCCESS) {
-                (void)hetgpu_cuda_mem_free_host(hetgpu, staging);
+                bool pooled;
+                (void)cxl_type2_htod_staging_release(
+                    ct2d, staging, staging_capacity, staging_id, &pooled);
                 ct2d->gpu_cmd.cmd_result = result;
                 break;
             }
             pending = g_new0(CXLType2PendingHtoD, 1);
             pending->stream = stream;
             pending->staging = staging;
+            pending->staging_id = staging_id;
+            pending->staging_capacity = staging_capacity;
             pending->dev_ptr = dev_ptr;
             pending->sequence = ++ct2d->next_htod_sequence;
             pending->call_id = ct2d->gpu_cmd.call_id;
@@ -3555,15 +3705,43 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             pending->size = size;
             pending->next = ct2d->pending_htod;
             ct2d->pending_htod = pending;
+            ct2d->htod_pending_copies++;
+            ct2d->htod_pending_bytes += staging_capacity;
+            ct2d->htod_peak_pending_copies =
+                MAX(ct2d->htod_peak_pending_copies,
+                    ct2d->htod_pending_copies);
+            ct2d->htod_peak_pending_bytes =
+                MAX(ct2d->htod_peak_pending_bytes,
+                    ct2d->htod_pending_bytes);
             qemu_log("CXL TYPE2 TRACE copy_driver call_id=0x%016" PRIx64
                      " direction=htod bytes=%zu backend_result=%d "
                      "implementation=async-enqueue stream_forwarded=1 "
-                     "host_alloc_duration_ns=%" PRId64
+                     "staging_id=%" PRIu64 " capacity_bytes=%zu"
+                     " staging_source=%s acquire_duration_ns=%" PRId64
+                     " host_alloc_duration_ns=%" PRId64
                      " staging_memcpy_duration_ns=%" PRId64
-                     " driver_enqueue_duration_ns=%" PRId64 "\n",
-                     ct2d->gpu_cmd.call_id, size, result,
-                     allocation_duration_ns, staging_duration_ns,
-                     enqueue_duration_ns);
+                     " driver_enqueue_duration_ns=%" PRId64
+                     " pending_copies=%" PRIu64 " pending_bytes=%" PRIu64
+                     " peak_pending_copies=%" PRIu64
+                     " peak_pending_bytes=%" PRIu64
+                     " pooled_buffers=%" PRIu64 " pooled_bytes=%" PRIu64
+                     " peak_pooled_bytes=%" PRIu64
+                     " pool_hits=%" PRIu64 " pool_misses=%" PRIu64
+                     " driver_allocations=%" PRIu64
+                     " driver_frees=%" PRIu64 " evictions=%" PRIu64 "\n",
+                     ct2d->gpu_cmd.call_id, size, result, staging_id,
+                     staging_capacity, pool_hit ? "pool" : "driver",
+                     acquire_duration_ns,
+                     pool_hit ? 0 : acquire_duration_ns,
+                     staging_duration_ns, enqueue_duration_ns,
+                     ct2d->htod_pending_copies,
+                     ct2d->htod_pending_bytes,
+                     ct2d->htod_peak_pending_copies,
+                     ct2d->htod_peak_pending_bytes,
+                     ct2d->htod_pooled_buffers, ct2d->htod_pooled_bytes,
+                     ct2d->htod_peak_pooled_bytes, ct2d->htod_pool_hits,
+                     ct2d->htod_pool_misses, ct2d->htod_driver_allocations,
+                     ct2d->htod_driver_frees, ct2d->htod_pool_evictions);
         }
         break;
 
@@ -6160,6 +6338,7 @@ static void cxl_type2_exit(PCIDevice *pci_dev)
         (void)hetgpu_synchronize(&ct2d->gpu_info.hetgpu_state);
         (void)cxl_type2_release_pending_htod(ct2d, NULL, true, UINT64_MAX,
                                              "device-exit");
+        (void)cxl_type2_clear_htod_staging_pool(ct2d);
     }
 
     (void)cxl_type2_clear_gpu_handles(ct2d, 0, CXL_GPU_CASE_NONE, 0);
@@ -6210,6 +6389,8 @@ static const Property cxl_type2_props[] = {
                      CXL_TYPE2_DEFAULT_CACHE_SIZE),
     DEFINE_PROP_SIZE("mem-size", CXLType2State, device_mem_size,
                      CXL_TYPE2_DEFAULT_MEM_SIZE),
+    DEFINE_PROP_SIZE("htod-staging-pool-size", CXLType2State,
+                     htod_staging_pool_size, 0),
     DEFINE_PROP_UINT64("sn", CXLType2State, sn, 0),
     DEFINE_PROP_PCIE_LINK_SPEED("x-speed", CXLType2State,
                                 speed, PCIE_LINK_SPEED_64),

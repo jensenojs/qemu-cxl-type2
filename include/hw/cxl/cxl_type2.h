@@ -182,6 +182,8 @@ typedef struct CXLType2MHSLDState {
 typedef struct CXLType2PendingHtoD {
     HetGPUStream stream;
     void *staging;
+    uint64_t staging_id;
+    size_t staging_capacity;
     uint64_t dev_ptr;
     uint64_t sequence;
     uint64_t call_id;
@@ -189,6 +191,13 @@ typedef struct CXLType2PendingHtoD {
     size_t size;
     struct CXLType2PendingHtoD *next;
 } CXLType2PendingHtoD;
+
+typedef struct CXLType2HtoDStagingBuffer {
+    void *data;
+    uint64_t id;
+    size_t capacity;
+    struct CXLType2HtoDStagingBuffer *next;
+} CXLType2HtoDStagingBuffer;
 
 typedef struct CXLType2EventHtoDMark {
     void *event;
@@ -258,8 +267,23 @@ typedef struct CXLType2State {
     } gpu_cmd;
 
     CXLType2PendingHtoD *pending_htod;
+    CXLType2HtoDStagingBuffer *htod_staging_pool;
     CXLType2EventHtoDMark *event_htod_marks;
     uint64_t next_htod_sequence;
+    uint64_t next_htod_staging_id;
+    uint64_t htod_staging_pool_size;
+    uint64_t htod_pending_copies;
+    uint64_t htod_pending_bytes;
+    uint64_t htod_peak_pending_copies;
+    uint64_t htod_peak_pending_bytes;
+    uint64_t htod_pooled_buffers;
+    uint64_t htod_pooled_bytes;
+    uint64_t htod_peak_pooled_bytes;
+    uint64_t htod_pool_hits;
+    uint64_t htod_pool_misses;
+    uint64_t htod_driver_allocations;
+    uint64_t htod_driver_frees;
+    uint64_t htod_pool_evictions;
 
     struct {
         bool required;
