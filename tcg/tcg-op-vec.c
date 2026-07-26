@@ -597,6 +597,17 @@ void tcg_gen_mul_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
     do_op3_nofail(vece, r, a, b, INDEX_op_mul_vec);
 }
 
+void tcg_gen_sdot_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
+{
+    do_op3_nofail(vece, r, a, b, INDEX_op_sdot_vec);
+}
+
+void tcg_gen_usdot_sat_vec(unsigned vece, TCGv_vec r,
+                           TCGv_vec a, TCGv_vec b)
+{
+    do_op3_nofail(vece, r, a, b, INDEX_op_usdot_sat_vec);
+}
+
 void tcg_gen_lookup_vec(TCGv_vec r, TCGv_vec table, TCGv_vec indexes)
 {
     TCGTemp *rt = tcgv_vec_temp(r);

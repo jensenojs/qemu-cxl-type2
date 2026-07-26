@@ -911,7 +911,6 @@ BINARY_INT_MMX(PACKSSDW,   packssdw)
 
 BINARY_INT_MMX(PAVGB,   pavgb)
 BINARY_INT_MMX(PAVGW,   pavgw)
-BINARY_INT_MMX(PMADDWD, pmaddwd)
 BINARY_INT_MMX(PMULHUW, pmulhuw)
 BINARY_INT_MMX(PMULHW,  pmulhw)
 BINARY_INT_MMX(PMULUDQ, pmuludq)
@@ -932,11 +931,106 @@ BINARY_INT_MMX(PHADDD,    phaddd)
 BINARY_INT_MMX(PHSUBW,    phsubw)
 BINARY_INT_MMX(PHSUBSW,   phsubsw)
 BINARY_INT_MMX(PHSUBD,    phsubd)
-BINARY_INT_MMX(PMADDUBSW, pmaddubsw)
-BINARY_INT_MMX(PSIGNB,    psignb)
-BINARY_INT_MMX(PSIGNW,    psignw)
-BINARY_INT_MMX(PSIGND,    psignd)
 BINARY_INT_MMX(PMULHRSW,  pmulhrsw)
+
+static void gen_pmaddwd_vec(unsigned vece, TCGv_vec d,
+                            TCGv_vec a, TCGv_vec b)
+{
+    tcg_gen_sdot_vec(vece, d, a, b);
+}
+
+static void gen_pmaddubsw_vec(unsigned vece, TCGv_vec d,
+                              TCGv_vec a, TCGv_vec b)
+{
+    tcg_gen_usdot_sat_vec(vece, d, a, b);
+}
+
+static void gen_pmadd(DisasContext *s, X86DecodedInsn *decode,
+                      TCGOpcode opc, unsigned vece,
+                      void (*fniv)(unsigned, TCGv_vec, TCGv_vec, TCGv_vec),
+                      SSEFunc_0_eppp mmx, SSEFunc_0_eppp xmm,
+                      SSEFunc_0_eppp ymm)
+{
+    TCGOpcode vecop_list[] = { opc, 0 };
+    GVecGen3 g = {
+        .fniv = fniv,
+        .opt_opc = vecop_list,
+        .vece = vece,
+    };
+    int vec_len;
+
+    if (!(s->prefix & PREFIX_DATA) ||
+        !tcg_op_supported(opc, TCG_TYPE_V128, vece)) {
+        gen_binary_int_sse(s, decode, mmx, xmm, ymm);
+        return;
+    }
+
+    vec_len = vector_len(s, decode);
+    tcg_gen_gvec_3(decode->op[0].offset, decode->op[1].offset,
+                   decode->op[2].offset, vec_len, vec_len, &g);
+}
+
+static void gen_PMADDWD(DisasContext *s, X86DecodedInsn *decode)
+{
+    gen_pmadd(s, decode, INDEX_op_sdot_vec, MO_16, gen_pmaddwd_vec,
+              gen_helper_pmaddwd_mmx, gen_helper_pmaddwd_xmm,
+              gen_helper_pmaddwd_ymm);
+}
+
+static void gen_PMADDUBSW(DisasContext *s, X86DecodedInsn *decode)
+{
+    gen_pmadd(s, decode, INDEX_op_usdot_sat_vec, MO_8, gen_pmaddubsw_vec,
+              gen_helper_pmaddubsw_mmx, gen_helper_pmaddubsw_xmm,
+              gen_helper_pmaddubsw_ymm);
+}
+
+static void gen_psign_vec(unsigned vece, TCGv_vec d,
+                          TCGv_vec value, TCGv_vec control)
+{
+    TCGv_vec neg = tcg_temp_new_vec_matching(d);
+    TCGv_vec zero = tcg_constant_vec_matching(d, vece, 0);
+
+    tcg_gen_neg_vec(vece, neg, value);
+    tcg_gen_cmpsel_vec(TCG_COND_LT, vece, d,
+                       control, zero, neg, value);
+    tcg_gen_cmpsel_vec(TCG_COND_EQ, vece, d,
+                       control, zero, zero, d);
+}
+
+static void gen_psign(DisasContext *s, X86DecodedInsn *decode, unsigned vece,
+                      SSEFunc_0_eppp mmx, SSEFunc_0_eppp xmm,
+                      SSEFunc_0_eppp ymm)
+{
+    static const TCGOpcode vecop_list[] = {
+        INDEX_op_neg_vec, INDEX_op_cmpsel_vec, 0
+    };
+    GVecGen3 g = {
+        .fniv = gen_psign_vec,
+        .opt_opc = vecop_list,
+        .vece = vece,
+    };
+    int vec_len;
+
+    if (!(s->prefix & PREFIX_DATA) ||
+        !tcg_can_emit_vecop_list(vecop_list, TCG_TYPE_V128, vece)) {
+        gen_binary_int_sse(s, decode, mmx, xmm, ymm);
+        return;
+    }
+
+    vec_len = vector_len(s, decode);
+    tcg_gen_gvec_3(decode->op[0].offset, decode->op[1].offset,
+                   decode->op[2].offset, vec_len, vec_len, &g);
+}
+
+#define PSIGN(uname, lname, vece)                                             \
+static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)              \
+{                                                                             \
+    gen_psign(s, decode, vece, gen_helper_##lname##_mmx,                       \
+              gen_helper_##lname##_xmm, gen_helper_##lname##_ymm);            \
+}
+PSIGN(PSIGNB, psignb, MO_8)
+PSIGN(PSIGNW, psignw, MO_16)
+PSIGN(PSIGND, psignd, MO_32)
 
 static void gen_pshufb_vec(unsigned vece, TCGv_vec d,
                            TCGv_vec table, TCGv_vec mask)
@@ -1036,12 +1130,62 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                
                       gen_helper_##lname##_ymm);                                   \
 }
 
-UNARY_INT_SSE(VPMOVSXBW,    pmovsxbw)
-UNARY_INT_SSE(VPMOVSXBD,    pmovsxbd)
-UNARY_INT_SSE(VPMOVSXBQ,    pmovsxbq)
-UNARY_INT_SSE(VPMOVSXWD,    pmovsxwd)
-UNARY_INT_SSE(VPMOVSXWQ,    pmovsxwq)
-UNARY_INT_SSE(VPMOVSXDQ,    pmovsxdq)
+static void gen_pmovsx(DisasContext *s, X86DecodedInsn *decode,
+                       MemOp src_ot, MemOp dst_ot)
+{
+    TCGv_i64 element[16];
+    int lanes = vector_len(s, decode) >> dst_ot;
+    int i;
+
+    for (i = 0; i < lanes; i++) {
+        int src_ofs = vector_elem_offset(&decode->op[2], src_ot, i);
+
+        element[i] = tcg_temp_new_i64();
+        switch (src_ot) {
+        case MO_8:
+            tcg_gen_ld8s_i64(element[i], tcg_env, src_ofs);
+            break;
+        case MO_16:
+            tcg_gen_ld16s_i64(element[i], tcg_env, src_ofs);
+            break;
+        case MO_32:
+            tcg_gen_ld32s_i64(element[i], tcg_env, src_ofs);
+            break;
+        default:
+            g_assert_not_reached();
+        }
+    }
+    for (i = 0; i < lanes; i++) {
+        int dst_ofs = vector_elem_offset(&decode->op[0], dst_ot, i);
+
+        switch (dst_ot) {
+        case MO_16:
+            tcg_gen_st16_i64(element[i], tcg_env, dst_ofs);
+            break;
+        case MO_32:
+            tcg_gen_st32_i64(element[i], tcg_env, dst_ofs);
+            break;
+        case MO_64:
+            tcg_gen_st_i64(element[i], tcg_env, dst_ofs);
+            break;
+        default:
+            g_assert_not_reached();
+        }
+    }
+}
+
+#define PMOVSX(uname, src_ot, dst_ot)                                          \
+static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)               \
+{                                                                              \
+    gen_pmovsx(s, decode, src_ot, dst_ot);                                     \
+}
+
+PMOVSX(VPMOVSXBW, MO_8,  MO_16)
+PMOVSX(VPMOVSXBD, MO_8,  MO_32)
+PMOVSX(VPMOVSXBQ, MO_8,  MO_64)
+PMOVSX(VPMOVSXWD, MO_16, MO_32)
+PMOVSX(VPMOVSXWQ, MO_16, MO_64)
+PMOVSX(VPMOVSXDQ, MO_32, MO_64)
 
 UNARY_INT_SSE(VPMOVZXBW,    pmovzxbw)
 UNARY_INT_SSE(VPMOVZXBD,    pmovzxbd)

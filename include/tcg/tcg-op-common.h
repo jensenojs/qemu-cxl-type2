@@ -421,6 +421,15 @@ void tcg_gen_dupi_vec(unsigned vece, TCGv_vec, uint64_t);
 void tcg_gen_add_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
 void tcg_gen_sub_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
 void tcg_gen_mul_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+/*
+ * Pairwise dot products produce lanes twice the width specified by vece.
+ * sdot multiplies signed lanes and wraps the pair sum at the output width.
+ * usdot_sat multiplies unsigned a by signed b and saturates the pair sum to
+ * the signed output width.
+ */
+void tcg_gen_sdot_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+void tcg_gen_usdot_sat_vec(unsigned vece, TCGv_vec r,
+                           TCGv_vec a, TCGv_vec b);
 void tcg_gen_lookup_vec(TCGv_vec r, TCGv_vec table, TCGv_vec indexes);
 void tcg_gen_and_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
 void tcg_gen_or_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);

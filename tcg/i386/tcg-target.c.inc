@@ -372,6 +372,8 @@ static bool tcg_target_const_match(int64_t val, int ct,
 #define OPC_PMOVZXBW    (0x30 | P_EXT38 | P_DATA16)
 #define OPC_PMOVZXWD    (0x33 | P_EXT38 | P_DATA16)
 #define OPC_PMOVZXDQ    (0x35 | P_EXT38 | P_DATA16)
+#define OPC_PMADDWD     (0xf5 | P_EXT | P_DATA16)
+#define OPC_PMADDUBSW   (0x04 | P_EXT38 | P_DATA16)
 #define OPC_PMULLW      (0xd5 | P_EXT | P_DATA16)
 #define OPC_PMULLD      (0x40 | P_EXT38 | P_DATA16)
 #define OPC_VPMULLQ     (0x40 | P_EXT38 | P_DATA16 | P_VEXW | P_EVEX)
@@ -3922,6 +3924,14 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     case INDEX_op_mul_vec:
         insn = mul_insn[vece];
         goto gen_simd;
+    case INDEX_op_sdot_vec:
+        tcg_debug_assert(vece == MO_16);
+        insn = OPC_PMADDWD;
+        goto gen_simd;
+    case INDEX_op_usdot_sat_vec:
+        tcg_debug_assert(vece == MO_8);
+        insn = OPC_PMADDUBSW;
+        goto gen_simd;
     case INDEX_op_and_vec:
         insn = OPC_PAND;
         goto gen_simd;
@@ -4159,6 +4169,8 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_add_vec:
     case INDEX_op_sub_vec:
     case INDEX_op_mul_vec:
+    case INDEX_op_sdot_vec:
+    case INDEX_op_usdot_sat_vec:
     case INDEX_op_and_vec:
     case INDEX_op_or_vec:
     case INDEX_op_xor_vec:
@@ -4326,6 +4338,11 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
             return have_avx512dq;
         }
         return 1;
+
+    case INDEX_op_sdot_vec:
+        return vece == MO_16;
+    case INDEX_op_usdot_sat_vec:
+        return vece == MO_8 && have_ssse3;
 
     case INDEX_op_ssadd_vec:
     case INDEX_op_usadd_vec:
