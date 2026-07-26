@@ -11,7 +11,6 @@
 
 #define have_bmi1         (cpuinfo & CPUINFO_BMI1)
 #define have_popcnt       (cpuinfo & CPUINFO_POPCNT)
-#define have_ssse3        (cpuinfo & CPUINFO_SSSE3)
 #define have_avx1         (cpuinfo & CPUINFO_AVX1)
 #define have_avx2         (cpuinfo & CPUINFO_AVX2)
 #define have_movbe        (cpuinfo & CPUINFO_MOVBE)

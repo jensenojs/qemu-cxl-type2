@@ -597,18 +597,6 @@ void tcg_gen_mul_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
     do_op3_nofail(vece, r, a, b, INDEX_op_mul_vec);
 }
 
-void tcg_gen_lookup_vec(TCGv_vec r, TCGv_vec table, TCGv_vec indexes)
-{
-    TCGTemp *rt = tcgv_vec_temp(r);
-    TCGTemp *tt = tcgv_vec_temp(table);
-    TCGTemp *it = tcgv_vec_temp(indexes);
-
-    tcg_debug_assert(rt->base_type == TCG_TYPE_V128);
-    tcg_debug_assert(tt->base_type == TCG_TYPE_V128);
-    tcg_debug_assert(it->base_type == TCG_TYPE_V128);
-    do_op3_nofail(MO_8, r, table, indexes, INDEX_op_lookup_vec);
-}
-
 void tcg_gen_ssadd_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
 {
     do_op3_nofail(vece, r, a, b, INDEX_op_ssadd_vec);
