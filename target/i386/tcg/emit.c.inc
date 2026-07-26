@@ -933,11 +933,50 @@ BINARY_INT_MMX(PHSUBW,    phsubw)
 BINARY_INT_MMX(PHSUBSW,   phsubsw)
 BINARY_INT_MMX(PHSUBD,    phsubd)
 BINARY_INT_MMX(PMADDUBSW, pmaddubsw)
-BINARY_INT_MMX(PSHUFB,    pshufb)
 BINARY_INT_MMX(PSIGNB,    psignb)
 BINARY_INT_MMX(PSIGNW,    psignw)
 BINARY_INT_MMX(PSIGND,    psignd)
 BINARY_INT_MMX(PMULHRSW,  pmulhrsw)
+
+static void gen_pshufb_vec(unsigned vece, TCGv_vec d,
+                           TCGv_vec table, TCGv_vec mask)
+{
+    TCGv_vec indexes = tcg_temp_new_vec_matching(d);
+    TCGv_vec high = tcg_temp_new_vec_matching(d);
+
+    tcg_gen_and_vec(MO_8, indexes, mask,
+                    tcg_constant_vec_matching(d, MO_8, 0x0f));
+    tcg_gen_cmp_vec(TCG_COND_LT, MO_8, high, mask,
+                    tcg_constant_vec_matching(d, MO_8, 0));
+    tcg_gen_and_vec(MO_8, high, high,
+                    tcg_constant_vec_matching(d, MO_8, 0x10));
+    tcg_gen_or_vec(MO_8, indexes, indexes, high);
+    tcg_gen_lookup_vec(d, table, indexes);
+}
+
+static void gen_PSHUFB(DisasContext *s, X86DecodedInsn *decode)
+{
+    static const TCGOpcode vecop_list[] = { INDEX_op_lookup_vec, 0 };
+    static const GVecGen3 g = {
+        .fniv = gen_pshufb_vec,
+        .opt_opc = vecop_list,
+        .vece = MO_8,
+    };
+    int vec_len;
+
+    if (!(s->prefix & PREFIX_DATA) ||
+        !tcg_op_supported(INDEX_op_lookup_vec, TCG_TYPE_V128, MO_8)) {
+        gen_binary_int_sse(s, decode,
+                           gen_helper_pshufb_mmx,
+                           gen_helper_pshufb_xmm,
+                           gen_helper_pshufb_ymm);
+        return;
+    }
+
+    vec_len = vector_len(s, decode);
+    tcg_gen_gvec_3(decode->op[0].offset, decode->op[1].offset,
+                   decode->op[2].offset, vec_len, vec_len, &g);
+}
 
 /* Instructions with no MMX equivalent.  */
 #define BINARY_INT_SSE(uname, lname)                                               \

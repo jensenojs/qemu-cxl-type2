@@ -3979,6 +3979,10 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     case INDEX_op_x86_packus_vec:
         insn = packus_insn[vece];
         goto gen_simd;
+    case INDEX_op_x86_pshufb_vec:
+        tcg_debug_assert(type == TCG_TYPE_V128 && vece == MO_8);
+        insn = OPC_PSHUFB;
+        goto gen_simd;
     case INDEX_op_x86_vpshldv_vec:
         insn = vpshldv_insn[vece];
         a1 = a2;
@@ -4184,6 +4188,7 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_x86_blend_vec:
     case INDEX_op_x86_packss_vec:
     case INDEX_op_x86_packus_vec:
+    case INDEX_op_x86_pshufb_vec:
     case INDEX_op_x86_vperm2i128_vec:
     case INDEX_op_x86_punpckl_vec:
     case INDEX_op_x86_punpckh_vec:
@@ -4220,6 +4225,9 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
 int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
 {
     switch (opc) {
+    case INDEX_op_lookup_vec:
+        return type == TCG_TYPE_V128 && vece == MO_8 && have_ssse3 ? -1 : 0;
+
     case INDEX_op_add_vec:
     case INDEX_op_sub_vec:
     case INDEX_op_and_vec:
@@ -4592,7 +4600,7 @@ void tcg_expand_vec_op(TCGOpcode opc, TCGType type, unsigned vece,
 {
     va_list va;
     TCGArg a1, a2, a3, a4, a5;
-    TCGv_vec v0, v1, v2;
+    TCGv_vec v0, v1, v2, t;
 
     va_start(va, a0);
     a1 = va_arg(va, TCGArg);
@@ -4601,6 +4609,18 @@ void tcg_expand_vec_op(TCGOpcode opc, TCGType type, unsigned vece,
     v1 = temp_tcgv_vec(arg_temp(a1));
 
     switch (opc) {
+    case INDEX_op_lookup_vec:
+        tcg_debug_assert(type == TCG_TYPE_V128 && vece == MO_8);
+        v2 = temp_tcgv_vec(arg_temp(a2));
+        t = tcg_temp_new_vec(type);
+        tcg_gen_cmp_vec(TCG_COND_GEU, MO_8, t, v2,
+                        tcg_constant_vec(type, MO_8, 16));
+        tcg_gen_or_vec(MO_8, t, v2, t);
+        vec_gen_3(INDEX_op_x86_pshufb_vec, type, MO_8,
+                  a0, a1, tcgv_vec_arg(t));
+        tcg_temp_free_vec(t);
+        break;
+
     case INDEX_op_shli_vec:
         expand_vec_shi(type, vece, false, v0, v1, a2);
         break;
