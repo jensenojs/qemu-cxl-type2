@@ -2514,6 +2514,9 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_xor_vec:
     case INDEX_op_cmp_vec:
         return has_type;
+    case INDEX_op_lookup_vec:
+        return has_type && type == TCG_TYPE_V128 && flags == MO_8 &&
+               tcg_can_emit_vec_op(op, type, flags);
     case INDEX_op_dup2_vec:
         return has_type && TCG_TARGET_REG_BITS == 32;
     case INDEX_op_not_vec:
