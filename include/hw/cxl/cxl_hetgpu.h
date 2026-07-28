@@ -270,6 +270,7 @@ typedef struct HetGPUState {
     /* Library handle for dynamic loading */
     void *hetgpu_lib;
     bool formal_case_strict;
+    bool detailed_logs;
     HetGPUKimiCaseBeginV1Fn kimi_case_begin_v1;
     HetGPUKimiCaseEndV1Fn kimi_case_end_v1;
 
@@ -343,6 +344,7 @@ int hetgpu_cuda_module_get_loading_mode(HetGPUState *state, int *mode);
 int hetgpu_cuda_mem_get_info(HetGPUState *state, size_t *free_bytes,
                              size_t *total_bytes);
 void hetgpu_cuda_trace_set_call_id(uint64_t call_id);
+void hetgpu_cuda_trace_set_detailed_logs(bool enabled);
 
 /* ========================================================================
  * Context Management

@@ -155,6 +155,7 @@ typedef int (*cuGetErrorName_fn)(int, const char **);
 
 static __thread uint64_t g_cuda_trace_call_id;
 static __thread uint32_t g_cuda_trace_occurrence;
+static __thread bool g_cuda_trace_detailed_logs;
 
 typedef struct CudaThreadBinding {
     void *context;
@@ -204,21 +205,30 @@ void hetgpu_cuda_trace_set_call_id(uint64_t call_id) {
   g_cuda_trace_occurrence = 0;
 }
 
+void hetgpu_cuda_trace_set_detailed_logs(bool enabled) {
+  g_cuda_trace_detailed_logs = enabled;
+}
+
 #define HETGPU_CUDA_CALL(field, ...)                                           \
   ({                                                                           \
     uint32_t _driver_occurrence = ++g_cuda_trace_occurrence;                   \
     int64_t _driver_start_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);             \
-    qemu_log("CXL TYPE2 TRACE driver_begin call_id=0x%016" PRIx64              \
-             " occurrence=%u symbol=%s host_ns=%" PRId64 "\n",                 \
-             g_cuda_trace_call_id, _driver_occurrence, #field,                 \
-             _driver_start_ns);                                                \
+    if (g_cuda_trace_detailed_logs) {                                          \
+      qemu_log("CXL TYPE2 TRACE driver_begin call_id=0x%016" PRIx64            \
+               " occurrence=%u symbol=%s host_ns=%" PRId64 "\n",               \
+               g_cuda_trace_call_id, _driver_occurrence, #field,               \
+               _driver_start_ns);                                              \
+    }                                                                          \
     int _driver_result = g_cuda_funcs.field(__VA_ARGS__);                      \
     int64_t _driver_end_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);               \
-    qemu_log("CXL TYPE2 TRACE driver_end call_id=0x%016" PRIx64                \
-             " occurrence=%u symbol=%s host_ns=%" PRId64                       \
-             " duration_ns=%" PRId64 " result=%d\n",                           \
-             g_cuda_trace_call_id, _driver_occurrence, #field, _driver_end_ns, \
-             _driver_end_ns - _driver_start_ns, _driver_result);               \
+    if (g_cuda_trace_detailed_logs) {                                          \
+      qemu_log("CXL TYPE2 TRACE driver_end call_id=0x%016" PRIx64              \
+               " occurrence=%u symbol=%s host_ns=%" PRId64                     \
+               " duration_ns=%" PRId64 " result=%d\n",                         \
+               g_cuda_trace_call_id, _driver_occurrence, #field,               \
+               _driver_end_ns, _driver_end_ns - _driver_start_ns,              \
+               _driver_result);                                                \
+    }                                                                          \
     _driver_result;                                                            \
   })
 
@@ -2136,11 +2146,14 @@ HetGPUError hetgpu_launch_kernel(HetGPUState *state, HetGPUFunction function,
             return HETGPU_ERROR_INVALID_CONTEXT;
         }
 
-        qemu_log("CXL hetGPU: [dev%d] Launching kernel grid=(%u,%u,%u) block=(%u,%u,%u) shared=%u\n",
-                 state->device_index,
-                 config->grid_dim[0], config->grid_dim[1], config->grid_dim[2],
-                 config->block_dim[0], config->block_dim[1], config->block_dim[2],
-                 config->shared_mem_bytes);
+        if (state->detailed_logs) {
+            qemu_log("CXL hetGPU: [dev%d] Launching kernel grid=(%u,%u,%u) "
+                     "block=(%u,%u,%u) shared=%u\n",
+                     state->device_index, config->grid_dim[0],
+                     config->grid_dim[1], config->grid_dim[2],
+                     config->block_dim[0], config->block_dim[1],
+                     config->block_dim[2], config->shared_mem_bytes);
+        }
 
         int err = HETGPU_CUDA_CALL(cuLaunchKernel,
             function,
