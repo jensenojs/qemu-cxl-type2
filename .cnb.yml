@@ -5,6 +5,8 @@
 
 .qemu-cxl-type2-component-tools: &qemu-cxl-type2-component-tools
   image: docker.cnb.cool/gevico.online/jensen/cxl-lab@sha256:17ed5b5fe2e57522ab61d253aaf1d28f4665cfb7ce8a1b5dfa7b73eefb261e12
+  volumes:
+    - qemu-cxl-type2-build-cache:/cache/qemu-cxl-type2/ccache:copy-on-write
 
 .qemu-cxl-type2-docker-service: &qemu-cxl-type2-docker-service
   - docker
@@ -27,6 +29,8 @@ $:
         cpus: 4
       docker: *qemu-cxl-type2-component-tools
       services: *qemu-cxl-type2-docker-service
+      env:
+        CCACHE_DIR: /cache/qemu-cxl-type2/ccache
       stages:
         - name: build and validate QEMU Type-2
           timeout: 12h

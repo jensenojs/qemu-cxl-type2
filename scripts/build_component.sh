@@ -6,6 +6,8 @@ readonly PROFILE=$ROOT/manifests/build-profile.json
 readonly WORK=$ROOT/.work/component
 readonly BUILD=$WORK/build
 readonly PAYLOAD=$WORK/payload
+: "${CCACHE_DIR:?CCACHE_DIR must name the CNB compiler-cache volume}"
+export CCACHE_BASEDIR=$ROOT
 
 [[ -z $(git -C "$ROOT" status --porcelain=v1 --untracked-files=all) ]] || {
     echo 'error: source checkout is dirty' >&2
@@ -34,11 +36,13 @@ rm -rf "$WORK"
 mkdir -p "$BUILD" "$PAYLOAD/bin" "$PAYLOAD/share/qemu" "$PAYLOAD/evidence/cuda-api" "$WORK/evidence"
 
 python3 "$ROOT/tests/test_component_artifact.py"
+ccache --show-stats | tee "$WORK/evidence/ccache-before.txt"
 (
     cd "$BUILD"
-    "$ROOT/configure" "${profile[@]:2}"
+    CC='ccache gcc' CXX='ccache g++' "$ROOT/configure" "${profile[@]:2}"
 )
 ninja -C "$BUILD" -j"$PARALLEL" qemu-system-x86_64
+ccache --show-stats | tee "$WORK/evidence/ccache-after.txt"
 
 readonly QEMU=$BUILD/qemu-system-x86_64
 [[ -x $QEMU ]]

@@ -5,6 +5,8 @@
 ```text
 verify_source_checkout.sh  验证superproject exact source与clean checkout
 build_component.sh         只恢复声明的hetGPU gitlink并构建qemu-system-x86_64
+
+CNB组件构建通过`CCACHE_DIR`消费本仓独立的编译缓存卷，QEMU configure接收由`ccache`包装的C/C++编译器并保存构建前后统计。build目录仍然每次删除重建；cache只减少重复编译，不改变source、gitlink、configure参数或artifact identity。
 component_artifact.py      生成/验证通用组件manifest与安全归档
 publish_component.sh       确定性归档并发布到本仓registry
 pull_component.sh          只按digest恢复并重复version/device/ELF检查；默认Docker，可显式选择Podman，不自动回退
