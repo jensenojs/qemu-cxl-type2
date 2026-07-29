@@ -76,6 +76,8 @@ typedef enum {
     HETGPU_KIMI_CASE_FAILED = 2,
 } HetGPUKimiCaseOutcome;
 
+#define HETGPU_KIMI_CASE_FLAG_CHECKPOINT_DISABLED (1U << 0)
+
 typedef struct HetGPUKimiCaseBeginV1 {
     uint32_t abi_version;
     uint32_t struct_size;

@@ -2941,11 +2941,13 @@ static uint64_t cxl_type2_paired_config_binding(
     g_autofree char *identity = g_strdup_printf(
         "kimi-case-config-v1\ncase=%u\nenabled=%u\nrestore=0\n"
         "min-allocation=%" PRIu64 "\nmax-regions=%" PRIu64
-        "\ncheckpoint-every=%" PRIu64 "\nlogs=%u\naof=%s\n"
+        "\ncheckpoint-enabled=%u\ncheckpoint-every=%" PRIu64
+        "\nlogs=%u\naof=%s\n"
         "restore-aof=%s\nmanifest=%s\n",
         case_kind, case_kind == CXL_GPU_CASE_CONCORDIA,
         ct2d->paired_case.min_allocation_bytes,
         ct2d->paired_case.max_regions,
+        ct2d->paired_case.checkpoint_enabled,
         ct2d->paired_case.checkpoint_every_launches,
         ct2d->paired_case.logs_enabled, aof_path, restore_path,
         manifest_path);
@@ -3089,6 +3091,9 @@ static void cxl_type2_paired_case_begin(CXLType2State *ct2d,
     input.max_regions = ct2d->paired_case.max_regions;
     input.checkpoint_every_launches =
         ct2d->paired_case.checkpoint_every_launches;
+    input.flags = ct2d->paired_case.checkpoint_enabled
+                      ? 0
+                      : HETGPU_KIMI_CASE_FLAG_CHECKPOINT_DISABLED;
     input.enabled = case_kind == CXL_GPU_CASE_CONCORDIA;
     input.logs_enabled = ct2d->paired_case.logs_enabled;
     hetgpu->detailed_logs = ct2d->paired_case.logs_enabled;
@@ -3252,11 +3257,11 @@ static void cxl_type2_paired_case_end(CXLType2State *ct2d,
 
     qemu_log("KIMI_CASE_END run_binding=%" PRIu64 " case=%s epoch=%" PRIu64
              " last_sequence=%" PRIu64 " app_exit=%d sync_status=%u"
-             " concordia_status=%u concordia_reason=%u reset_status=%u "
-             "detail=%.*s\n",
+             " concordia_status=%u concordia_reason=%u stateful_launches=%"
+             PRIu64 " reset_status=%u detail=%.*s\n",
              run_binding, cxl_type2_paired_case_name(case_kind), epoch,
              trace_sequence, application_exit, sync_error, result.outcome,
-             result.reason, reset_error,
+             result.reason, result.stateful_launches, reset_error,
              (int)MIN(result.error_len, HETGPU_KIMI_CASE_ERROR_BYTES),
              result.error);
 
@@ -6424,8 +6429,10 @@ static const Property cxl_type2_props[] = {
                        paired_case.max_regions, 128),
     DEFINE_PROP_UINT64("paired-kimi-checkpoint-every", CXLType2State,
                        paired_case.checkpoint_every_launches, 1),
+    DEFINE_PROP_BOOL("paired-kimi-checkpoint", CXLType2State,
+                     paired_case.checkpoint_enabled, false),
     DEFINE_PROP_BOOL("paired-kimi-logs", CXLType2State,
-                     paired_case.logs_enabled, true),
+                     paired_case.logs_enabled, false),
     DEFINE_PROP_BOOL("dcd", CXLType2State, dcd.enabled, false),
     DEFINE_PROP_SIZE("dcd-granularity", CXLType2State, dcd.granularity,
                      CXL_TYPE2_DCD_DEFAULT_GRANULARITY),

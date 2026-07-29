@@ -1259,8 +1259,10 @@ HetGPUError hetgpu_malloc(HetGPUState *state, size_t size,
         if (err == 0) {
             *dev_ptr = ptr;
             state->allocated_memory += size;
-            qemu_log("CXL hetGPU: [dev%d] Allocated %zu bytes at device ptr 0x%lx\n",
-                     state->device_index, size, (unsigned long)ptr);
+            if (state->detailed_logs) {
+                qemu_log("CXL hetGPU: [dev%d] Allocated %zu bytes at device ptr 0x%lx\n",
+                         state->device_index, size, (unsigned long)ptr);
+            }
             return HETGPU_SUCCESS;
         }
         const char *err_name = "UNKNOWN";
@@ -1292,8 +1294,10 @@ HetGPUError hetgpu_malloc(HetGPUState *state, size_t size,
         state->sim_next_ptr += (size + 0xFFF) & ~0xFFF;  /* Page align */
         state->allocated_memory += size;
 
-        qemu_log("CXL hetGPU: SIM allocated %zu bytes at 0x%lx -> host %p\n",
-                 size, (unsigned long)*dev_ptr, alloc->host_buffer);
+        if (state->detailed_logs) {
+            qemu_log("CXL hetGPU: SIM allocated %zu bytes at 0x%lx -> host %p\n",
+                     size, (unsigned long)*dev_ptr, alloc->host_buffer);
+        }
         return HETGPU_SUCCESS;
     }
 
@@ -1339,7 +1343,9 @@ HetGPUError hetgpu_free(HetGPUState *state, HetGPUDevicePtr dev_ptr)
                 } else {
                     state->sim_allocs = alloc->next;
                 }
-                qemu_log("CXL hetGPU: SIM freed 0x%lx\n", (unsigned long)dev_ptr);
+                if (state->detailed_logs) {
+                    qemu_log("CXL hetGPU: SIM freed 0x%lx\n", (unsigned long)dev_ptr);
+                }
                 g_free(alloc->host_buffer);
                 g_free(alloc);
                 return HETGPU_SUCCESS;
@@ -1418,8 +1424,10 @@ HetGPUError hetgpu_memcpy_htod(HetGPUState *state, HetGPUDevicePtr dst,
             size_t offset = dst - alloc->dev_ptr;
             if (offset + size <= alloc->size) {
                 memcpy((uint8_t *)alloc->host_buffer + offset, src, size);
-                qemu_log("CXL hetGPU: SIM memcpy HtoD 0x%lx <- %zu bytes\n",
-                         (unsigned long)dst, size);
+                if (state->detailed_logs) {
+                    qemu_log("CXL hetGPU: SIM memcpy HtoD 0x%lx <- %zu bytes\n",
+                             (unsigned long)dst, size);
+                }
                 return HETGPU_SUCCESS;
             }
         }
@@ -1510,8 +1518,10 @@ HetGPUError hetgpu_memcpy_dtoh(HetGPUState *state, void *dst,
             size_t offset = src - alloc->dev_ptr;
             if (offset + size <= alloc->size) {
                 memcpy(dst, (uint8_t *)alloc->host_buffer + offset, size);
-                qemu_log("CXL hetGPU: SIM memcpy DtoH 0x%lx -> %zu bytes\n",
-                         (unsigned long)src, size);
+                if (state->detailed_logs) {
+                    qemu_log("CXL hetGPU: SIM memcpy DtoH 0x%lx -> %zu bytes\n",
+                             (unsigned long)src, size);
+                }
                 return HETGPU_SUCCESS;
             }
         }
@@ -1564,8 +1574,10 @@ HetGPUError hetgpu_memcpy_dtod(HetGPUState *state, HetGPUDevicePtr dst,
                 dst_offset + size <= dst_alloc->size) {
                 memcpy((uint8_t *)dst_alloc->host_buffer + dst_offset,
                        (uint8_t *)src_alloc->host_buffer + src_offset, size);
-                qemu_log("CXL hetGPU: SIM memcpy DtoD 0x%lx -> 0x%lx (%zu bytes)\n",
-                         (unsigned long)src, (unsigned long)dst, size);
+                if (state->detailed_logs) {
+                    qemu_log("CXL hetGPU: SIM memcpy DtoD 0x%lx -> 0x%lx (%zu bytes)\n",
+                             (unsigned long)src, (unsigned long)dst, size);
+                }
                 return HETGPU_SUCCESS;
             }
         }
@@ -1744,8 +1756,10 @@ HetGPUError hetgpu_load_ptx(HetGPUState *state, const char *ptx_source,
 
         if (err == 0) {
             *module = mod;
-            qemu_log("CXL hetGPU: [dev%d] Loaded PTX module %p\n",
-                     state->device_index, mod);
+            if (state->detailed_logs) {
+                qemu_log("CXL hetGPU: [dev%d] Loaded PTX module %p\n",
+                         state->device_index, mod);
+            }
             return HETGPU_SUCCESS;
         }
         const char *err_name = "UNKNOWN";
@@ -1785,8 +1799,10 @@ HetGPUError hetgpu_load_cubin(HetGPUState *state, const void *cubin_data,
 
         if (err == 0) {
             *module = mod;
-            qemu_log("CXL hetGPU: [dev%d] Loaded CUBIN module %p\n",
-                     state->device_index, mod);
+            if (state->detailed_logs) {
+                qemu_log("CXL hetGPU: [dev%d] Loaded CUBIN module %p\n",
+                         state->device_index, mod);
+            }
             return HETGPU_SUCCESS;
         }
         const char *err_name = "UNKNOWN";
@@ -1864,8 +1880,10 @@ HetGPUError hetgpu_get_function(HetGPUState *state, HetGPUModule module,
 
         if (err == 0) {
             *function = func;
-            qemu_log("CXL hetGPU: [dev%d] Got function '%s' -> %p\n",
-                     state->device_index, name, func);
+            if (state->detailed_logs) {
+                qemu_log("CXL hetGPU: [dev%d] Got function '%s' -> %p\n",
+                         state->device_index, name, func);
+            }
             return HETGPU_SUCCESS;
         }
         const char *err_name = "UNKNOWN";
@@ -1905,8 +1923,10 @@ HetGPUError hetgpu_get_global(HetGPUState *state, HetGPUModule module,
         if (err == 0) {
             *dev_ptr = ptr;
             *size = bytes;
-            qemu_log("CXL hetGPU: [dev%d] Got global '%s' -> 0x%" PRIx64 " size=%zu\n",
-                     state->device_index, name, ptr, bytes);
+            if (state->detailed_logs) {
+                qemu_log("CXL hetGPU: [dev%d] Got global '%s' -> 0x%" PRIx64 " size=%zu\n",
+                         state->device_index, name, ptr, bytes);
+            }
             return HETGPU_SUCCESS;
         }
 
@@ -2103,9 +2123,11 @@ HetGPUError hetgpu_get_max_active_blocks_per_multiprocessor(HetGPUState *state,
             num_blocks, function, block_size, dynamic_smem_size, flags);
         cuda_unlock(state);
 
-        qemu_log("CXL hetGPU: occupancy function=%p block_size=%d dynamic_smem_size=%zu "
-                 "flags=%u driver_result=%d num_blocks=%d\n",
-                 function, block_size, dynamic_smem_size, flags, err, *num_blocks);
+        if (state->detailed_logs) {
+            qemu_log("CXL hetGPU: occupancy function=%p block_size=%d dynamic_smem_size=%zu "
+                     "flags=%u driver_result=%d num_blocks=%d\n",
+                     function, block_size, dynamic_smem_size, flags, err, *num_blocks);
+        }
 
         switch (err) {
         case 0:
@@ -2176,9 +2198,11 @@ HetGPUError hetgpu_launch_kernel(HetGPUState *state, HetGPUFunction function,
     }
 
     if (state->backend == HETGPU_BACKEND_SIMULATION) {
-        qemu_log("CXL hetGPU: Simulated kernel launch grid=(%u,%u,%u) block=(%u,%u,%u)\n",
-                 config->grid_dim[0], config->grid_dim[1], config->grid_dim[2],
-                 config->block_dim[0], config->block_dim[1], config->block_dim[2]);
+        if (state->detailed_logs) {
+            qemu_log("CXL hetGPU: Simulated kernel launch grid=(%u,%u,%u) block=(%u,%u,%u)\n",
+                     config->grid_dim[0], config->grid_dim[1], config->grid_dim[2],
+                     config->block_dim[0], config->block_dim[1], config->block_dim[2]);
+        }
         return HETGPU_SUCCESS;
     }
 

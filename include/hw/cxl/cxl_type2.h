@@ -292,6 +292,7 @@ typedef struct CXLType2State {
         uint64_t min_allocation_bytes;
         uint64_t max_regions;
         uint64_t checkpoint_every_launches;
+        bool checkpoint_enabled;
         bool logs_enabled;
         uint64_t next_epoch;
         bool failed;
