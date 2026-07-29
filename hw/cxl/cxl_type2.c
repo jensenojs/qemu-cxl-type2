@@ -2610,32 +2610,34 @@ static int cxl_type2_release_pending_htod(CXLType2State *ct2d,
 
         ct2d->htod_pending_copies--;
         ct2d->htod_pending_bytes -= pending->staging_capacity;
-        qemu_log("CXL TYPE2 TRACE copy_completion original_call_id=0x%016"
-                 PRIx64 " completion_call_id=0x%016" PRIx64
-                 " direction=htod sequence=%" PRIu64 " bytes=%zu"
-                 " staging_id=%" PRIu64 " capacity_bytes=%zu"
-                 " completion=%s lifetime_ns=%" PRId64
-                 " disposition=%s release_duration_ns=%" PRId64
-                 " free_result=%d pending_copies=%" PRIu64
-                 " pending_bytes=%" PRIu64 " peak_pending_copies=%" PRIu64
-                 " peak_pending_bytes=%" PRIu64 " pooled_buffers=%" PRIu64
-                 " pooled_bytes=%" PRIu64 " peak_pooled_bytes=%" PRIu64
-                 " pool_hits=%" PRIu64 " pool_misses=%" PRIu64
-                 " driver_allocations=%" PRIu64 " driver_frees=%" PRIu64
-                 " evictions=%" PRIu64 "\n",
-                 pending->call_id, ct2d->gpu_cmd.call_id,
-                 pending->sequence, pending->size, pending->staging_id,
-                 pending->staging_capacity, completion,
-                 qemu_clock_get_ns(QEMU_CLOCK_HOST) -
-                     pending->enqueue_host_ns,
-                 pooled ? "pool" : "driver-free", release_duration_ns,
-                 result, ct2d->htod_pending_copies,
-                 ct2d->htod_pending_bytes, ct2d->htod_peak_pending_copies,
-                 ct2d->htod_peak_pending_bytes, ct2d->htod_pooled_buffers,
-                 ct2d->htod_pooled_bytes, ct2d->htod_peak_pooled_bytes,
-                 ct2d->htod_pool_hits, ct2d->htod_pool_misses,
-                 ct2d->htod_driver_allocations, ct2d->htod_driver_frees,
-                 ct2d->htod_pool_evictions);
+        if (ct2d->paired_case.logs_enabled) {
+            qemu_log("CXL TYPE2 TRACE copy_completion original_call_id=0x%016"
+                     PRIx64 " completion_call_id=0x%016" PRIx64
+                     " direction=htod sequence=%" PRIu64 " bytes=%zu"
+                     " staging_id=%" PRIu64 " capacity_bytes=%zu"
+                     " completion=%s lifetime_ns=%" PRId64
+                     " disposition=%s release_duration_ns=%" PRId64
+                     " free_result=%d pending_copies=%" PRIu64
+                     " pending_bytes=%" PRIu64 " peak_pending_copies=%" PRIu64
+                     " peak_pending_bytes=%" PRIu64 " pooled_buffers=%" PRIu64
+                     " pooled_bytes=%" PRIu64 " peak_pooled_bytes=%" PRIu64
+                     " pool_hits=%" PRIu64 " pool_misses=%" PRIu64
+                     " driver_allocations=%" PRIu64 " driver_frees=%" PRIu64
+                     " evictions=%" PRIu64 "\n",
+                     pending->call_id, ct2d->gpu_cmd.call_id,
+                     pending->sequence, pending->size, pending->staging_id,
+                     pending->staging_capacity, completion,
+                     qemu_clock_get_ns(QEMU_CLOCK_HOST) -
+                         pending->enqueue_host_ns,
+                     pooled ? "pool" : "driver-free", release_duration_ns,
+                     result, ct2d->htod_pending_copies,
+                     ct2d->htod_pending_bytes, ct2d->htod_peak_pending_copies,
+                     ct2d->htod_peak_pending_bytes, ct2d->htod_pooled_buffers,
+                     ct2d->htod_pooled_bytes, ct2d->htod_peak_pooled_bytes,
+                     ct2d->htod_pool_hits, ct2d->htod_pool_misses,
+                     ct2d->htod_driver_allocations, ct2d->htod_driver_frees,
+                     ct2d->htod_pool_evictions);
+        }
         if (first_error == CXL_GPU_SUCCESS && result != CXL_GPU_SUCCESS) {
             first_error = result;
         }
