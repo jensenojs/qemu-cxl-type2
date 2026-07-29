@@ -3191,6 +3191,7 @@ static void cxl_type2_paired_case_end(CXLType2State *ct2d,
     HetGPUError reset_error;
     int pool_clear_result;
     bool result_valid;
+    bool case_success;
 
     memset(ct2d->gpu_cmd.results, 0, sizeof(ct2d->gpu_cmd.results));
     if (!ct2d->paired_case.required) {
@@ -3235,20 +3236,34 @@ static void cxl_type2_paired_case_end(CXLType2State *ct2d,
     cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
                                   "concordia_case_end", "end", concordia_error,
                                   true);
-    cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
-                                  "formal_backend_cleanup", "begin", 0, false);
-    reset_error = hetgpu_cleanup_formal(hetgpu);
-    cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
-                                  "formal_backend_cleanup", "end", reset_error,
-                                  true);
     result_valid = result.abi_version == HETGPU_KIMI_CASE_ABI_VERSION &&
                    result.struct_size == sizeof(result) &&
                    result.outcome == HETGPU_KIMI_CASE_SUCCEEDED &&
                    result.case_kind == case_kind && result.epoch == epoch &&
                    result.run_binding == run_binding &&
                    result.config_binding == input.config_binding;
+    case_success = application_exit == 0 && sync_error == HETGPU_SUCCESS &&
+                   concordia_error == HETGPU_SUCCESS && result_valid;
+    if (case_success) {
+        /* Keep READY visible so the next guest can submit CASE_BEGIN. */
+        cxl_type2_log_kimi_case_stage(
+            run_binding, case_kind, epoch, "formal_backend_cleanup", "begin",
+            0, false);
+        cxl_type2_log_kimi_case_stage(
+            run_binding, case_kind, epoch, "formal_backend_cleanup", "end", 0,
+            false);
+        reset_error = HETGPU_SUCCESS;
+    } else {
+        cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
+                                      "formal_backend_cleanup", "begin", 0,
+                                      false);
+        reset_error = hetgpu_cleanup_formal(hetgpu);
+        cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
+                                      "formal_backend_cleanup", "end",
+                                      reset_error, true);
+        ct2d->gpu_info.passthrough_enabled = false;
+    }
     (void)cxl_type2_clear_gpu_handles(ct2d, run_binding, case_kind, epoch);
-    ct2d->gpu_info.passthrough_enabled = false;
 
     ct2d->gpu_cmd.results[0] = epoch;
     ct2d->gpu_cmd.results[1] = trace_sequence;
