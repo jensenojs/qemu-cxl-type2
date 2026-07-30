@@ -6293,9 +6293,13 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
         }
         if (ct2d->paired_case.min_allocation_bytes < 4096 ||
             ct2d->paired_case.max_regions == 0 ||
-            ct2d->paired_case.checkpoint_every_launches == 0) {
-            error_setg(errp, "paired case Concordia limits must be nonzero "
-                       "and min allocation at least 4096 bytes");
+            (ct2d->paired_case.checkpoint_enabled &&
+             ct2d->paired_case.checkpoint_every_launches == 0) ||
+            (!ct2d->paired_case.checkpoint_enabled &&
+             ct2d->paired_case.checkpoint_every_launches != 0)) {
+            error_setg(errp, "paired case Concordia limits require a positive "
+                       "checkpoint interval when enabled and zero when disabled; "
+                       "min allocation must be at least 4096 bytes");
             return;
         }
         ct2d->paired_case.next_epoch = 1;
@@ -6576,7 +6580,7 @@ static const Property cxl_type2_props[] = {
     DEFINE_PROP_UINT64("paired-kimi-max-regions", CXLType2State,
                        paired_case.max_regions, 128),
     DEFINE_PROP_UINT64("paired-kimi-checkpoint-every", CXLType2State,
-                       paired_case.checkpoint_every_launches, 1),
+                       paired_case.checkpoint_every_launches, 0),
     DEFINE_PROP_BOOL("paired-kimi-checkpoint", CXLType2State,
                      paired_case.checkpoint_enabled, false),
     DEFINE_PROP_BOOL("paired-kimi-qemu-cuda-calls", CXLType2State,
