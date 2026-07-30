@@ -309,6 +309,14 @@ typedef struct CXLType2State {
         int64_t active_last_command_host_ns;
         uint64_t active_command_calls[256];
         uint64_t active_command_busy_ns_by_command[256];
+        uint64_t active_cxl_request_count;
+        uint64_t active_cxl_read_count;
+        uint64_t active_cxl_write_count;
+        uint64_t active_cxl_logical_bytes;
+        uint64_t active_cxl_qemu_wall_ns;
+        uint64_t active_cxl_response_count;
+        uint64_t active_cxl_request_failures;
+        uint64_t active_cxl_server_reported_latency_ns;
     } paired_case;
 
     /* Bulk transfer region for large memory operations */

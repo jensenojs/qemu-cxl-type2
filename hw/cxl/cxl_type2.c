@@ -1451,6 +1451,42 @@ static bool cxl_type2_memsim_read_response(CXLType2State *ct2d,
     return true;
 }
 
+static void cxl_type2_record_memsim_request(CXLType2State *ct2d,
+                                             uint8_t op_type,
+                                             uint64_t logical_bytes,
+                                             int64_t begin_host_ns,
+                                             int64_t end_host_ns,
+                                             bool response_received,
+                                             const CXLMemSimResponse *response)
+{
+    uint64_t qemu_wall_ns = end_host_ns >= begin_host_ns
+                                ? (uint64_t)(end_host_ns - begin_host_ns)
+                                : 0;
+
+    if (ct2d->paired_case.active_case == CXL_GPU_CASE_NONE) {
+        return;
+    }
+
+    ct2d->paired_case.active_cxl_request_count++;
+    if (op_type == CXL_OP_READ) {
+        ct2d->paired_case.active_cxl_read_count++;
+    } else if (op_type == CXL_OP_WRITE) {
+        ct2d->paired_case.active_cxl_write_count++;
+    }
+    ct2d->paired_case.active_cxl_logical_bytes += logical_bytes;
+    ct2d->paired_case.active_cxl_qemu_wall_ns += qemu_wall_ns;
+    if (response_received && response) {
+        ct2d->paired_case.active_cxl_response_count++;
+        ct2d->paired_case.active_cxl_server_reported_latency_ns +=
+            response->latency_ns;
+        if (response->status != 0) {
+            ct2d->paired_case.active_cxl_request_failures++;
+        }
+    } else {
+        ct2d->paired_case.active_cxl_request_failures++;
+    }
+}
+
 static bool cxl_type2_memsim_request_ext(CXLType2State *ct2d, uint8_t op_type,
                                          uint64_t addr, uint64_t size,
                                          const uint8_t *data, uint64_t value,
@@ -1461,6 +1497,10 @@ static bool cxl_type2_memsim_request_ext(CXLType2State *ct2d, uint8_t op_type,
     CXLMemSimResponse local_resp;
     Error *err = NULL;
     bool ok = false;
+    bool request_sent = false;
+    bool response_received = false;
+    int64_t request_begin_host_ns = 0;
+    int64_t request_end_host_ns = 0;
 
     if (!ct2d->memsim.connected || ct2d->memsim.use_shm) {
         return false;
@@ -1483,6 +1523,7 @@ static bool cxl_type2_memsim_request_ext(CXLType2State *ct2d, uint8_t op_type,
         goto out;
     }
 
+    request_begin_host_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
     if (qio_channel_write_all(QIO_CHANNEL(ct2d->memsim.socket),
                               (const char *)&req, sizeof(req), &err) < 0) {
         error_report("CXL Type2: Failed to send request to CXLMemSim: %s",
@@ -1491,6 +1532,7 @@ static bool cxl_type2_memsim_request_ext(CXLType2State *ct2d, uint8_t op_type,
         cxlmemsim_drop_locked(ct2d);
         goto out;
     }
+    request_sent = true;
 
     if (!cxl_type2_memsim_read_response(ct2d, &req, &local_resp, &err)) {
         error_report("CXL Type2: Failed to receive response from CXLMemSim: %s",
@@ -1499,6 +1541,8 @@ static bool cxl_type2_memsim_request_ext(CXLType2State *ct2d, uint8_t op_type,
         cxlmemsim_drop_locked(ct2d);
         goto out;
     }
+    response_received = true;
+    request_end_host_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
 
     if (resp) {
         *resp = local_resp;
@@ -1506,6 +1550,14 @@ static bool cxl_type2_memsim_request_ext(CXLType2State *ct2d, uint8_t op_type,
     ok = local_resp.status == 0;
 
 out:
+    if (request_sent) {
+        if (request_end_host_ns == 0) {
+            request_end_host_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+        }
+        cxl_type2_record_memsim_request(
+            ct2d, op_type, size, request_begin_host_ns, request_end_host_ns,
+            response_received, response_received ? &local_resp : NULL);
+    }
     qemu_mutex_unlock(&ct2d->memsim.lock);
     return ok;
 }
@@ -2403,6 +2455,14 @@ static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
            sizeof(ct2d->paired_case.active_command_calls));
     memset(ct2d->paired_case.active_command_busy_ns_by_command, 0,
            sizeof(ct2d->paired_case.active_command_busy_ns_by_command));
+    ct2d->paired_case.active_cxl_request_count = 0;
+    ct2d->paired_case.active_cxl_read_count = 0;
+    ct2d->paired_case.active_cxl_write_count = 0;
+    ct2d->paired_case.active_cxl_logical_bytes = 0;
+    ct2d->paired_case.active_cxl_qemu_wall_ns = 0;
+    ct2d->paired_case.active_cxl_response_count = 0;
+    ct2d->paired_case.active_cxl_request_failures = 0;
+    ct2d->paired_case.active_cxl_server_reported_latency_ns = 0;
 }
 
 static void cxl_type2_record_case_command(CXLType2State *ct2d,
@@ -2462,6 +2522,23 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
              busy[CXL_GPU_CMD_MEM_COPY_HTOD_ASYNC],
              calls[CXL_GPU_CMD_MEM_COPY_DTOH], busy[CXL_GPU_CMD_MEM_COPY_DTOH],
              calls[CXL_GPU_CMD_STREAM_SYNC], busy[CXL_GPU_CMD_STREAM_SYNC]);
+
+    qemu_log("KIMI_CXL_REQUEST_SUMMARY run_binding=%" PRIu64
+             " case=%s epoch=%" PRIu64
+             " request_count=%" PRIu64 " read_count=%" PRIu64
+             " write_count=%" PRIu64 " logical_bytes=%" PRIu64
+             " qemu_wall_ns=%" PRIu64 " response_count=%" PRIu64
+             " request_failures=%" PRIu64
+             " server_reported_latency_ns=%" PRIu64 "\n",
+             run_binding, cxl_type2_paired_case_name(case_kind), epoch,
+             ct2d->paired_case.active_cxl_request_count,
+             ct2d->paired_case.active_cxl_read_count,
+             ct2d->paired_case.active_cxl_write_count,
+             ct2d->paired_case.active_cxl_logical_bytes,
+             ct2d->paired_case.active_cxl_qemu_wall_ns,
+             ct2d->paired_case.active_cxl_response_count,
+             ct2d->paired_case.active_cxl_request_failures,
+             ct2d->paired_case.active_cxl_server_reported_latency_ns);
 }
 
 static void cxl_type2_log_kimi_case_stage(uint64_t run_binding,
