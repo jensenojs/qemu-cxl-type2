@@ -302,6 +302,13 @@ typedef struct CXLType2State {
         uint64_t active_epoch;
         uint64_t active_first_sequence;
         uint64_t active_config_binding;
+        uint64_t active_command_count;
+        uint64_t active_command_failures;
+        uint64_t active_command_busy_ns;
+        int64_t active_first_command_host_ns;
+        int64_t active_last_command_host_ns;
+        uint64_t active_command_calls[256];
+        uint64_t active_command_busy_ns_by_command[256];
     } paired_case;
 
     /* Bulk transfer region for large memory operations */

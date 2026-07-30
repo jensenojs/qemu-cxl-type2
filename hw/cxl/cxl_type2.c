@@ -2392,6 +2392,78 @@ static const char *cxl_type2_paired_case_name(uint32_t case_kind)
     }
 }
 
+static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
+{
+    ct2d->paired_case.active_command_count = 0;
+    ct2d->paired_case.active_command_failures = 0;
+    ct2d->paired_case.active_command_busy_ns = 0;
+    ct2d->paired_case.active_first_command_host_ns = 0;
+    ct2d->paired_case.active_last_command_host_ns = 0;
+    memset(ct2d->paired_case.active_command_calls, 0,
+           sizeof(ct2d->paired_case.active_command_calls));
+    memset(ct2d->paired_case.active_command_busy_ns_by_command, 0,
+           sizeof(ct2d->paired_case.active_command_busy_ns_by_command));
+}
+
+static void cxl_type2_record_case_command(CXLType2State *ct2d,
+                                          uint32_t command,
+                                          int64_t begin_host_ns,
+                                          int64_t end_host_ns,
+                                          uint32_t result)
+{
+    uint64_t duration_ns;
+
+    if (ct2d->paired_case.active_case == CXL_GPU_CASE_NONE ||
+        command >= G_N_ELEMENTS(ct2d->paired_case.active_command_calls)) {
+        return;
+    }
+
+    duration_ns = end_host_ns >= begin_host_ns
+                      ? (uint64_t)(end_host_ns - begin_host_ns)
+                      : 0;
+    ct2d->paired_case.active_command_count++;
+    ct2d->paired_case.active_command_failures += result != CXL_GPU_SUCCESS;
+    ct2d->paired_case.active_command_busy_ns += duration_ns;
+    if (ct2d->paired_case.active_first_command_host_ns == 0) {
+        ct2d->paired_case.active_first_command_host_ns = begin_host_ns;
+    }
+    ct2d->paired_case.active_last_command_host_ns = end_host_ns;
+    ct2d->paired_case.active_command_calls[command]++;
+    ct2d->paired_case.active_command_busy_ns_by_command[command] += duration_ns;
+}
+
+static void cxl_type2_log_case_summary(CXLType2State *ct2d,
+                                       uint64_t run_binding,
+                                       uint32_t case_kind,
+                                       uint64_t epoch)
+{
+    uint64_t *calls = ct2d->paired_case.active_command_calls;
+    uint64_t *busy = ct2d->paired_case.active_command_busy_ns_by_command;
+    uint64_t host_window_ns =
+        ct2d->paired_case.active_last_command_host_ns >=
+        ct2d->paired_case.active_first_command_host_ns
+            ? (uint64_t)(ct2d->paired_case.active_last_command_host_ns -
+                         ct2d->paired_case.active_first_command_host_ns)
+            : 0;
+
+    qemu_log("KIMI_CASE_SUMMARY run_binding=%" PRIu64 " case=%s epoch=%" PRIu64
+             " commands=%" PRIu64 " failures=%" PRIu64
+             " busy_ns=%" PRIu64 " host_window_ns=%" PRIu64
+             " launch_calls=%" PRIu64 " launch_busy_ns=%" PRIu64
+             " htod_async_calls=%" PRIu64 " htod_async_busy_ns=%" PRIu64
+             " dtoh_calls=%" PRIu64 " dtoh_busy_ns=%" PRIu64
+             " stream_sync_calls=%" PRIu64 " stream_sync_busy_ns=%" PRIu64 "\n",
+             run_binding, cxl_type2_paired_case_name(case_kind), epoch,
+             ct2d->paired_case.active_command_count,
+             ct2d->paired_case.active_command_failures,
+             ct2d->paired_case.active_command_busy_ns, host_window_ns,
+             calls[CXL_GPU_CMD_LAUNCH_KERNEL], busy[CXL_GPU_CMD_LAUNCH_KERNEL],
+             calls[CXL_GPU_CMD_MEM_COPY_HTOD_ASYNC],
+             busy[CXL_GPU_CMD_MEM_COPY_HTOD_ASYNC],
+             calls[CXL_GPU_CMD_MEM_COPY_DTOH], busy[CXL_GPU_CMD_MEM_COPY_DTOH],
+             calls[CXL_GPU_CMD_STREAM_SYNC], busy[CXL_GPU_CMD_STREAM_SYNC]);
+}
+
 static void cxl_type2_log_kimi_case_stage(uint64_t run_binding,
                                           uint32_t case_kind, uint64_t epoch,
                                           const char *operation,
@@ -3280,6 +3352,7 @@ static void cxl_type2_paired_case_begin(CXLType2State *ct2d,
     ct2d->paired_case.active_epoch = epoch;
     ct2d->paired_case.active_first_sequence = trace_sequence;
     ct2d->paired_case.active_config_binding = config_binding;
+    cxl_type2_reset_case_summary(ct2d);
     ct2d->paired_case.next_epoch++;
     ct2d->gpu_cmd.results[0] = epoch;
     ct2d->gpu_cmd.results[1] = case_kind;
@@ -3399,6 +3472,8 @@ static void cxl_type2_paired_case_end(CXLType2State *ct2d,
              result.reason, result.stateful_launches, reset_error,
              (int)MIN(result.error_len, HETGPU_KIMI_CASE_ERROR_BYTES),
              result.error);
+
+    cxl_type2_log_case_summary(ct2d, run_binding, case_kind, epoch);
 
     cxl_type2_log_kimi_case_stage(
         run_binding, case_kind, epoch, "case_end", "end",
@@ -5968,6 +6043,10 @@ complete:
     ct2d->gpu_cmd.cmd_status = CXL_GPU_CMD_STATUS_COMPLETE;
     int64_t trace_end_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
     int64_t trace_duration_ns = trace_end_ns - trace_start_ns;
+    if (cmd != CXL_GPU_CMD_CASE_BEGIN && cmd != CXL_GPU_CMD_CASE_END) {
+        cxl_type2_record_case_command(ct2d, cmd, trace_start_ns,
+                                      trace_end_ns, ct2d->gpu_cmd.cmd_result);
+    }
     if (ct2d->paired_case.qemu_cuda_calls_enabled) qemu_log("CXL TYPE2 TRACE cmd_end seq=%" PRIu64
              " call_id=0x%016" PRIx64
              " cmd=0x%x host_ns=%" PRId64 " result=%u duration_ns=%" PRId64
