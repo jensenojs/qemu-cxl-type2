@@ -537,19 +537,19 @@ static HetGPUError hetgpu_init_internal(HetGPUState *state,
     state->hetgpu_lib = g_cuda_lib_handle;
     state->driver_version = g_cuda_driver_version;
     if (state->hetgpu_lib) {
-        state->kimi_case_begin_v1 = dlsym(state->hetgpu_lib,
-                                          "hetgpu_kimi_case_begin_v1");
-        state->kimi_case_end_v1 = dlsym(state->hetgpu_lib,
-                                        "hetgpu_kimi_case_end_v1");
+        state->kimi_case_begin_v2 = dlsym(state->hetgpu_lib,
+                                          "hetgpu_kimi_case_begin_v2");
+        state->kimi_case_end_v2 = dlsym(state->hetgpu_lib,
+                                        "hetgpu_kimi_case_end_v2");
     }
 
     qemu_mutex_unlock(&g_cuda_mutex);
 
     if (formal_case_strict &&
-        (!state->kimi_case_begin_v1 || !state->kimi_case_end_v1)) {
+        (!state->kimi_case_begin_v2 || !state->kimi_case_end_v2)) {
         qemu_log("CXL hetGPU: formal Kimi case symbols are missing "
                  "begin=%p end=%p\n",
-                 state->kimi_case_begin_v1, state->kimi_case_end_v1);
+                 state->kimi_case_begin_v2, state->kimi_case_end_v2);
         goto simulation_fallback;
     }
 
@@ -746,26 +746,26 @@ HetGPUError hetgpu_reset_formal(HetGPUState *state, HetGPUBackendType backend,
 }
 
 HetGPUError hetgpu_kimi_case_begin(HetGPUState *state,
-                                   const HetGPUKimiCaseBeginV1 *input,
+                                   const HetGPUKimiCaseBeginV2 *input,
                                    HetGPUKimiCaseResultV1 *result)
 {
     if (!state || !state->initialized || !state->formal_case_strict ||
-        !state->kimi_case_begin_v1 || !input || !result) {
+        !state->kimi_case_begin_v2 || !input || !result) {
         return HETGPU_ERROR_NOT_INITIALIZED;
     }
-    return state->kimi_case_begin_v1(input, result) == 0 ?
+    return state->kimi_case_begin_v2(input, result) == 0 ?
            HETGPU_SUCCESS : HETGPU_ERROR_UNKNOWN;
 }
 
 HetGPUError hetgpu_kimi_case_end(HetGPUState *state,
-                                 const HetGPUKimiCaseEndV1 *input,
+                                 const HetGPUKimiCaseEndV2 *input,
                                  HetGPUKimiCaseResultV1 *result)
 {
     if (!state || !state->initialized || !state->formal_case_strict ||
-        !state->kimi_case_end_v1 || !input || !result) {
+        !state->kimi_case_end_v2 || !input || !result) {
         return HETGPU_ERROR_NOT_INITIALIZED;
     }
-    return state->kimi_case_end_v1(input, result) == 0 ?
+    return state->kimi_case_end_v2(input, result) == 0 ?
            HETGPU_SUCCESS : HETGPU_ERROR_UNKNOWN;
 }
 

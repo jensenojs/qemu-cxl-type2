@@ -62,7 +62,7 @@ typedef enum {
     HETGPU_ERROR_UNKNOWN = 255,
 } HetGPUError;
 
-#define HETGPU_KIMI_CASE_ABI_VERSION 1U
+#define HETGPU_KIMI_CASE_ABI_VERSION 2U
 #define HETGPU_KIMI_CASE_ERROR_BYTES 256U
 
 typedef enum {
@@ -78,7 +78,7 @@ typedef enum {
 
 #define HETGPU_KIMI_CASE_FLAG_CHECKPOINT_DISABLED (1U << 0)
 
-typedef struct HetGPUKimiCaseBeginV1 {
+typedef struct HetGPUKimiCaseBeginV2 {
     uint32_t abi_version;
     uint32_t struct_size;
     uint32_t case_kind;
@@ -91,7 +91,7 @@ typedef struct HetGPUKimiCaseBeginV1 {
     uint64_t checkpoint_every_launches;
     uint32_t enabled;
     uint32_t restore_enabled;
-    uint32_t logs_enabled;
+    uint32_t runtime_details_enabled;
     uint32_t reserved;
     const uint8_t *aof_path;
     uint32_t aof_path_len;
@@ -99,9 +99,9 @@ typedef struct HetGPUKimiCaseBeginV1 {
     uint32_t restore_aof_path_len;
     const uint8_t *manifest_path;
     uint32_t manifest_path_len;
-} HetGPUKimiCaseBeginV1;
+} HetGPUKimiCaseBeginV2;
 
-typedef struct HetGPUKimiCaseEndV1 {
+typedef struct HetGPUKimiCaseEndV2 {
     uint32_t abi_version;
     uint32_t struct_size;
     uint32_t flags;
@@ -111,7 +111,7 @@ typedef struct HetGPUKimiCaseEndV1 {
     uint64_t config_binding;
     int32_t application_exit;
     uint32_t reserved2;
-} HetGPUKimiCaseEndV1;
+} HetGPUKimiCaseEndV2;
 
 typedef struct HetGPUKimiCaseResultV1 {
     uint32_t abi_version;
@@ -129,14 +129,14 @@ typedef struct HetGPUKimiCaseResultV1 {
     uint8_t error[HETGPU_KIMI_CASE_ERROR_BYTES];
 } HetGPUKimiCaseResultV1;
 
-typedef int (*HetGPUKimiCaseBeginV1Fn)(
-    const HetGPUKimiCaseBeginV1 *, HetGPUKimiCaseResultV1 *);
-typedef int (*HetGPUKimiCaseEndV1Fn)(
-    const HetGPUKimiCaseEndV1 *, HetGPUKimiCaseResultV1 *);
+typedef int (*HetGPUKimiCaseBeginV2Fn)(
+    const HetGPUKimiCaseBeginV2 *, HetGPUKimiCaseResultV1 *);
+typedef int (*HetGPUKimiCaseEndV2Fn)(
+    const HetGPUKimiCaseEndV2 *, HetGPUKimiCaseResultV1 *);
 
-_Static_assert(sizeof(HetGPUKimiCaseBeginV1) == 128,
+_Static_assert(sizeof(HetGPUKimiCaseBeginV2) == 128,
                "Concordia Kimi begin ABI size changed");
-_Static_assert(sizeof(HetGPUKimiCaseEndV1) == 48,
+_Static_assert(sizeof(HetGPUKimiCaseEndV2) == 48,
                "Concordia Kimi end ABI size changed");
 _Static_assert(sizeof(HetGPUKimiCaseResultV1) == 328,
                "Concordia Kimi result ABI size changed");
@@ -273,8 +273,8 @@ typedef struct HetGPUState {
     void *hetgpu_lib;
     bool formal_case_strict;
     bool detailed_logs;
-    HetGPUKimiCaseBeginV1Fn kimi_case_begin_v1;
-    HetGPUKimiCaseEndV1Fn kimi_case_end_v1;
+    HetGPUKimiCaseBeginV2Fn kimi_case_begin_v2;
+    HetGPUKimiCaseEndV2Fn kimi_case_end_v2;
 
     /* Statistics */
     uint64_t kernel_launches;
@@ -302,10 +302,10 @@ HetGPUError hetgpu_init_formal(HetGPUState *state, HetGPUBackendType backend,
 HetGPUError hetgpu_reset_formal(HetGPUState *state, HetGPUBackendType backend,
                                 int device_index, const char *hetgpu_lib_path);
 HetGPUError hetgpu_kimi_case_begin(HetGPUState *state,
-                                   const HetGPUKimiCaseBeginV1 *input,
+                                   const HetGPUKimiCaseBeginV2 *input,
                                    HetGPUKimiCaseResultV1 *result);
 HetGPUError hetgpu_kimi_case_end(HetGPUState *state,
-                                 const HetGPUKimiCaseEndV1 *input,
+                                 const HetGPUKimiCaseEndV2 *input,
                                  HetGPUKimiCaseResultV1 *result);
 
 /**

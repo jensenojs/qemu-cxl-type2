@@ -293,7 +293,8 @@ typedef struct CXLType2State {
         uint64_t max_regions;
         uint64_t checkpoint_every_launches;
         bool checkpoint_enabled;
-        bool logs_enabled;
+        bool qemu_cuda_calls_enabled;
+        bool concordia_runtime_details_enabled;
         uint64_t next_epoch;
         bool failed;
         uint32_t failure_code;

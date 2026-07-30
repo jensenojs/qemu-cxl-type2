@@ -2610,7 +2610,7 @@ static int cxl_type2_release_pending_htod(CXLType2State *ct2d,
 
         ct2d->htod_pending_copies--;
         ct2d->htod_pending_bytes -= pending->staging_capacity;
-        if (ct2d->paired_case.logs_enabled) {
+        if (ct2d->paired_case.qemu_cuda_calls_enabled) {
             qemu_log("CXL TYPE2 TRACE copy_completion original_call_id=0x%016"
                      PRIx64 " completion_call_id=0x%016" PRIx64
                      " direction=htod sequence=%" PRIu64 " bytes=%zu"
@@ -2941,17 +2941,18 @@ static uint64_t cxl_type2_paired_config_binding(
     const char *restore_path, const char *manifest_path)
 {
     g_autofree char *identity = g_strdup_printf(
-        "kimi-case-config-v1\ncase=%u\nenabled=%u\nrestore=0\n"
+        "kimi-case-config-v2\ncase=%u\nenabled=%u\nrestore=0\n"
         "min-allocation=%" PRIu64 "\nmax-regions=%" PRIu64
         "\ncheckpoint-enabled=%u\ncheckpoint-every=%" PRIu64
-        "\nlogs=%u\naof=%s\n"
+        "\nqemu-cuda-calls=%u\nconcordia-runtime-details=%u\naof=%s\n"
         "restore-aof=%s\nmanifest=%s\n",
         case_kind, case_kind == CXL_GPU_CASE_CONCORDIA,
         ct2d->paired_case.min_allocation_bytes,
         ct2d->paired_case.max_regions,
         ct2d->paired_case.checkpoint_enabled,
         ct2d->paired_case.checkpoint_every_launches,
-        ct2d->paired_case.logs_enabled, aof_path, restore_path,
+        ct2d->paired_case.qemu_cuda_calls_enabled,
+        ct2d->paired_case.concordia_runtime_details_enabled, aof_path, restore_path,
         manifest_path);
     g_autofree char *digest = g_compute_checksum_for_string(
         G_CHECKSUM_SHA256, identity, -1);
@@ -2996,11 +2997,11 @@ static HetGPUError cxl_type2_reset_formal_backend(CXLType2State *ct2d,
     }
     if (!hetgpu->initialized || hetgpu->backend != HETGPU_BACKEND_NVIDIA ||
         !hetgpu->context || !hetgpu->formal_case_strict ||
-        !hetgpu->kimi_case_begin_v1 || !hetgpu->kimi_case_end_v1) {
+        !hetgpu->kimi_case_begin_v2 || !hetgpu->kimi_case_end_v2) {
         qemu_log("CXL Type2: formal backend identity incomplete "
                  "initialized=%d backend=%u context=%p begin=%p end=%p\n",
                  hetgpu->initialized, hetgpu->backend, hetgpu->context,
-                 hetgpu->kimi_case_begin_v1, hetgpu->kimi_case_end_v1);
+                 hetgpu->kimi_case_begin_v2, hetgpu->kimi_case_end_v2);
         error = HETGPU_ERROR_INVALID_CONTEXT;
         cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
                                       "formal_backend_reset", "end", error,
@@ -3033,7 +3034,7 @@ static void cxl_type2_paired_case_begin(CXLType2State *ct2d,
     g_autofree char *aof_path = NULL;
     g_autofree char *restore_path = NULL;
     g_autofree char *manifest_path = NULL;
-    HetGPUKimiCaseBeginV1 input = { 0 };
+    HetGPUKimiCaseBeginV2 input = { 0 };
     HetGPUKimiCaseResultV1 result = { 0 };
     HetGPUError error;
     uint64_t config_binding;
@@ -3097,8 +3098,9 @@ static void cxl_type2_paired_case_begin(CXLType2State *ct2d,
                       ? 0
                       : HETGPU_KIMI_CASE_FLAG_CHECKPOINT_DISABLED;
     input.enabled = case_kind == CXL_GPU_CASE_CONCORDIA;
-    input.logs_enabled = ct2d->paired_case.logs_enabled;
-    hetgpu->detailed_logs = ct2d->paired_case.logs_enabled;
+    input.runtime_details_enabled =
+        ct2d->paired_case.concordia_runtime_details_enabled;
+    hetgpu->detailed_logs = ct2d->paired_case.qemu_cuda_calls_enabled;
     input.aof_path = (const uint8_t *)aof_path;
     input.aof_path_len = strlen(aof_path);
     input.restore_aof_path = (const uint8_t *)restore_path;
@@ -3186,7 +3188,7 @@ static void cxl_type2_paired_case_end(CXLType2State *ct2d,
     uint64_t run_binding = ct2d->gpu_cmd.params[3];
     uint64_t epoch = ct2d->paired_case.active_epoch;
     uint32_t case_kind = ct2d->paired_case.active_case;
-    HetGPUKimiCaseEndV1 input = { 0 };
+    HetGPUKimiCaseEndV2 input = { 0 };
     HetGPUKimiCaseResultV1 result = { 0 };
     HetGPUError sync_error;
     HetGPUError concordia_error;
@@ -3325,19 +3327,19 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
     uint64_t trace_sequence = ++ct2d->gpu_cmd.trace_sequence;
     int64_t trace_start_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
 
-    if (ct2d->paired_case.logs_enabled) qemu_log("CXL TYPE2 TRACE cmd_begin seq=%" PRIu64
+    if (ct2d->paired_case.qemu_cuda_calls_enabled) qemu_log("CXL TYPE2 TRACE cmd_begin seq=%" PRIu64
              " call_id=0x%016" PRIx64
              " cmd=0x%x host_ns=%" PRId64 " p0=0x%" PRIx64 " p1=%" PRIu64 "\n",
              trace_sequence, ct2d->gpu_cmd.call_id, cmd, trace_start_ns, ct2d->gpu_cmd.params[0],
              ct2d->gpu_cmd.params[1]);
 
-    if (ct2d->paired_case.logs_enabled) qemu_log_mask(LOG_GUEST_ERROR,
+    if (ct2d->paired_case.qemu_cuda_calls_enabled) qemu_log_mask(LOG_GUEST_ERROR,
                   "CXL GPU: execute cmd 0x%x, hetgpu_init=%d, ctx=%p\n",
                   cmd, hetgpu->initialized, hetgpu->context);
 
     ct2d->gpu_cmd.cmd_status = CXL_GPU_CMD_STATUS_RUNNING;
     ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
-    hetgpu_cuda_trace_set_detailed_logs(ct2d->paired_case.logs_enabled);
+    hetgpu_cuda_trace_set_detailed_logs(ct2d->paired_case.qemu_cuda_calls_enabled);
     hetgpu_cuda_trace_set_call_id(ct2d->gpu_cmd.call_id);
 
     if (ct2d->paired_case.required && ct2d->paired_case.failed) {
@@ -3624,7 +3626,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         if (hetgpu->initialized) {
             int64_t driver_start_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
             err = hetgpu_memcpy_htod(hetgpu, dev_ptr, ct2d->gpu_cmd.data, size);
-            if (ct2d->paired_case.logs_enabled) qemu_log("CXL TYPE2 TRACE copy_driver call_id=0x%016" PRIx64
+            if (ct2d->paired_case.qemu_cuda_calls_enabled) qemu_log("CXL TYPE2 TRACE copy_driver call_id=0x%016" PRIx64
                      " direction=htod bytes=%zu driver_duration_ns=%" PRId64
                      " backend_result=%d implementation=blocking stream_forwarded=0\n",
                      ct2d->gpu_cmd.call_id, size,
@@ -3737,7 +3739,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             ct2d->htod_peak_pending_bytes =
                 MAX(ct2d->htod_peak_pending_bytes,
                     ct2d->htod_pending_bytes);
-            if (ct2d->paired_case.logs_enabled) qemu_log("CXL TYPE2 TRACE copy_driver call_id=0x%016" PRIx64
+            if (ct2d->paired_case.qemu_cuda_calls_enabled) qemu_log("CXL TYPE2 TRACE copy_driver call_id=0x%016" PRIx64
                      " direction=htod bytes=%zu backend_result=%d "
                      "implementation=async-enqueue stream_forwarded=1 "
                      "staging_id=%" PRIu64 " capacity_bytes=%zu"
@@ -3784,7 +3786,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             }
             int64_t driver_start_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
             err = hetgpu_memcpy_dtoh(hetgpu, ct2d->gpu_cmd.data, dev_ptr, size);
-            if (ct2d->paired_case.logs_enabled) qemu_log("CXL TYPE2 TRACE copy_driver call_id=0x%016" PRIx64
+            if (ct2d->paired_case.qemu_cuda_calls_enabled) qemu_log("CXL TYPE2 TRACE copy_driver call_id=0x%016" PRIx64
                      " direction=dtoh bytes=%zu driver_duration_ns=%" PRId64
                      " backend_result=%d implementation=blocking stream_forwarded=0\n",
                      ct2d->gpu_cmd.call_id, size,
@@ -3831,7 +3833,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 int64_t driver_start_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
                 err = hetgpu_memcpy_dtod(hetgpu, dst_dev_ptr, src_dev_ptr,
                                          xfer_size);
-                if (ct2d->paired_case.logs_enabled) qemu_log("CXL TYPE2 TRACE copy_driver call_id=0x%016" PRIx64
+                if (ct2d->paired_case.qemu_cuda_calls_enabled) qemu_log("CXL TYPE2 TRACE copy_driver call_id=0x%016" PRIx64
                          " direction=dtod bytes=%zu driver_duration_ns=%" PRId64
                          " backend_result=%d implementation=blocking-direct "
                          "stream_forwarded=0\n",
@@ -3913,7 +3915,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             } else {
                 err = HETGPU_ERROR_INVALID_CONTEXT;
             }
-            if (ct2d->paired_case.logs_enabled) qemu_log("CXL TYPE2 TRACE copy_driver call_id=0x%016" PRIx64
+            if (ct2d->paired_case.qemu_cuda_calls_enabled) qemu_log("CXL TYPE2 TRACE copy_driver call_id=0x%016" PRIx64
                      " direction=dtod bytes=%zu rows=%zu row_commands_eliminated=%zu "
                      "driver_duration_ns=%" PRId64
                      " backend_result=%d implementation=blocking-direct-2d "
@@ -4908,7 +4910,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                     break;
                 }
 
-                if (ct2d->paired_case.logs_enabled) qemu_log(
+                if (ct2d->paired_case.qemu_cuda_calls_enabled) qemu_log(
                     "CXL TYPE2 TRACE function_param_layout event=launch "
                     "layer=qemu function_id=%u args=%u extent=%zu hits=%" PRIu64
                     " misses=%" PRIu64 " backend_queries=%" PRIu64 "\n",
@@ -5802,7 +5804,7 @@ complete:
     ct2d->gpu_cmd.cmd_status = CXL_GPU_CMD_STATUS_COMPLETE;
     int64_t trace_end_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
     int64_t trace_duration_ns = trace_end_ns - trace_start_ns;
-    if (ct2d->paired_case.logs_enabled) qemu_log("CXL TYPE2 TRACE cmd_end seq=%" PRIu64
+    if (ct2d->paired_case.qemu_cuda_calls_enabled) qemu_log("CXL TYPE2 TRACE cmd_end seq=%" PRIu64
              " call_id=0x%016" PRIx64
              " cmd=0x%x host_ns=%" PRId64 " result=%u duration_ns=%" PRId64
              " context_generation=%" PRIu64
@@ -5812,7 +5814,7 @@ complete:
              ct2d->gpu_cmd.cmd_result, trace_duration_ns,
              hetgpu->context_generation, hetgpu->context_binding_hits,
              hetgpu->context_binding_misses);
-    if (ct2d->paired_case.logs_enabled) qemu_log_mask(LOG_GUEST_ERROR,
+    if (ct2d->paired_case.qemu_cuda_calls_enabled) qemu_log_mask(LOG_GUEST_ERROR,
                   "CXL GPU: cmd 0x%x done, result=%u results[0]=0x%lx\n",
                   cmd, ct2d->gpu_cmd.cmd_result,
                   (unsigned long)ct2d->gpu_cmd.results[0]);
@@ -6448,8 +6450,10 @@ static const Property cxl_type2_props[] = {
                        paired_case.checkpoint_every_launches, 1),
     DEFINE_PROP_BOOL("paired-kimi-checkpoint", CXLType2State,
                      paired_case.checkpoint_enabled, false),
-    DEFINE_PROP_BOOL("paired-kimi-logs", CXLType2State,
-                     paired_case.logs_enabled, false),
+    DEFINE_PROP_BOOL("paired-kimi-qemu-cuda-calls", CXLType2State,
+                     paired_case.qemu_cuda_calls_enabled, false),
+    DEFINE_PROP_BOOL("paired-kimi-concordia-runtime-details", CXLType2State,
+                     paired_case.concordia_runtime_details_enabled, false),
     DEFINE_PROP_BOOL("dcd", CXLType2State, dcd.enabled, false),
     DEFINE_PROP_SIZE("dcd-granularity", CXLType2State, dcd.granularity,
                      CXL_TYPE2_DCD_DEFAULT_GRANULARITY),
