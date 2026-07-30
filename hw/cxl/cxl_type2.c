@@ -4295,11 +4295,46 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
                 break;
             }
+            if (!ct2d->gpu_cmd.functions[func_id]) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                break;
+            }
+            if (ct2d->paired_case.qemu_cuda_calls_enabled) {
+                qemu_log("CXL TYPE2 TRACE function_param_layout event=query_begin "
+                         "layer=qemu function_id=%u backend_function=%p\n",
+                         func_id, ct2d->gpu_cmd.functions[func_id]);
+            }
             err = hetgpu_get_param_layout(hetgpu,
                                           ct2d->gpu_cmd.functions[func_id],
                                           &layout);
-            if (err != HETGPU_SUCCESS ||
-                layout->num_args > ARRAY_SIZE(wire.params) ||
+            if (ct2d->paired_case.qemu_cuda_calls_enabled) {
+                qemu_log("CXL TYPE2 TRACE function_param_layout event=query_end "
+                         "layer=qemu function_id=%u backend_function=%p "
+                         "backend_result=%d layout=%p backend_queries=%" PRIu64 "\n",
+                         func_id, ct2d->gpu_cmd.functions[func_id], err, layout,
+                         hetgpu->param_info_backend_queries - backend_queries_before);
+            }
+            if (err != HETGPU_SUCCESS) {
+                switch (err) {
+                case HETGPU_ERROR_INVALID_HANDLE:
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                    break;
+                case HETGPU_ERROR_NOT_SUPPORTED:
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_SUPPORTED;
+                    break;
+                case HETGPU_ERROR_INVALID_CONTEXT:
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_CONTEXT;
+                    break;
+                case HETGPU_ERROR_INVALID_VALUE:
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                    break;
+                default:
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_UNKNOWN;
+                    break;
+                }
+                break;
+            }
+            if (!layout || layout->num_args > ARRAY_SIZE(wire.params) ||
                 layout->extent > ct2d->gpu_cmd.data_size) {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
                 break;
