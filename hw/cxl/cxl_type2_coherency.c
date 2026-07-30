@@ -211,12 +211,11 @@ CXLSnoopEntry *cxl_bar_snoop_lookup(CXLBARCoherencyState *state, uint64_t addr)
     return entry;
 }
 
-void cxl_bar_snoop_insert(CXLBARCoherencyState *state, uint64_t addr,
-                          uint8_t state_val, CXLCoherencyDomain domain)
+static void cxl_bar_snoop_insert_locked(CXLBARCoherencyState *state,
+                                        uint64_t addr, uint8_t state_val,
+                                        CXLCoherencyDomain domain)
 {
     uint64_t aligned_addr = addr & CXL_CACHE_LINE_MASK;
-
-    qemu_mutex_lock(&state->lock);
 
     /* Check if already exists */
     CXLSnoopEntry *existing = g_hash_table_lookup(state->snoop_filter, &aligned_addr);
@@ -247,11 +246,18 @@ void cxl_bar_snoop_insert(CXLBARCoherencyState *state, uint64_t addr,
         g_hash_table_insert(state->snoop_filter, key, entry);
         state->snoop_filter_size++;
     }
+}
+
+void cxl_bar_snoop_insert(CXLBARCoherencyState *state, uint64_t addr,
+                          uint8_t state_val, CXLCoherencyDomain domain)
+{
+    qemu_mutex_lock(&state->lock);
+    cxl_bar_snoop_insert_locked(state, addr, state_val, domain);
 
     qemu_mutex_unlock(&state->lock);
 
     qemu_log_mask(LOG_TRACE, "CXL BAR Snoop: Insert 0x%lx state=%d domain=%d\n",
-                 aligned_addr, state_val, domain);
+                 addr & CXL_CACHE_LINE_MASK, state_val, domain);
 }
 
 void cxl_bar_snoop_update(CXLBARCoherencyState *state, uint64_t addr,
@@ -295,17 +301,22 @@ void cxl_bar_snoop_update(CXLBARCoherencyState *state, uint64_t addr,
     qemu_mutex_unlock(&state->lock);
 }
 
-void cxl_bar_snoop_remove(CXLBARCoherencyState *state, uint64_t addr)
+static void cxl_bar_snoop_remove_locked(CXLBARCoherencyState *state,
+                                        uint64_t addr)
 {
     uint64_t aligned_addr = addr & CXL_CACHE_LINE_MASK;
-
-    qemu_mutex_lock(&state->lock);
 
     if (g_hash_table_remove(state->snoop_filter, &aligned_addr)) {
         state->snoop_filter_size--;
         state->stats.evictions++;
         qemu_log_mask(LOG_TRACE, "CXL BAR Snoop: Remove 0x%lx\n", aligned_addr);
     }
+}
+
+void cxl_bar_snoop_remove(CXLBARCoherencyState *state, uint64_t addr)
+{
+    qemu_mutex_lock(&state->lock);
+    cxl_bar_snoop_remove_locked(state, addr);
 
     qemu_mutex_unlock(&state->lock);
 }
@@ -338,7 +349,8 @@ CXLCoherencyRspType cxl_bar_coherency_request(CXLBARCoherencyState *state,
         if (!entry) {
             /* Cache miss - fetch from memory */
             response = CXL_COH_RSP_S;
-            cxl_bar_snoop_insert(state, addr, CXL_COHERENCY_SHARED, source);
+            cxl_bar_snoop_insert_locked(state, addr, CXL_COHERENCY_SHARED,
+                                        source);
         } else if (entry->state == CXL_COHERENCY_MODIFIED) {
             /* Need writeback from owner first */
             state->stats.writebacks++;
@@ -368,7 +380,8 @@ CXLCoherencyRspType cxl_bar_coherency_request(CXLBARCoherencyState *state,
         if (!entry) {
             /* Cache miss - allocate exclusive */
             response = CXL_COH_RSP_E;
-            cxl_bar_snoop_insert(state, addr, CXL_COHERENCY_EXCLUSIVE, source);
+            cxl_bar_snoop_insert_locked(state, addr, CXL_COHERENCY_EXCLUSIVE,
+                                        source);
         } else {
             /* Check bias mode for fast path */
             if (entry->bias_mode == CXL_BIAS_MODE_DEVICE &&
@@ -417,7 +430,8 @@ CXLCoherencyRspType cxl_bar_coherency_request(CXLBARCoherencyState *state,
             entry->owner_domain = source;
             entry->flags |= CXL_SNOOP_FLAG_DIRTY;
         } else {
-            cxl_bar_snoop_insert(state, addr, CXL_COHERENCY_MODIFIED, source);
+            cxl_bar_snoop_insert_locked(state, addr, CXL_COHERENCY_MODIFIED,
+                                        source);
             entry = g_hash_table_lookup(state->snoop_filter, &aligned_addr);
             if (entry) {
                 entry->flags |= CXL_SNOOP_FLAG_DIRTY;
@@ -448,7 +462,7 @@ CXLCoherencyRspType cxl_bar_coherency_request(CXLBARCoherencyState *state,
         if (entry) {
             entry->domain_mask &= ~(1 << source);
             if (entry->domain_mask == 0) {
-                cxl_bar_snoop_remove(state, addr);
+                cxl_bar_snoop_remove_locked(state, addr);
             }
         }
         response = CXL_COH_RSP_I;
@@ -461,7 +475,7 @@ CXLCoherencyRspType cxl_bar_coherency_request(CXLBARCoherencyState *state,
             entry->domain_mask &= ~(1 << source);
             entry->flags &= ~CXL_SNOOP_FLAG_DIRTY;
             if (entry->domain_mask == 0) {
-                cxl_bar_snoop_remove(state, addr);
+                cxl_bar_snoop_remove_locked(state, addr);
             } else {
                 entry->state = CXL_COHERENCY_SHARED;
             }
