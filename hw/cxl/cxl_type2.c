@@ -96,7 +96,7 @@ static bool cxl_type2_memsim_request(CXLType2State *ct2d, uint8_t op_type,
 
 static bool cxl_type2_bulk_memsim_access(CXLType2State *ct2d, uint8_t op_type,
                                           uint64_t addr, size_t size,
-                                          const uint8_t *data)
+                                          uint8_t *data)
 {
     /* The wire protocol carries one cacheline, so a bulk CUDA copy is split
      * into bounded CXL.mem requests while the GPU transfer remains batched. */
@@ -109,8 +109,18 @@ static bool cxl_type2_bulk_memsim_access(CXLType2State *ct2d, uint8_t op_type,
     }
     while (size > 0) {
         size_t chunk = MIN(size, sizeof(((CXLMemSimRequest *)0)->data));
-        if (!cxl_type2_memsim_request(ct2d, op_type, addr, chunk, data, NULL)) {
+        CXLMemSimResponse response;
+        const uint8_t *request_data = op_type == CXL_OP_WRITE ? data : NULL;
+
+        if (op_type == CXL_OP_READ && !data) {
             return false;
+        }
+        if (!cxl_type2_memsim_request(ct2d, op_type, addr, chunk,
+                                      request_data, &response)) {
+            return false;
+        }
+        if (op_type == CXL_OP_READ) {
+            memcpy(data, response.data, chunk);
         }
         addr += chunk;
         size -= chunk;
@@ -5333,7 +5343,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                                                     xfer_size, false, false)) {
                     if (!cxl_type2_bulk_memsim_access(ct2d, CXL_OP_READ,
                                                       bar4_offset, xfer_size,
-                                                      NULL)) {
+                                                      mem + bar4_offset)) {
                         ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
                         break;
                     }
