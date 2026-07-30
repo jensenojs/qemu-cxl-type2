@@ -64,6 +64,10 @@ extern int LZ4_decompress_safe(const char *src, char *dst,
 #define CXL_OP_BI_WRITEBACK 17
 #define CXL_OP_BI_QUERY     18
 
+/* A CXL.mem response is one fixed-size message. A missing response must
+ * release the QEMU device path instead of consuming the outer CNB timeout. */
+#define CXL_MEMSIM_RESPONSE_TIMEOUT_NS (1000LL * 1000 * 1000)
+
 typedef struct QEMU_PACKED CXLMemSimRequest {
     uint8_t op_type;
     uint64_t addr;
@@ -1370,6 +1374,83 @@ static void cxlmemsim_disconnect(CXLType2State *ct2d)
     qemu_mutex_unlock(&ct2d->memsim.lock);
 }
 
+static bool cxl_type2_memsim_read_response(CXLType2State *ct2d,
+                                           const CXLMemSimRequest *req,
+                                           CXLMemSimResponse *resp,
+                                           Error **errp)
+{
+    QIOChannelSocket *socket = ct2d->memsim.socket;
+    uint8_t *cursor = (uint8_t *)resp;
+    size_t remaining = sizeof(*resp);
+    int64_t deadline = g_get_monotonic_time() * 1000 +
+                       CXL_MEMSIM_RESPONSE_TIMEOUT_NS;
+
+    while (remaining > 0) {
+        ssize_t received = recv(socket->fd, cursor, remaining, MSG_DONTWAIT);
+        if (received > 0) {
+            cursor += received;
+            remaining -= received;
+            continue;
+        }
+        if (received == 0) {
+            error_setg(errp,
+                       "CXLMemSim closed response for op=%u addr=0x%" PRIx64
+                       " size=%" PRIu64,
+                       req->op_type, req->addr, req->size);
+            return false;
+        }
+        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            error_setg_errno(errp, errno,
+                             "CXLMemSim response read failed for op=%u addr=0x%" PRIx64
+                             " size=%" PRIu64,
+                             req->op_type, req->addr, req->size);
+            return false;
+        }
+
+        int64_t remaining_ns = deadline - g_get_monotonic_time() * 1000;
+        if (remaining_ns <= 0) {
+            error_setg(errp,
+                       "timed out waiting for CXLMemSim response for op=%u"
+                       " addr=0x%" PRIx64 " size=%" PRIu64,
+                       req->op_type, req->addr, req->size);
+            return false;
+        }
+
+        GPollFD poll_fd = {
+            .fd = socket->fd,
+            .events = G_IO_IN | G_IO_HUP | G_IO_ERR,
+            .revents = 0,
+        };
+        int poll_result = qemu_poll_ns(&poll_fd, 1, remaining_ns);
+        if (poll_result == 0) {
+            error_setg(errp,
+                       "timed out waiting for CXLMemSim response for op=%u"
+                       " addr=0x%" PRIx64 " size=%" PRIu64,
+                       req->op_type, req->addr, req->size);
+            return false;
+        }
+        if (poll_result < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            error_setg_errno(errp, errno,
+                             "CXLMemSim response poll failed for op=%u addr=0x%" PRIx64
+                             " size=%" PRIu64,
+                             req->op_type, req->addr, req->size);
+            return false;
+        }
+        if (poll_fd.revents & (G_IO_HUP | G_IO_ERR | G_IO_NVAL)) {
+            error_setg(errp,
+                       "CXLMemSim response channel failed for op=%u addr=0x%" PRIx64
+                       " size=%" PRIu64,
+                       req->op_type, req->addr, req->size);
+            return false;
+        }
+    }
+
+    return true;
+}
+
 static bool cxl_type2_memsim_request_ext(CXLType2State *ct2d, uint8_t op_type,
                                          uint64_t addr, uint64_t size,
                                          const uint8_t *data, uint64_t value,
@@ -1411,8 +1492,7 @@ static bool cxl_type2_memsim_request_ext(CXLType2State *ct2d, uint8_t op_type,
         goto out;
     }
 
-    if (qio_channel_read_all(QIO_CHANNEL(ct2d->memsim.socket),
-                             (char *)&local_resp, sizeof(local_resp), &err) < 0) {
+    if (!cxl_type2_memsim_read_response(ct2d, &req, &local_resp, &err)) {
         error_report("CXL Type2: Failed to receive response from CXLMemSim: %s",
                      error_get_pretty(err));
         error_free(err);
