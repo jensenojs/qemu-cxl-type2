@@ -94,20 +94,30 @@ static bool cxl_type2_memsim_request(CXLType2State *ct2d, uint8_t op_type,
                                      const uint8_t *data,
                                      CXLMemSimResponse *resp);
 
-static void cxl_type2_bulk_memsim_access(CXLType2State *ct2d, uint8_t op_type,
+static bool cxl_type2_bulk_memsim_access(CXLType2State *ct2d, uint8_t op_type,
                                           uint64_t addr, size_t size,
                                           const uint8_t *data)
 {
     /* The wire protocol carries one cacheline, so a bulk CUDA copy is split
      * into bounded CXL.mem requests while the GPU transfer remains batched. */
+    if (ct2d->memsim.use_shm) {
+        /* SHM transport has no TCP request/response to acknowledge here. */
+        return true;
+    }
+    if (!ct2d->memsim.connected) {
+        return false;
+    }
     while (size > 0) {
         size_t chunk = MIN(size, sizeof(((CXLMemSimRequest *)0)->data));
-        cxl_type2_memsim_request(ct2d, op_type, addr, chunk, data, NULL);
+        if (!cxl_type2_memsim_request(ct2d, op_type, addr, chunk, data, NULL)) {
+            return false;
+        }
         addr += chunk;
         size -= chunk;
         if (data)
             data += chunk;
     }
+    return true;
 }
 
 /* ========================================================================
@@ -5321,8 +5331,12 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 if (mem && bar4_offset + xfer_size <= ct2d->device_mem_size &&
                     cxl_type2_fabric_access_allowed(ct2d, bar4_offset,
                                                     xfer_size, false, false)) {
-                    cxl_type2_bulk_memsim_access(ct2d, CXL_OP_READ,
-                                                 bar4_offset, xfer_size, NULL);
+                    if (!cxl_type2_bulk_memsim_access(ct2d, CXL_OP_READ,
+                                                      bar4_offset, xfer_size,
+                                                      NULL)) {
+                        ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                        break;
+                    }
                     err = hetgpu_memcpy_htod(hetgpu, dst_dev_ptr,
                                              mem + bar4_offset, xfer_size);
                     if (err != HETGPU_SUCCESS) {
@@ -5358,9 +5372,11 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                     err = hetgpu_memcpy_dtoh(hetgpu, mem + bar4_offset,
                                              src_dev_ptr, xfer_size);
                     if (err == HETGPU_SUCCESS) {
-                        cxl_type2_bulk_memsim_access(ct2d, CXL_OP_WRITE,
-                                                     bar4_offset, xfer_size,
-                                                     mem + bar4_offset);
+                        if (!cxl_type2_bulk_memsim_access(
+                                ct2d, CXL_OP_WRITE, bar4_offset, xfer_size,
+                                mem + bar4_offset)) {
+                            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                        }
                     }
                     if (err != HETGPU_SUCCESS) {
                         ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
