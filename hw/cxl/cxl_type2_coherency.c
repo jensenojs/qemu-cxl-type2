@@ -490,10 +490,6 @@ CXLCoherencyRspType cxl_bar_coherency_request(CXLBARCoherencyState *state,
 
     qemu_mutex_unlock(&state->lock);
 
-    qemu_log_mask(LOG_TRACE,
-                 "CXL BAR Coherency: req=%d addr=0x%lx src=%d -> rsp=%d\n",
-                 req, addr, source, response);
-
     return response;
 }
 

@@ -206,8 +206,6 @@ void cxl_type2_cache_insert(CXLType2State *ct2d, uint64_t addr,
     ct2d->coherency.coherency_ops++;
     qemu_mutex_unlock(&ct2d->coherency.lock);
 
-    qemu_log_mask(LOG_TRACE, "CXL Type2: Cache insert at 0x%lx, state=%d\n",
-                 cache_line_addr, state);
 }
 
 void cxl_type2_cache_invalidate(CXLType2State *ct2d, uint64_t addr)
@@ -1690,8 +1688,6 @@ static void cxl_type2_cache_write(void *opaque, hwaddr addr, uint64_t value, uns
                                  (const uint8_t *)&value, NULL);
     }
 
-    qemu_log_mask(LOG_TRACE, "CXL Type2: Cache write at 0x%lx = 0x%lx\n",
-                 addr, value);
 }
 
 static bool cxl_type2_fabric_access_allowed(CXLType2State *ct2d, uint64_t addr,
