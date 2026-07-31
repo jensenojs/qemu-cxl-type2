@@ -25,41 +25,48 @@
 #if SHIFT == 0 && defined(__x86_64__) && !defined(__FAST_MATH__)
 #include <emmintrin.h>
 
-static bool x86_m128_f32_all_normal(__m128 value)
+static __m128i x86_m128_f32_non_normal(__m128 value)
 {
     const __m128i exponent_mask = _mm_set1_epi32(0x7f800000);
     __m128i exponent = _mm_and_si128(_mm_castps_si128(value), exponent_mask);
     __m128i zero = _mm_cmpeq_epi32(exponent, _mm_setzero_si128());
     __m128i special = _mm_cmpeq_epi32(exponent, exponent_mask);
 
-    return _mm_movemask_epi8(_mm_or_si128(zero, special)) == 0;
+    return _mm_or_si128(zero, special);
 }
 
 static inline bool x86_try_packed_f32_add(CPUX86State *env, float32 *d,
                                           const float32 *a, const float32 *b,
                                           int count)
 {
-    float32 result[8];
+    __m128 va[2];
+    __m128 vb[2];
+    __m128 result[2];
+    __m128i non_normal = _mm_setzero_si128();
+    int blocks = count / 4;
 
     if (!float_status_can_use_hardfloat(&env->sse_status)) {
         return false;
     }
 
-    for (int i = 0; i < count; i += 4) {
-        __m128 va;
-        __m128 vb;
-
-        memcpy(&va, &a[i], sizeof(va));
-        memcpy(&vb, &b[i], sizeof(vb));
-        if (!x86_m128_f32_all_normal(va) ||
-            !x86_m128_f32_all_normal(vb)) {
-            return false;
-        }
-        va = _mm_add_ps(va, vb);
-        if (!x86_m128_f32_all_normal(va)) {
-            return false;
-        }
-        memcpy(&result[i], &va, sizeof(va));
+    for (int i = 0; i < blocks; i++) {
+        memcpy(&va[i], &a[i * 4], sizeof(va[i]));
+        memcpy(&vb[i], &b[i * 4], sizeof(vb[i]));
+        non_normal = _mm_or_si128(non_normal,
+                                  x86_m128_f32_non_normal(va[i]));
+        non_normal = _mm_or_si128(non_normal,
+                                  x86_m128_f32_non_normal(vb[i]));
+    }
+    if (_mm_movemask_epi8(non_normal)) {
+        return false;
+    }
+    for (int i = 0; i < blocks; i++) {
+        result[i] = _mm_add_ps(va[i], vb[i]);
+        non_normal = _mm_or_si128(non_normal,
+                                  x86_m128_f32_non_normal(result[i]));
+    }
+    if (_mm_movemask_epi8(non_normal)) {
+        return false;
     }
 
     memcpy(d, result, count * sizeof(*d));
@@ -70,26 +77,33 @@ static inline bool x86_try_packed_f32_mul(CPUX86State *env, float32 *d,
                                           const float32 *a, const float32 *b,
                                           int count)
 {
-    float32 result[8];
+    __m128 va[2];
+    __m128 vb[2];
+    __m128 result[2];
+    __m128i non_normal = _mm_setzero_si128();
+    int blocks = count / 4;
 
     if (!float_status_can_use_hardfloat(&env->sse_status)) {
         return false;
     }
-    for (int i = 0; i < count; i += 4) {
-        __m128 va;
-        __m128 vb;
-
-        memcpy(&va, &a[i], sizeof(va));
-        memcpy(&vb, &b[i], sizeof(vb));
-        if (!x86_m128_f32_all_normal(va) ||
-            !x86_m128_f32_all_normal(vb)) {
-            return false;
-        }
-        va = _mm_mul_ps(va, vb);
-        if (!x86_m128_f32_all_normal(va)) {
-            return false;
-        }
-        memcpy(&result[i], &va, sizeof(va));
+    for (int i = 0; i < blocks; i++) {
+        memcpy(&va[i], &a[i * 4], sizeof(va[i]));
+        memcpy(&vb[i], &b[i * 4], sizeof(vb[i]));
+        non_normal = _mm_or_si128(non_normal,
+                                  x86_m128_f32_non_normal(va[i]));
+        non_normal = _mm_or_si128(non_normal,
+                                  x86_m128_f32_non_normal(vb[i]));
+    }
+    if (_mm_movemask_epi8(non_normal)) {
+        return false;
+    }
+    for (int i = 0; i < blocks; i++) {
+        result[i] = _mm_mul_ps(va[i], vb[i]);
+        non_normal = _mm_or_si128(non_normal,
+                                  x86_m128_f32_non_normal(result[i]));
+    }
+    if (_mm_movemask_epi8(non_normal)) {
+        return false;
     }
 
     memcpy(d, result, count * sizeof(*d));
