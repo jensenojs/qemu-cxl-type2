@@ -74,7 +74,7 @@
 
 /* Magic number */
 #define CXL_GPU_MAGIC               0x43584C32  /* "CXL2" */
-#define CXL_GPU_VERSION             0x00010A00  /* v1.10.0: stream-aware HtoD async */
+#define CXL_GPU_VERSION             0x00010B00  /* v1.11.0: BAR4-backed HtoD async */
 
 #define CXL_GPU_STREAM_WIRE_NULL       0xffffffffffffffffULL
 #define CXL_GPU_STREAM_WIRE_LEGACY     0xfffffffffffffffeULL
@@ -184,6 +184,7 @@ typedef enum {
     CXL_GPU_CMD_BULK_HTOD       = 0x70,  /* Bulk host-to-device via BAR4 */
     CXL_GPU_CMD_BULK_DTOH       = 0x71,  /* Bulk device-to-host via BAR4 */
     CXL_GPU_CMD_BULK_DTOD       = 0x72,  /* Bulk device-to-device */
+    CXL_GPU_CMD_BULK_HTOD_ASYNC = 0x73,  /* BAR4 source, stream-aware HtoD */
 
     /* CXL.cache coherency commands */
     CXL_GPU_CMD_CACHE_FLUSH     = 0x80,  /* Flush cache lines to device */
