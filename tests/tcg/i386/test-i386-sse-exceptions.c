@@ -1,8 +1,10 @@
 /* Test SSE exceptions.  */
 
 #include <float.h>
+#include <immintrin.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 volatile float f_res;
 volatile double d_res;
@@ -49,11 +51,137 @@ volatile int32_t i32_max = INT32_MAX;
 uint32_t mxcsr_default = 0x1f80;
 uint32_t mxcsr_ftz = 0x9f80;
 
+static int check_u32_vector(const char *name, const void *actual,
+                            const uint32_t *expected, size_t count)
+{
+    uint32_t bits[8];
+
+    memcpy(bits, actual, count * sizeof(*bits));
+    for (size_t i = 0; i < count; i++) {
+        if (bits[i] != expected[i]) {
+            printf("FAIL: %s lane %zu got %08x expected %08x\n",
+                   name, i, bits[i], expected[i]);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int test_packed_float(void)
+{
+    const float a4[4] = { 1.0f, 2.0f, 3.0f, 4.0f };
+    const float b4[4] = { 2.0f, 3.0f, 4.0f, 5.0f };
+    const float a8[8] = { 1.0f, 2.0f, 3.0f, 4.0f,
+                          5.0f, 6.0f, 7.0f, 8.0f };
+    const float b8[8] = { 2.0f, 3.0f, 4.0f, 5.0f,
+                          6.0f, 7.0f, 8.0f, 9.0f };
+    const uint32_t add4[] = { 0x40400000, 0x40a00000,
+                              0x40e00000, 0x41100000 };
+    const uint32_t mul4[] = { 0x40000000, 0x40c00000,
+                              0x41400000, 0x41a00000 };
+    const uint32_t add8[] = { 0x40400000, 0x40a00000,
+                              0x40e00000, 0x41100000,
+                              0x41300000, 0x41500000,
+                              0x41700000, 0x41880000 };
+    const uint32_t cvt4[] = { 0x3f800000, 0xc0000000,
+                              0x4b800000, 0x4f000000 };
+    const int32_t integers[4] = { 1, -2, 16777217, INT32_MAX };
+    const uint32_t special_a_bits[4] = {
+        0x7fc12345, 0x7f812345, 0x00800000, 0x80000000,
+    };
+    const uint32_t special_b_bits[4] = {
+        0x3f800000, 0x3f800000, 0x3f000000, 0x80000000,
+    };
+    const uint32_t special_add_bits[4] = {
+        0x7fc12345, 0x7fc12345, 0x3f000000, 0x80000000,
+    };
+    const uint32_t special_mul_bits[4] = {
+        0x7fc12345, 0x7fc12345, 0x00400000, 0x00000000,
+    };
+    float special_a[4];
+    float special_b[4];
+    uint32_t mxcsr = mxcsr_default | PE;
+    __m128 x4;
+    __m256 x8;
+    int ret = 0;
+
+    memcpy(special_a, special_a_bits, sizeof(special_a));
+    memcpy(special_b, special_b_bits, sizeof(special_b));
+
+    __asm__ volatile ("ldmxcsr %0" : : "m" (mxcsr));
+    x4 = _mm_add_ps(_mm_loadu_ps(a4), _mm_loadu_ps(b4));
+    ret |= check_u32_vector("packed addps", &x4, add4, 4);
+    x4 = _mm_mul_ps(_mm_loadu_ps(a4), _mm_loadu_ps(b4));
+    ret |= check_u32_vector("packed mulps", &x4, mul4, 4);
+    x8 = _mm256_add_ps(_mm256_loadu_ps(a8), _mm256_loadu_ps(b8));
+    ret |= check_u32_vector("packed vaddps", &x8, add8, 8);
+    x4 = _mm_cvtepi32_ps(_mm_loadu_si128((const __m128i *)integers));
+    ret |= check_u32_vector("packed cvtdq2ps", &x4, cvt4, 4);
+
+    __asm__ volatile ("ldmxcsr %0" : : "m" (mxcsr_default));
+    x4 = _mm_cvtepi32_ps(_mm_loadu_si128((const __m128i *)integers));
+    ret |= check_u32_vector("fallback cvtdq2ps", &x4, cvt4, 4);
+    __asm__ volatile ("stmxcsr %0" : "=m" (mxcsr));
+    if ((mxcsr & EXC) != PE) {
+        printf("FAIL: fallback cvtdq2ps flags\n");
+        ret = 1;
+    }
+
+    mxcsr = mxcsr_default | PE;
+    __asm__ volatile ("ldmxcsr %0" : : "m" (mxcsr));
+    x4 = _mm_add_ps(_mm_loadu_ps(special_a), _mm_loadu_ps(special_b));
+    ret |= check_u32_vector("fallback packed add special", &x4,
+                            special_add_bits, 4);
+    __asm__ volatile ("stmxcsr %0" : "=m" (mxcsr));
+    if ((mxcsr & EXC) != (IE | PE)) {
+        printf("FAIL: fallback packed add special flags\n");
+        ret = 1;
+    }
+
+    mxcsr = mxcsr_default | PE;
+    __asm__ volatile ("ldmxcsr %0" : : "m" (mxcsr));
+    x4 = _mm_mul_ps(_mm_loadu_ps(special_a), _mm_loadu_ps(special_b));
+    ret |= check_u32_vector("fallback packed mul special", &x4,
+                            special_mul_bits, 4);
+    __asm__ volatile ("stmxcsr %0" : "=m" (mxcsr));
+    if ((mxcsr & EXC) != (IE | PE)) {
+        printf("FAIL: fallback packed mul special flags\n");
+        ret = 1;
+    }
+
+    mxcsr = mxcsr_ftz | PE;
+    __asm__ volatile ("ldmxcsr %0" : : "m" (mxcsr));
+    x4 = _mm_mul_ps(_mm_loadu_ps(special_a), _mm_loadu_ps(special_b));
+    __asm__ volatile ("stmxcsr %0" : "=m" (mxcsr));
+    if (((const uint32_t *)&x4)[2] != 0 ||
+        (mxcsr & EXC) != (IE | UE | PE)) {
+        printf("FAIL: fallback packed mul FTZ\n");
+        ret = 1;
+    }
+
+    for (uint32_t rounding = 0; rounding < 4; rounding++) {
+        mxcsr = (mxcsr_default | PE) | (rounding << 13);
+        __asm__ volatile ("ldmxcsr %0" : : "m" (mxcsr));
+        x4 = _mm_add_ps(_mm_loadu_ps(a4), _mm_loadu_ps(b4));
+        ret |= check_u32_vector("fallback packed add rounding", &x4,
+                                add4, 4);
+        __asm__ volatile ("stmxcsr %0" : "=m" (mxcsr));
+        if ((mxcsr & EXC) != PE) {
+            printf("FAIL: fallback packed add rounding flags\n");
+            ret = 1;
+        }
+    }
+
+    return ret;
+}
+
 int main(void)
 {
     uint32_t mxcsr;
     int32_t i32_res;
     int ret = 0;
+
+    ret |= test_packed_float();
 
     __asm__ volatile ("ldmxcsr %0" : : "m" (mxcsr_default));
     d_res = f_snan;

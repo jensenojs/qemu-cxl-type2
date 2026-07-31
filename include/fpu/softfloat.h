@@ -595,6 +595,7 @@ float128 float32_to_float128(float32, float_status *status);
 | Software IEC/IEEE single-precision operations.
 *----------------------------------------------------------------------------*/
 float32 float32_round_to_int(float32, float_status *status);
+bool float_status_can_use_hardfloat(const float_status *status);
 float32 float32_add(float32, float32, float_status *status);
 float32 float32_sub(float32, float32, float_status *status);
 float32 float32_mul(float32, float32, float_status *status);

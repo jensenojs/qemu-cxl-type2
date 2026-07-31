@@ -22,6 +22,114 @@
 #include "crypto/aes-round.h"
 #include "crypto/clmul.h"
 
+#if SHIFT == 0 && defined(__x86_64__) && !defined(__FAST_MATH__)
+#include <emmintrin.h>
+
+static bool x86_m128_f32_all_normal(__m128 value)
+{
+    const __m128i exponent_mask = _mm_set1_epi32(0x7f800000);
+    __m128i exponent = _mm_and_si128(_mm_castps_si128(value), exponent_mask);
+    __m128i zero = _mm_cmpeq_epi32(exponent, _mm_setzero_si128());
+    __m128i special = _mm_cmpeq_epi32(exponent, exponent_mask);
+
+    return _mm_movemask_epi8(_mm_or_si128(zero, special)) == 0;
+}
+
+static inline bool x86_try_packed_f32_add(CPUX86State *env, float32 *d,
+                                          const float32 *a, const float32 *b,
+                                          int count)
+{
+    float32 result[8];
+
+    if (!float_status_can_use_hardfloat(&env->sse_status)) {
+        return false;
+    }
+
+    for (int i = 0; i < count; i += 4) {
+        __m128 va;
+        __m128 vb;
+
+        memcpy(&va, &a[i], sizeof(va));
+        memcpy(&vb, &b[i], sizeof(vb));
+        if (!x86_m128_f32_all_normal(va) ||
+            !x86_m128_f32_all_normal(vb)) {
+            return false;
+        }
+        va = _mm_add_ps(va, vb);
+        if (!x86_m128_f32_all_normal(va)) {
+            return false;
+        }
+        memcpy(&result[i], &va, sizeof(va));
+    }
+
+    memcpy(d, result, count * sizeof(*d));
+    return true;
+}
+
+static inline bool x86_try_packed_f32_mul(CPUX86State *env, float32 *d,
+                                          const float32 *a, const float32 *b,
+                                          int count)
+{
+    float32 result[8];
+
+    if (!float_status_can_use_hardfloat(&env->sse_status)) {
+        return false;
+    }
+    for (int i = 0; i < count; i += 4) {
+        __m128 va;
+        __m128 vb;
+
+        memcpy(&va, &a[i], sizeof(va));
+        memcpy(&vb, &b[i], sizeof(vb));
+        if (!x86_m128_f32_all_normal(va) ||
+            !x86_m128_f32_all_normal(vb)) {
+            return false;
+        }
+        va = _mm_mul_ps(va, vb);
+        if (!x86_m128_f32_all_normal(va)) {
+            return false;
+        }
+        memcpy(&result[i], &va, sizeof(va));
+    }
+
+    memcpy(d, result, count * sizeof(*d));
+    return true;
+}
+
+static inline bool x86_try_packed_i32_to_f32(CPUX86State *env, float32 *d,
+                                             const uint32_t *source, int count)
+{
+    float32 result[8];
+
+    if (!float_status_can_use_hardfloat(&env->sse_status)) {
+        return false;
+    }
+    for (int i = 0; i < count; i += 4) {
+        __m128i input;
+        __m128 output;
+
+        memcpy(&input, &source[i], sizeof(input));
+        output = _mm_cvtepi32_ps(input);
+        memcpy(&result[i], &output, sizeof(output));
+    }
+    memcpy(d, result, count * sizeof(*d));
+    return true;
+}
+
+#define X86_TRY_PACKED_F32_ADD(env, d, v, s, count) \
+    x86_try_packed_f32_add(env, &(d)->ZMM_S(0), &(v)->ZMM_S(0), \
+                           &(s)->ZMM_S(0), count)
+#define X86_TRY_PACKED_F32_MUL(env, d, v, s, count) \
+    x86_try_packed_f32_mul(env, &(d)->ZMM_S(0), &(v)->ZMM_S(0), \
+                           &(s)->ZMM_S(0), count)
+#define X86_TRY_PACKED_I32_TO_F32(env, d, s, count) \
+    x86_try_packed_i32_to_f32(env, &(d)->ZMM_S(0), &(s)->ZMM_L(0), count)
+#elif SHIFT == 0
+#define X86_TRY_PACKED_F32_ADD(env, d, v, s, count) false
+#define X86_TRY_PACKED_F32_MUL(env, d, v, s, count) false
+#define X86_TRY_PACKED_I32_TO_F32(env, d, s, count) false
+#endif
+
 #if SHIFT == 0
 #define Reg MMXReg
 #define XMM_ONLY(...)
@@ -468,6 +576,9 @@ void glue(helper_pshufhw, SUFFIX)(Reg *d, Reg *s, int order)
             Reg *d, Reg *v, Reg *s)                                     \
     {                                                                   \
         int i;                                                          \
+        if (X86_TRY_PACKED_F32_ ## name(env, d, v, s, 2 << SHIFT)) {    \
+            return;                                                     \
+        }                                                               \
         for (i = 0; i < 2 << SHIFT; i++) {                              \
             d->ZMM_S(i) = F(32, v->ZMM_S(i), s->ZMM_S(i));              \
         }                                                               \
@@ -524,6 +635,15 @@ void glue(helper_pshufhw, SUFFIX)(Reg *d, Reg *s, int order)
     (float ## size ## _lt(a, b, &env->sse_status) ? (a) : (b))
 #define FPU_MAX(size, a, b)                                     \
     (float ## size ## _lt(b, a, &env->sse_status) ? (a) : (b))
+
+#define X86_TRY_PACKED_F32_add(env, d, v, s, count) \
+    X86_TRY_PACKED_F32_ADD(env, d, v, s, count)
+#define X86_TRY_PACKED_F32_mul(env, d, v, s, count) \
+    X86_TRY_PACKED_F32_MUL(env, d, v, s, count)
+#define X86_TRY_PACKED_F32_sub(env, d, v, s, count) false
+#define X86_TRY_PACKED_F32_div(env, d, v, s, count) false
+#define X86_TRY_PACKED_F32_min(env, d, v, s, count) false
+#define X86_TRY_PACKED_F32_max(env, d, v, s, count) false
 
 SSE_HELPER_S(add, FPU_ADD)
 SSE_HELPER_S(sub, FPU_SUB)
@@ -641,6 +761,10 @@ void helper_cvtsd2ss(CPUX86State *env, Reg *d, Reg *v, Reg *s)
 void glue(helper_cvtdq2ps, SUFFIX)(CPUX86State *env, Reg *d, Reg *s)
 {
     int i;
+
+    if (X86_TRY_PACKED_I32_TO_F32(env, d, s, 2 << SHIFT)) {
+        return;
+    }
     for (i = 0; i < 2 << SHIFT; i++) {
         d->ZMM_S(i) = int32_to_float32(s->ZMM_L(i), &env->sse_status);
     }
@@ -2664,6 +2788,19 @@ void helper_sha256msg2(Reg *d, Reg *a, Reg *b)
 #endif
 
 #undef SSE_HELPER_S
+
+#undef X86_TRY_PACKED_F32_add
+#undef X86_TRY_PACKED_F32_sub
+#undef X86_TRY_PACKED_F32_mul
+#undef X86_TRY_PACKED_F32_div
+#undef X86_TRY_PACKED_F32_min
+#undef X86_TRY_PACKED_F32_max
+
+#if SHIFT == 2
+#undef X86_TRY_PACKED_F32_ADD
+#undef X86_TRY_PACKED_F32_MUL
+#undef X86_TRY_PACKED_I32_TO_F32
+#endif
 
 #undef LANE_WIDTH
 #undef SHIFT

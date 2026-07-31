@@ -236,6 +236,11 @@ static inline bool can_use_fpu(const float_status *s)
                   s->float_rounding_mode == float_round_nearest_even);
 }
 
+bool float_status_can_use_hardfloat(const float_status *s)
+{
+    return can_use_fpu(s);
+}
+
 /*
  * Hardfloat generation functions. Each operation can have two flavors:
  * either using softfloat primitives (e.g. float32_is_zero_or_normal) for
