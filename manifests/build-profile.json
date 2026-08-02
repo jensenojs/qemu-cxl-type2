@@ -8,7 +8,8 @@
     "--target-list=x86_64-softmmu"
   ],
   "targets": [
-    "qemu-system-x86_64"
+    "qemu-system-x86_64",
+    "contrib-plugins"
   ],
   "parallelism": 4,
   "required_gitlinks": {
@@ -35,6 +36,11 @@
     },
     {
       "path": "bin/qemu-system-x86_64",
+      "type": "file",
+      "mode": "0755"
+    },
+    {
+      "path": "libexec/qemu/libhotblocks.so",
       "type": "file",
       "mode": "0755"
     },

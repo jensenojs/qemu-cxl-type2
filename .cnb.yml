@@ -42,6 +42,8 @@ $:
         - name: recover and verify published QEMU Type-2 component
           script: |
             bash scripts/pull_component.sh \
+              --container-runtime docker \
+              --work-dir "$PWD/.work/component/pull" \
               "$PWD/.work/component/publish/candidate.json" \
               "$PWD/.work/component/verified"
 
@@ -57,5 +59,7 @@ $:
           script: |
             python3 -m unittest discover -s tests -p 'test_component_artifact.py'
             bash scripts/pull_component.sh \
+              --container-runtime docker \
+              --work-dir "$PWD/.work/restored/qemu-cxl-type2-pull" \
               manifests/artifacts/qemu-cxl-type2.candidate.json \
               "$PWD/.work/restored/qemu-cxl-type2"

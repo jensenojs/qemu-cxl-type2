@@ -33,7 +33,7 @@ git -C "$ROOT" submodule update --init --depth 1 subprojects/hetGPU
 
 [[ $WORK == "$ROOT/.work/component" ]]
 rm -rf "$WORK"
-mkdir -p "$BUILD" "$PAYLOAD/bin" "$PAYLOAD/share/qemu" "$PAYLOAD/evidence/cuda-api" "$WORK/evidence"
+mkdir -p "$BUILD" "$PAYLOAD/bin" "$PAYLOAD/libexec/qemu" "$PAYLOAD/share/qemu" "$PAYLOAD/evidence/cuda-api" "$WORK/evidence"
 
 python3 "$ROOT/tests/test_component_artifact.py"
 ccache --show-stats | tee "$WORK/evidence/ccache-before.txt"
@@ -41,12 +41,14 @@ ccache --show-stats | tee "$WORK/evidence/ccache-before.txt"
     cd "$BUILD"
     CC='ccache gcc' CXX='ccache g++' "$ROOT/configure" "${profile[@]:2}"
 )
-ninja -C "$BUILD" -j"$PARALLEL" qemu-system-x86_64
+ninja -C "$BUILD" -j"$PARALLEL" qemu-system-x86_64 contrib-plugins
 ccache --show-stats | tee "$WORK/evidence/ccache-after.txt"
 
 readonly QEMU=$BUILD/qemu-system-x86_64
 [[ -x $QEMU ]]
 install -m 0755 "$QEMU" "$PAYLOAD/bin/qemu-system-x86_64"
+install -m 0755 "$BUILD/contrib/plugins/libhotblocks.so" \
+    "$PAYLOAD/libexec/qemu/libhotblocks.so"
 install -m 0644 "$ROOT/hw/cxl/cxl_type2.c" "$PAYLOAD/evidence/cuda-api/cxl_type2.c"
 install -m 0644 "$ROOT/hw/cxl/cxl_hetgpu.c" "$PAYLOAD/evidence/cuda-api/cxl_hetgpu.c"
 install -m 0644 "$ROOT/include/hw/cxl/cxl_type2_gpu_cmd.h" \
@@ -54,30 +56,7 @@ install -m 0644 "$ROOT/include/hw/cxl/cxl_type2_gpu_cmd.h" \
 for firmware in bios-256k.bin kvmvapic.bin linuxboot_dma.bin; do
     install -m 0644 "$ROOT/pc-bios/$firmware" "$PAYLOAD/share/qemu/$firmware"
 done
-"$PAYLOAD/bin/qemu-system-x86_64" --version | tee "$WORK/evidence/version.txt"
-"$PAYLOAD/bin/qemu-system-x86_64" -device help | tee "$WORK/evidence/device-help.txt"
-grep -Fq 'cxl-type2' "$WORK/evidence/device-help.txt"
-set +e
-timeout 3 "$PAYLOAD/bin/qemu-system-x86_64" \
-    -accel tcg,thread=multi \
-    -cpu max \
-    -S \
-    -display none \
-    -monitor none \
-    -serial none \
-    -nic none \
-    -vga none \
-    -m 256M \
-    -L "$PAYLOAD/share/qemu" \
-    >"$WORK/evidence/paused-boot.stdout" \
-    2>"$WORK/evidence/paused-boot.stderr"
-paused_boot_rc=$?
-set -e
-[[ $paused_boot_rc -eq 124 ]]
-printf 'paused_boot=pass\n' | tee "$WORK/evidence/paused-boot.txt"
-file "$PAYLOAD/bin/qemu-system-x86_64" | tee "$WORK/evidence/file.txt"
-readelf -d "$PAYLOAD/bin/qemu-system-x86_64" | tee "$WORK/evidence/readelf-dynamic.txt"
-ldd "$PAYLOAD/bin/qemu-system-x86_64" | tee "$WORK/evidence/ldd.txt"
+bash "$ROOT/scripts/verify_component_payload.sh" "$PAYLOAD" "$WORK/evidence"
 printf 'hetgpu_commit=%s\n' "$HETGPU_COMMIT" | tee "$WORK/evidence/gitlinks.txt"
 
 printf 'component_build=pass\npayload=%s\n' "$PAYLOAD"

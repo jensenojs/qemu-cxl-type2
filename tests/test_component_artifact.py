@@ -101,6 +101,7 @@ class ComponentArtifactTest(unittest.TestCase):
                     "mode": "0644",
                 },
                 {"path": "bin/qemu-system-x86_64", "type": "file", "mode": "0755"},
+                {"path": "libexec/qemu/libhotblocks.so", "type": "file", "mode": "0755"},
                 {"path": "share/qemu/bios-256k.bin", "type": "file", "mode": "0644"},
                 {"path": "share/qemu/kvmvapic.bin", "type": "file", "mode": "0644"},
                 {"path": "share/qemu/linuxboot_dma.bin", "type": "file", "mode": "0644"},
