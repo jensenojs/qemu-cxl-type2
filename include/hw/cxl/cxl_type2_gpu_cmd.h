@@ -9,6 +9,7 @@
 #define CXL_TYPE2_GPU_CMD_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 /* GPU Command Register Offsets (from BAR2 base) */
 #define CXL_GPU_REG_MAGIC           0x0000  /* Magic number: 0x43584C32 "CXL2" */
@@ -37,6 +38,53 @@
 #define CXL_GPU_REG_RESULT2         0x0090  /* Result 2 */
 #define CXL_GPU_REG_RESULT3         0x0098  /* Result 3 */
 
+#define CXL_GPU_DESCRIPTOR_OFFSET 0x801000
+#define CXL_GPU_DESCRIPTOR_REGION_SIZE 0x1000
+#define CXL_GPU_DESCRIPTOR_WIRE_SIZE 0x0100
+#define CXL_GPU_DESCRIPTOR_PROTOCOL_VERSION 1U
+#define CXL_GPU_DESCRIPTOR_DOORBELL_OFFSET CXL_GPU_REG_CMD
+#define CXL_GPU_DESCRIPTOR_DOORBELL_VALUE 1U
+
+#define CXL_GPU_DESCRIPTOR_COMPLETION_EMPTY 0U
+#define CXL_GPU_DESCRIPTOR_COMPLETION_COMPLETE 1U
+#define CXL_GPU_DESCRIPTOR_COMPLETION_ERROR 2U
+
+typedef struct CXLGPURAMCommandDescriptor {
+    uint32_t protocol_version;
+    uint32_t descriptor_size;
+    uint64_t request_submission;
+    uint64_t request_device_generation;
+    uint64_t request_command;
+    uint64_t request_call_id;
+    uint64_t request_case_epoch;
+    uint64_t params[8];
+    uint64_t completion_submission;
+    uint64_t completion_device_generation;
+    uint64_t completion_status;
+    int64_t result;
+    uint64_t results[4];
+    uint64_t active_case_epoch;
+    uint64_t device_generation;
+    uint8_t reserved[0x40];
+} CXLGPURAMCommandDescriptor;
+
+_Static_assert(sizeof(CXLGPURAMCommandDescriptor) == CXL_GPU_DESCRIPTOR_WIRE_SIZE,
+               "CXL GPU descriptor size mismatch");
+_Static_assert(offsetof(CXLGPURAMCommandDescriptor, request_submission) == 0x08,
+               "CXL GPU request submission offset mismatch");
+_Static_assert(offsetof(CXLGPURAMCommandDescriptor, params) == 0x30,
+               "CXL GPU params offset mismatch");
+_Static_assert(offsetof(CXLGPURAMCommandDescriptor, completion_submission) == 0x70,
+               "CXL GPU completion submission offset mismatch");
+_Static_assert(offsetof(CXLGPURAMCommandDescriptor, completion_status) == 0x80,
+               "CXL GPU completion status offset mismatch");
+_Static_assert(offsetof(CXLGPURAMCommandDescriptor, results) == 0x90,
+               "CXL GPU results offset mismatch");
+_Static_assert(offsetof(CXLGPURAMCommandDescriptor, active_case_epoch) == 0xb0,
+               "CXL GPU case epoch offset mismatch");
+_Static_assert(offsetof(CXLGPURAMCommandDescriptor, device_generation) == 0xb8,
+               "CXL GPU generation offset mismatch");
+
 /* Device info registers */
 #define CXL_GPU_REG_DEV_NAME        0x0100  /* Device name (64 bytes) */
 #define CXL_GPU_REG_TOTAL_MEM       0x0140  /* Total memory */
@@ -53,7 +101,14 @@
  * this window independent from the decoded CUBIN size. */
 #define CXL_GPU_DATA_OFFSET         0x1000    /* Data buffer offset */
 #define CXL_GPU_DATA_SIZE           0x800000  /* Data buffer size (8 MiB) */
-#define CXL_GPU_CMD_REG_SIZE        0x801000  /* 8 MiB payload + 4 KiB registers */
+#define CXL_GPU_CMD_REG_SIZE        0x802000  /* registers + 8 MiB payload + descriptor page */
+
+_Static_assert(CXL_GPU_DESCRIPTOR_OFFSET % CXL_GPU_DESCRIPTOR_REGION_SIZE == 0,
+               "CXL GPU descriptor region must be page aligned");
+_Static_assert(CXL_GPU_DESCRIPTOR_WIRE_SIZE <= CXL_GPU_DESCRIPTOR_REGION_SIZE,
+               "CXL GPU descriptor wire does not fit in its RAM region");
+_Static_assert(CXL_GPU_DESCRIPTOR_OFFSET >= CXL_GPU_DATA_OFFSET + CXL_GPU_DATA_SIZE,
+               "CXL GPU descriptor region overlaps the payload window");
 
 /* Module payload encoding in CXL_GPU_REG_PARAM1. */
 #define CXL_GPU_MODULE_DATA_ZSTD    (1U << 0)
@@ -74,7 +129,7 @@
 
 /* Magic number */
 #define CXL_GPU_MAGIC               0x43584C32  /* "CXL2" */
-#define CXL_GPU_VERSION             0x00010B00  /* v1.11.0: BAR4-backed HtoD async */
+#define CXL_GPU_VERSION             0x00010E00  /* v1.14.0: CUDA 12 graph executable update */
 
 #define CXL_GPU_STREAM_WIRE_NULL       0xffffffffffffffffULL
 #define CXL_GPU_STREAM_WIRE_LEGACY     0xfffffffffffffffeULL
@@ -159,6 +214,7 @@ typedef enum {
     CXL_GPU_CMD_LINK_DESTROY = 0x45,
     CXL_GPU_CMD_FUNC_GET_ATTRIBUTE = 0x46,
     CXL_GPU_CMD_FUNC_GET_PARAM_LAYOUT = 0x47,
+    CXL_GPU_CMD_GRAPH_EXEC_UPDATE = 0x48,
 
     CXL_GPU_CMD_STREAM_CREATE   = 0x50,
     CXL_GPU_CMD_STREAM_DESTROY  = 0x51,

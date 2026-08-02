@@ -16,6 +16,7 @@
 #include "hw/cxl/cxl_device.h"
 #include "hw/cxl/cxl_component.h"
 #include "hw/cxl/cxl_hetgpu.h"
+#include "hw/cxl/cxl_type2_gpu_cmd.h"
 #include "hw/cxl/cxl_type2_coherency.h"
 #include "hw/cxl/cxl_p2p_dma.h"
 #include "qemu/thread.h"
@@ -218,10 +219,10 @@ typedef struct CXLType2State {
     MemoryRegion bar0;                 /* Component registers */
     MemoryRegion cache_mem;            /* Type 1: Cache for coherent access */
     MemoryRegion cache_io;             /* Cache access interceptor */
+    MemoryRegion gpu_descriptor_mem;   /* RAM-backed BAR2 command descriptor */
     MemoryRegion gpu_data_mem;         /* RAM-backed BAR2 command data window */
     MemoryRegion device_mem;           /* Type 3: Device-attached memory */
     MemoryRegion device_mem_io;        /* Device memory interceptor */
-    MemoryRegion gpu_cmd_region;       /* GPU command registers */
 
     /* GPU command state */
     struct {
@@ -234,6 +235,10 @@ typedef struct CXLType2State {
         uint64_t results[4];
         uint8_t  *data;                /* Host pointer into gpu_data_mem */
         size_t   data_size;            /* Size of data buffer */
+        CXLGPURAMCommandDescriptor *descriptor;
+        uint64_t device_generation;
+        uint64_t last_accepted_submission;
+        uint64_t last_completed_submission;
         /* Guest-visible IDs are indexes into tables that grow with the active
          * CUDA workload. A case reset releases both tables and invalidates all
          * IDs from that case. */

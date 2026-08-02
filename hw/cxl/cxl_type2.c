@@ -16,6 +16,7 @@
 #include "qemu/error-report.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qemu/plugin.h"
 #include "qemu/range.h"
 #include "qemu/rcu.h"
 #include "qemu/sockets.h"
@@ -37,6 +38,7 @@
 #include "hw/pci/msix.h"
 #include "hw/qdev-properties.h"
 #include "hw/qdev-properties-system.h"
+#include "migration/vmstate.h"
 #include "system/memory.h"
 #include "io/channel-socket.h"
 #include <sys/mman.h>
@@ -2440,6 +2442,17 @@ static const char *cxl_type2_paired_case_name(uint32_t case_kind)
     }
 }
 
+static void cxl_type2_notify_case_scope(uint64_t run_binding,
+                                        uint32_t case_kind, uint64_t epoch,
+                                        bool begin)
+{
+    g_autofree char *identity = g_strdup_printf(
+        "run_binding=%" PRIu64 " case=%s epoch=%" PRIu64,
+        run_binding, cxl_type2_paired_case_name(case_kind), epoch);
+
+    qemu_plugin_notify_scope("type2-case", identity, begin);
+}
+
 static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
 {
     ct2d->paired_case.active_command_count = 0;
@@ -2508,7 +2521,8 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
              " launch_calls=%" PRIu64 " launch_busy_ns=%" PRIu64
              " htod_async_calls=%" PRIu64 " htod_async_busy_ns=%" PRIu64
              " dtoh_calls=%" PRIu64 " dtoh_busy_ns=%" PRIu64
-             " stream_sync_calls=%" PRIu64 " stream_sync_busy_ns=%" PRIu64 "\n",
+             " stream_sync_calls=%" PRIu64 " stream_sync_busy_ns=%" PRIu64
+             " htod_pending_copies=%" PRIu64 " htod_pending_bytes=%" PRIu64 "\n",
              run_binding, cxl_type2_paired_case_name(case_kind), epoch,
              ct2d->paired_case.active_command_count,
              ct2d->paired_case.active_command_failures,
@@ -2517,7 +2531,8 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
              calls[CXL_GPU_CMD_MEM_COPY_HTOD_ASYNC],
              busy[CXL_GPU_CMD_MEM_COPY_HTOD_ASYNC],
              calls[CXL_GPU_CMD_MEM_COPY_DTOH], busy[CXL_GPU_CMD_MEM_COPY_DTOH],
-             calls[CXL_GPU_CMD_STREAM_SYNC], busy[CXL_GPU_CMD_STREAM_SYNC]);
+             calls[CXL_GPU_CMD_STREAM_SYNC], busy[CXL_GPU_CMD_STREAM_SYNC],
+             ct2d->htod_pending_copies, ct2d->htod_pending_bytes);
 
     qemu_log("KIMI_CXL_REQUEST_SUMMARY run_binding=%" PRIu64
              " case=%s epoch=%" PRIu64
@@ -3521,6 +3536,7 @@ static void cxl_type2_paired_case_begin(CXLType2State *ct2d,
     ct2d->paired_case.active_first_sequence = trace_sequence;
     ct2d->paired_case.active_config_binding = config_binding;
     cxl_type2_reset_case_summary(ct2d);
+    cxl_type2_notify_case_scope(run_binding, case_kind, epoch, true);
     ct2d->paired_case.next_epoch++;
     ct2d->gpu_cmd.results[0] = epoch;
     ct2d->gpu_cmd.results[1] = case_kind;
@@ -3642,6 +3658,7 @@ static void cxl_type2_paired_case_end(CXLType2State *ct2d,
              result.error);
 
     cxl_type2_log_case_summary(ct2d, run_binding, case_kind, epoch);
+    cxl_type2_notify_case_scope(run_binding, case_kind, epoch, false);
 
     cxl_type2_log_kimi_case_stage(
         run_binding, case_kind, epoch, "case_end", "end",
@@ -5010,6 +5027,47 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         }
         break;
 
+    case CXL_GPU_CMD_GRAPH_EXEC_UPDATE:
+        memset(ct2d->gpu_cmd.results, 0xff, sizeof(ct2d->gpu_cmd.results));
+        if (!hetgpu->initialized) {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
+            break;
+        }
+        {
+            uint64_t graph_exec_id = ct2d->gpu_cmd.params[0];
+            uint64_t graph_id = ct2d->gpu_cmd.params[1];
+            HetGPUGraphExecUpdateResultInfo info = { 0 };
+
+            if (graph_exec_id > UINT32_MAX || graph_id > UINT32_MAX ||
+                graph_exec_id >= ct2d->gpu_cmd.num_graph_execs ||
+                graph_id >= ct2d->gpu_cmd.num_graphs ||
+                !ct2d->gpu_cmd.graph_execs[graph_exec_id] ||
+                !ct2d->gpu_cmd.graphs[graph_id]) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                break;
+            }
+            int cuda_result = hetgpu_cuda_graph_exec_update(
+                hetgpu, ct2d->gpu_cmd.graph_execs[graph_exec_id],
+                ct2d->gpu_cmd.graphs[graph_id], &info);
+            ct2d->gpu_cmd.cmd_result = cuda_result;
+            ct2d->gpu_cmd.results[0] = (uint64_t)(int64_t)info.result;
+            HetGPUGraphNode nodes[] = { info.error_node,
+                                       info.error_from_node };
+            for (size_t i = 0; i < ARRAY_SIZE(nodes); i++) {
+                uint32_t node_id;
+
+                if (nodes[i] && cxl_type2_register_gpu_handle(
+                        &ct2d->gpu_cmd.graph_nodes,
+                        &ct2d->gpu_cmd.graph_nodes_capacity,
+                        &ct2d->gpu_cmd.num_graph_nodes, nodes[i], &node_id)) {
+                    ct2d->gpu_cmd.results[i + 1] = node_id;
+                } else if (nodes[i]) {
+                    qemu_log("CXL Type2: failed to register graph update error node\n");
+                }
+            }
+        }
+        break;
+
     case CXL_GPU_CMD_GRAPH_NODE_GET_TYPE:
         memset(ct2d->gpu_cmd.results, 0, sizeof(ct2d->gpu_cmd.results));
         if (!hetgpu->initialized) {
@@ -5642,6 +5700,13 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             uint64_t stream_wire = ct2d->gpu_cmd.params[3];
             uint8_t *mem = memory_region_get_ram_ptr(&ct2d->device_mem);
             void *stream = NULL;
+            uint64_t requests_before;
+            uint64_t bytes_before;
+            uint64_t latency_before;
+            int64_t aggregate_begin_ns;
+            int64_t aggregate_end_ns;
+            bool access_ok;
+            PCIDevice *pci_dev = PCI_DEVICE(ct2d);
 
             if (!xfer_size || xfer_size > CXL_GPU_BULK_TRANSFER_SIZE ||
                 bar4_offset > ct2d->device_mem_size ||
@@ -5654,9 +5719,38 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
                 break;
             }
-            if (!cxl_type2_bulk_memsim_access(ct2d, CXL_OP_READ,
-                                              bar4_offset, xfer_size,
-                                              mem + bar4_offset)) {
+            requests_before = ct2d->paired_case.active_cxl_request_count;
+            bytes_before = ct2d->paired_case.active_cxl_logical_bytes;
+            latency_before =
+                ct2d->paired_case.active_cxl_server_reported_latency_ns;
+            aggregate_begin_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+            access_ok = cxl_type2_bulk_memsim_access(
+                ct2d, CXL_OP_READ, bar4_offset, xfer_size, mem + bar4_offset);
+            aggregate_end_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+            qemu_log("CXL WEIGHT_SOURCE event=access-aggregate"
+                     " run_binding=%" PRIu64 " case=%s case_epoch=%" PRIu64
+                     " call_id=0x%016" PRIx64 " device_bdf=%04x:%02x:%02x.%x"
+                     " bar_index=4 bar_offset=0x%016" PRIx64
+                     " range_bytes=%zu destination_cuda_start=0x%016" PRIx64
+                     " destination_cuda_bytes=%zu op=read accesses=%" PRIu64
+                     " bytes=%" PRIu64 " cache_hits=unavailable"
+                     " cache_misses=unavailable latency_model=unavailable"
+                     " server_reported_latency_ns=%" PRIu64
+                     " host_ns_begin=%" PRId64 " host_ns_end=%" PRId64
+                     " result=%s\n",
+                     ct2d->paired_case.run_binding,
+                     cxl_type2_paired_case_name(ct2d->paired_case.active_case),
+                     ct2d->paired_case.active_epoch, ct2d->gpu_cmd.call_id,
+                     0, pci_bus_num(pci_get_bus(pci_dev)), PCI_SLOT(pci_dev->devfn),
+                     PCI_FUNC(pci_dev->devfn), bar4_offset, xfer_size,
+                     dst_dev_ptr, xfer_size,
+                     ct2d->paired_case.active_cxl_request_count - requests_before,
+                     ct2d->paired_case.active_cxl_logical_bytes - bytes_before,
+                     ct2d->paired_case.active_cxl_server_reported_latency_ns -
+                         latency_before,
+                     aggregate_begin_ns, aggregate_end_ns,
+                     access_ok ? "success" : "failed");
+            if (!access_ok) {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
                 break;
             }
@@ -6203,29 +6297,6 @@ static uint64_t cxl_type2_gpu_cmd_read(void *opaque, hwaddr addr, unsigned size)
     case CXL_GPU_REG_CAPS:
         value = ct2d->gpu_cmd.capabilities;
         break;
-    case CXL_GPU_REG_CMD_STATUS:
-        value = ct2d->gpu_cmd.cmd_status;
-        // fprintf(stderr, "CXL GPU: read CMD_STATUS = %lu\n", (unsigned long)value);
-        break;
-    case CXL_GPU_REG_CMD_RESULT:
-        value = ct2d->gpu_cmd.cmd_result;
-        break;
-    case CXL_GPU_REG_CALL_ID:
-        value = ct2d->gpu_cmd.call_id;
-        break;
-    case CXL_GPU_REG_RESULT0:
-        value = ct2d->gpu_cmd.results[0];
-        // fprintf(stderr, "CXL GPU: read RESULT0 = 0x%lx\n", (unsigned long)value);
-        break;
-    case CXL_GPU_REG_RESULT1:
-        value = ct2d->gpu_cmd.results[1];
-        break;
-    case CXL_GPU_REG_RESULT2:
-        value = ct2d->gpu_cmd.results[2];
-        break;
-    case CXL_GPU_REG_RESULT3:
-        value = ct2d->gpu_cmd.results[3];
-        break;
     case CXL_GPU_REG_TOTAL_MEM:
     case CXL_GPU_REG_FREE_MEM:
         value = 0;
@@ -6322,6 +6393,76 @@ static uint64_t cxl_type2_gpu_cmd_read(void *opaque, hwaddr addr, unsigned size)
     return value;
 }
 
+static void cxl_type2_descriptor_publish_error(CXLType2State *ct2d,
+                                                uint64_t submission,
+                                                uint64_t generation,
+                                                const char *reason)
+{
+    CXLGPURAMCommandDescriptor *descriptor = ct2d->gpu_cmd.descriptor;
+
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "CXL GPU descriptor protocol error: %s submission=%" PRIu64
+                  " generation=%" PRIu64 "\n",
+                  reason, submission, generation);
+    descriptor->completion_submission = submission;
+    descriptor->completion_device_generation = generation;
+    descriptor->result = CXL_GPU_ERROR_UNKNOWN;
+    memset(descriptor->results, 0, sizeof(descriptor->results));
+    descriptor->active_case_epoch = ct2d->paired_case.active_epoch;
+    descriptor->device_generation = 0;
+    ct2d->gpu_cmd.device_generation = 0;
+    qatomic_store_release(&descriptor->completion_status,
+                          CXL_GPU_DESCRIPTOR_COMPLETION_ERROR);
+}
+
+static void cxl_type2_gpu_descriptor_doorbell(CXLType2State *ct2d,
+                                               uint64_t value,
+                                               unsigned size)
+{
+    CXLGPURAMCommandDescriptor request;
+    CXLGPURAMCommandDescriptor *descriptor = ct2d->gpu_cmd.descriptor;
+    CXLType2DescriptorRequestVerdict verdict;
+
+    if (!descriptor) {
+        return;
+    }
+    smp_rmb();
+    memcpy(&request, descriptor, sizeof(request));
+
+    verdict = cxl_type2_descriptor_validate_request(
+        &request, value, size, ct2d->gpu_cmd.device_generation,
+        ct2d->gpu_cmd.last_accepted_submission,
+        ct2d->gpu_cmd.last_completed_submission, ct2d->paired_case.required,
+        ct2d->paired_case.active_epoch);
+    if (verdict == CXL_TYPE2_DESCRIPTOR_DUPLICATE) {
+        return;
+    }
+    if (verdict != CXL_TYPE2_DESCRIPTOR_ACCEPT) {
+        cxl_type2_descriptor_publish_error(ct2d, request.request_submission,
+                                           request.request_device_generation,
+                                           cxl_type2_descriptor_verdict_reason(
+                                               verdict));
+        return;
+    }
+
+    ct2d->gpu_cmd.last_accepted_submission = request.request_submission;
+    ct2d->gpu_cmd.call_id = request.request_call_id;
+    memcpy(ct2d->gpu_cmd.params, request.params, sizeof(request.params));
+    memset(ct2d->gpu_cmd.results, 0, sizeof(ct2d->gpu_cmd.results));
+    cxl_type2_gpu_execute_cmd(ct2d, request.request_command);
+
+    descriptor->completion_submission = request.request_submission;
+    descriptor->completion_device_generation = request.request_device_generation;
+    descriptor->result = ct2d->gpu_cmd.cmd_result;
+    memcpy(descriptor->results, ct2d->gpu_cmd.results,
+           sizeof(descriptor->results));
+    descriptor->active_case_epoch = ct2d->paired_case.active_epoch;
+    descriptor->device_generation = ct2d->gpu_cmd.device_generation;
+    ct2d->gpu_cmd.last_completed_submission = request.request_submission;
+    qatomic_store_release(&descriptor->completion_status,
+                          CXL_GPU_DESCRIPTOR_COMPLETION_COMPLETE);
+}
+
 static void cxl_type2_gpu_cmd_write(void *opaque, hwaddr addr,
                                      uint64_t value, unsigned size)
 {
@@ -6329,35 +6470,7 @@ static void cxl_type2_gpu_cmd_write(void *opaque, hwaddr addr,
 
     switch (addr) {
     case CXL_GPU_REG_CMD:
-        /* Execute command */
-        cxl_type2_gpu_execute_cmd(ct2d, value);
-        break;
-    case CXL_GPU_REG_CALL_ID:
-        ct2d->gpu_cmd.call_id = value;
-        break;
-    case CXL_GPU_REG_PARAM0:
-        ct2d->gpu_cmd.params[0] = value;
-        break;
-    case CXL_GPU_REG_PARAM1:
-        ct2d->gpu_cmd.params[1] = value;
-        break;
-    case CXL_GPU_REG_PARAM2:
-        ct2d->gpu_cmd.params[2] = value;
-        break;
-    case CXL_GPU_REG_PARAM3:
-        ct2d->gpu_cmd.params[3] = value;
-        break;
-    case CXL_GPU_REG_PARAM4:
-        ct2d->gpu_cmd.params[4] = value;
-        break;
-    case CXL_GPU_REG_PARAM5:
-        ct2d->gpu_cmd.params[5] = value;
-        break;
-    case CXL_GPU_REG_PARAM6:
-        ct2d->gpu_cmd.params[6] = value;
-        break;
-    case CXL_GPU_REG_PARAM7:
-        ct2d->gpu_cmd.params[7] = value;
+        cxl_type2_gpu_descriptor_doorbell(ct2d, value, size);
         break;
     default:
         break;
@@ -6472,6 +6585,23 @@ static void cxl_type2_reset(DeviceState *dev)
 
     /* Reset statistics */
     memset(&ct2d->stats, 0, sizeof(ct2d->stats));
+
+    if (ct2d->gpu_cmd.descriptor) {
+        CXLGPURAMCommandDescriptor *descriptor = ct2d->gpu_cmd.descriptor;
+
+        if (ct2d->paired_case.active_case != CXL_GPU_CASE_NONE ||
+            ct2d->gpu_cmd.device_generation == UINT64_MAX) {
+            ct2d->gpu_cmd.device_generation = 0;
+            descriptor->device_generation = 0;
+        } else {
+            uint64_t generation = ct2d->gpu_cmd.device_generation + 1;
+            memset(descriptor, 0, sizeof(*descriptor));
+            ct2d->gpu_cmd.device_generation = generation;
+            ct2d->gpu_cmd.last_accepted_submission = 0;
+            ct2d->gpu_cmd.last_completed_submission = 0;
+            descriptor->device_generation = generation;
+        }
+    }
 
     qemu_log("CXL Type2: Device reset\n");
 }
@@ -6590,6 +6720,17 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
 
     memory_region_add_subregion_overlap(&ct2d->cache_mem, 0, &ct2d->cache_io, 1);
 
+    memory_region_init_ram(&ct2d->gpu_descriptor_mem, OBJECT(ct2d),
+                           "cxl-type2-gpu-command-descriptor",
+                           CXL_GPU_DESCRIPTOR_REGION_SIZE, &local_err);
+    if (local_err) {
+        error_propagate(errp, local_err);
+        return;
+    }
+    memory_region_add_subregion_overlap(&ct2d->cache_mem,
+                                        CXL_GPU_DESCRIPTOR_OFFSET,
+                                        &ct2d->gpu_descriptor_mem, 2);
+
     /* The command data window is a payload mailbox, not a CXL cache access.
      * Expose it as RAM so guest bulk copies do not dispatch one device callback
      * per store through cache_io. */
@@ -6649,6 +6790,11 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
 
     ct2d->gpu_cmd.data_size = CXL_GPU_DATA_SIZE;
     ct2d->gpu_cmd.data = memory_region_get_ram_ptr(&ct2d->gpu_data_mem);
+    ct2d->gpu_cmd.descriptor =
+        memory_region_get_ram_ptr(&ct2d->gpu_descriptor_mem);
+    memset(ct2d->gpu_cmd.descriptor, 0, CXL_GPU_DESCRIPTOR_WIRE_SIZE);
+    ct2d->gpu_cmd.device_generation = 1;
+    ct2d->gpu_cmd.descriptor->device_generation = 1;
 
     /* Set capabilities */
     ct2d->gpu_cmd.capabilities = CXL_GPU_CAP_BULK_TRANSFER |
@@ -6717,6 +6863,7 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
 static void cxl_type2_exit(PCIDevice *pci_dev)
 {
     CXLType2State *ct2d = CXL_TYPE2(pci_dev);
+
 
     /* Disconnect from CXLMemSim */
     cxlmemsim_disconnect(ct2d);
@@ -6837,6 +6984,11 @@ static const Property cxl_type2_props[] = {
                        mhsld.coherency_latency_ns, 200),
 };
 
+static const VMStateDescription cxl_type2_vmstate = {
+    .name = TYPE_CXL_TYPE2,
+    .unmigratable = 1,
+};
+
 static void cxl_type2_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -6850,6 +7002,7 @@ static void cxl_type2_class_init(ObjectClass *oc, const void *data)
     pc->class_id = PCI_CLASS_MEMORY_CXL;
 
     dc->desc = "CXL Type 2 Accelerator Device with Coherent Memory (GPU Passthrough)";
+    dc->vmsd = &cxl_type2_vmstate;
     device_class_set_legacy_reset(dc, cxl_type2_reset);
     device_class_set_props(dc, cxl_type2_props);
 }

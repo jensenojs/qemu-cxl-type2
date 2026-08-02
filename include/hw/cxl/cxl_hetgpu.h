@@ -632,6 +632,15 @@ int hetgpu_cuda_graph_instantiate(HetGPUState *state, HetGPUGraph graph,
                                   HetGPUGraphExec *graph_exec,
                                   HetGPUGraphNode *error_node,
                                   char *log_buffer, size_t buffer_size);
+typedef struct HetGPUGraphExecUpdateResultInfo {
+    int result;
+    HetGPUGraphNode error_node;
+    HetGPUGraphNode error_from_node;
+} HetGPUGraphExecUpdateResultInfo;
+int hetgpu_cuda_graph_exec_update(HetGPUState *state,
+                                  HetGPUGraphExec graph_exec,
+                                  HetGPUGraph graph,
+                                  HetGPUGraphExecUpdateResultInfo *result_info);
 int hetgpu_cuda_graph_get_nodes(HetGPUState *state, HetGPUGraph graph,
                                 HetGPUGraphNode *nodes, size_t *num_nodes);
 int hetgpu_cuda_graph_node_get_type(HetGPUState *state,

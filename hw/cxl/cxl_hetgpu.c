@@ -100,6 +100,8 @@ typedef int (*cuGraphExecDestroy_fn)(void *);
 typedef int (*cuGraphLaunch_fn)(void *, void *);
 typedef int (*cuGraphDestroy_fn)(void *);
 typedef int (*cuGraphInstantiate_fn)(void **, void *, void **, char *, size_t);
+typedef int (*cuGraphExecUpdate_fn)(void *, void *,
+                                    HetGPUGraphExecUpdateResultInfo *);
 typedef int (*cuGraphGetNodes_fn)(void *, void **, size_t *);
 typedef int (*cuGraphNodeGetType_fn)(void *, int *);
 typedef int (*cuLinkCreate_fn)(unsigned int, int *, void **, void **);
@@ -271,6 +273,7 @@ static struct {
     cuGraphLaunch_fn cuGraphLaunch;
     cuGraphDestroy_fn cuGraphDestroy;
     cuGraphInstantiate_fn cuGraphInstantiate;
+    cuGraphExecUpdate_fn cuGraphExecUpdate;
     cuGraphGetNodes_fn cuGraphGetNodes;
     cuGraphNodeGetType_fn cuGraphNodeGetType;
     cuLinkCreate_fn cuLinkCreate;
@@ -449,6 +452,8 @@ static HetGPUError hetgpu_init_internal(HetGPUState *state,
                 dlsym(g_cuda_lib_handle, "cuGraphDestroy");
             g_cuda_funcs.cuGraphInstantiate =
                 dlsym(g_cuda_lib_handle, "cuGraphInstantiate_v2");
+            g_cuda_funcs.cuGraphExecUpdate =
+                dlsym(g_cuda_lib_handle, "cuGraphExecUpdate_v2");
             g_cuda_funcs.cuGraphGetNodes =
                 dlsym(g_cuda_lib_handle, "cuGraphGetNodes");
             g_cuda_funcs.cuGraphNodeGetType =
@@ -2361,6 +2366,32 @@ int hetgpu_cuda_graph_instantiate(HetGPUState *state, HetGPUGraph graph,
     }
     result = HETGPU_CUDA_CALL(cuGraphInstantiate, graph_exec, graph,
                               error_node, log_buffer, buffer_size);
+    cuda_unlock(state);
+    return result;
+}
+
+int hetgpu_cuda_graph_exec_update(HetGPUState *state,
+                                  HetGPUGraphExec graph_exec,
+                                  HetGPUGraph graph,
+                                  HetGPUGraphExecUpdateResultInfo *result_info)
+{
+    int result;
+
+    if (!state || !state->initialized) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    if (!graph_exec || !graph || !result_info) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if (state->backend == HETGPU_BACKEND_SIMULATION ||
+        !g_cuda_funcs.cuGraphExecUpdate) {
+        return CUDA_ERROR_NOT_SUPPORTED;
+    }
+    if (!cuda_lock(state)) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    result = HETGPU_CUDA_CALL(cuGraphExecUpdate, graph_exec, graph,
+                              result_info);
     cuda_unlock(state);
     return result;
 }
