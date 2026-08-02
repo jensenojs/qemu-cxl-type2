@@ -46,6 +46,9 @@ get_plugin_meminfo_rw(qemu_plugin_meminfo_t i)
 #ifdef CONFIG_PLUGIN
 extern QemuOptsList qemu_plugin_opts;
 
+void qemu_plugin_notify_scope(const char *scope, const char *identity,
+                              bool begin);
+
 static inline void qemu_plugin_add_opts(void)
 {
     qemu_add_opts(&qemu_plugin_opts);
@@ -63,6 +66,7 @@ union qemu_plugin_cb_sig {
     qemu_plugin_vcpu_mem_cb_t        vcpu_mem;
     qemu_plugin_vcpu_syscall_cb_t    vcpu_syscall;
     qemu_plugin_vcpu_syscall_ret_cb_t vcpu_syscall_ret;
+    qemu_plugin_scope_cb_t            scope;
     void *generic;
 };
 
@@ -278,6 +282,11 @@ static inline void qemu_plugin_flush_cb(void)
 { }
 
 static inline void qemu_plugin_atexit_cb(void)
+{ }
+
+static inline void qemu_plugin_notify_scope(const char *scope,
+                                            const char *identity,
+                                            bool begin)
 { }
 
 static inline

@@ -73,6 +73,21 @@ void qemu_plugin_register_vcpu_init_cb(qemu_plugin_id_t id,
     plugin_register_cb(id, QEMU_PLUGIN_EV_VCPU_INIT, cb);
 }
 
+void qemu_plugin_register_scope_cb(qemu_plugin_id_t id,
+                                   qemu_plugin_scope_cb_t cb,
+                                   void *userdata)
+{
+    struct qemu_plugin_ctx *ctx;
+
+    QEMU_LOCK_GUARD(&plugin.lock);
+    ctx = plugin_id_to_ctx_locked(id);
+    if (unlikely(ctx->uninstalling)) {
+        return;
+    }
+    ctx->scope_cb = cb;
+    ctx->scope_udata = userdata;
+}
+
 void qemu_plugin_register_vcpu_exit_cb(qemu_plugin_id_t id,
                                        qemu_plugin_vcpu_simple_cb_t cb)
 {
@@ -643,4 +658,3 @@ uint64_t qemu_plugin_u64_sum(qemu_plugin_u64 entry)
     }
     return total;
 }
-

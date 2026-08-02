@@ -64,8 +64,6 @@ QemuOptsList qemu_plugin_opts = {
 
 typedef int (*qemu_plugin_install_func_t)(qemu_plugin_id_t, const qemu_info_t *, int, char **);
 
-extern struct qemu_plugin_state plugin;
-
 void qemu_plugin_add_dyn_cb_arr(GArray *arr)
 {
     uint32_t hash = qemu_xxhash2((uint64_t)(uintptr_t)arr);

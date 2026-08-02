@@ -144,6 +144,12 @@ typedef void (*qemu_plugin_simple_cb_t)(qemu_plugin_id_t id);
  */
 typedef void (*qemu_plugin_udata_cb_t)(qemu_plugin_id_t id, void *userdata);
 
+typedef void (*qemu_plugin_scope_cb_t)(qemu_plugin_id_t id,
+                                       const char *scope,
+                                       const char *identity,
+                                       bool begin,
+                                       void *userdata);
+
 /**
  * typedef qemu_plugin_vcpu_simple_cb_t - vcpu callback
  * @id: the unique qemu_plugin_id_t
@@ -201,6 +207,20 @@ void qemu_plugin_reset(qemu_plugin_id_t id, qemu_plugin_simple_cb_t cb);
 QEMU_PLUGIN_API
 void qemu_plugin_register_vcpu_init_cb(qemu_plugin_id_t id,
                                        qemu_plugin_vcpu_simple_cb_t cb);
+
+/**
+ * qemu_plugin_register_scope_cb() - register a workload-scope callback
+ * @id: plugin ID
+ * @cb: callback invoked at an explicitly named scope boundary
+ * @userdata: opaque pointer passed to @cb
+ *
+ * Scope callbacks do not run on the translated-block fast path.  The scope
+ * and identity strings are valid only for the duration of the callback.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_register_scope_cb(qemu_plugin_id_t id,
+                                   qemu_plugin_scope_cb_t cb,
+                                   void *userdata);
 
 /**
  * qemu_plugin_register_vcpu_exit_cb() - register a vCPU exit callback

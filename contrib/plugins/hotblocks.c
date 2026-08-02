@@ -23,6 +23,9 @@ static bool do_inline;
 static GMutex lock;
 static GHashTable *hotblocks;
 static guint64 limit = 20;
+static char *scope_name;
+static char *active_identity;
+static bool scope_open;
 
 /*
  * Counting Structure
@@ -37,7 +40,13 @@ typedef struct {
     struct qemu_plugin_scoreboard *exec_count;
     int trans_count;
     unsigned long insns;
+    uint64_t scope_start_count;
 } ExecCount;
+
+typedef struct {
+    ExecCount *count;
+    uint64_t executions;
+} ScopedCount;
 
 static gint cmp_exec_count(gconstpointer a, gconstpointer b, gpointer d)
 {
@@ -47,7 +56,16 @@ static gint cmp_exec_count(gconstpointer a, gconstpointer b, gpointer d)
         qemu_plugin_u64_sum(qemu_plugin_scoreboard_u64(ea->exec_count));
     uint64_t count_b =
         qemu_plugin_u64_sum(qemu_plugin_scoreboard_u64(eb->exec_count));
-    return count_a > count_b ? -1 : 1;
+    return count_a > count_b ? -1 : count_a < count_b ? 1 : 0;
+}
+
+static gint cmp_scoped_count(gconstpointer a, gconstpointer b)
+{
+    const ScopedCount *sa = *(ScopedCount * const *)a;
+    const ScopedCount *sb = *(ScopedCount * const *)b;
+
+    return sa->executions > sb->executions ? -1
+           : sa->executions < sb->executions ? 1 : 0;
 }
 
 static guint exec_count_hash(gconstpointer v)
@@ -76,6 +94,11 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     GList *counts, *it;
     int i;
 
+    if (scope_open) {
+        g_string_append_printf(report,
+                               "TCG_HOTBLOCKS_ERROR reason=open-scope-at-exit identity=%s\n",
+                               active_identity);
+    }
     g_string_append_printf(report, "%d entries in the hash table\n",
                            g_hash_table_size(hotblocks));
     counts = g_hash_table_get_values(hotblocks);
@@ -101,6 +124,109 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
 
     g_hash_table_foreach(hotblocks, exec_count_free, NULL);
     g_hash_table_destroy(hotblocks);
+    g_free(scope_name);
+    g_free(active_identity);
+}
+
+static void scope_begin_snapshot(gpointer key, gpointer value,
+                                 gpointer user_data)
+{
+    ExecCount *cnt = value;
+
+    cnt->scope_start_count =
+        qemu_plugin_u64_sum(qemu_plugin_scoreboard_u64(cnt->exec_count));
+}
+
+static void scope_collect_delta(gpointer key, gpointer value,
+                                gpointer user_data)
+{
+    ExecCount *cnt = value;
+    GPtrArray *counts = user_data;
+    uint64_t current =
+        qemu_plugin_u64_sum(qemu_plugin_scoreboard_u64(cnt->exec_count));
+
+    if (current > cnt->scope_start_count) {
+        ScopedCount *scoped = g_new(ScopedCount, 1);
+
+        scoped->count = cnt;
+        scoped->executions = current - cnt->scope_start_count;
+        g_ptr_array_add(counts, scoped);
+    }
+}
+
+static void scope_event(qemu_plugin_id_t id, const char *scope,
+                        const char *identity, bool begin, void *userdata)
+{
+    g_autoptr(GPtrArray) counts = NULL;
+    g_autoptr(GString) report = NULL;
+    uint64_t total_executions = 0;
+    uint64_t total_guest_instructions = 0;
+    uint64_t top_executions = 0;
+    guint rows;
+
+    if (!scope_name || g_strcmp0(scope, scope_name) != 0) {
+        return;
+    }
+
+    g_mutex_lock(&lock);
+    if (begin) {
+        if (scope_open) {
+            qemu_plugin_outs("TCG_HOTBLOCKS_ERROR reason=overlapping-scope\n");
+            g_mutex_unlock(&lock);
+            return;
+        }
+        g_hash_table_foreach(hotblocks, scope_begin_snapshot, NULL);
+        active_identity = g_strdup(identity);
+        scope_open = true;
+        g_mutex_unlock(&lock);
+        return;
+    }
+
+    if (!scope_open || g_strcmp0(identity, active_identity) != 0) {
+        qemu_plugin_outs("TCG_HOTBLOCKS_ERROR reason=scope-end-mismatch\n");
+        g_mutex_unlock(&lock);
+        return;
+    }
+
+    counts = g_ptr_array_new_with_free_func(g_free);
+    g_hash_table_foreach(hotblocks, scope_collect_delta, counts);
+    g_ptr_array_sort(counts, cmp_scoped_count);
+    for (guint i = 0; i < counts->len; i++) {
+        ScopedCount *scoped = g_ptr_array_index(counts, i);
+
+        total_executions += scoped->executions;
+        total_guest_instructions += scoped->executions * scoped->count->insns;
+    }
+    rows = MIN(limit, counts->len);
+    for (guint i = 0; i < rows; i++) {
+        ScopedCount *scoped = g_ptr_array_index(counts, i);
+
+        top_executions += scoped->executions;
+    }
+
+    report = g_string_new(NULL);
+    g_string_append_printf(
+        report,
+        "TCG_HOTBLOCKS_SUMMARY scope=%s %s total_executions=%" PRIu64
+        " total_guest_instructions=%" PRIu64 " unique_blocks=%u"
+        " top_rows=%u top_executions=%" PRIu64 "\n",
+        scope, identity, total_executions, total_guest_instructions,
+        counts->len, rows, top_executions);
+    for (guint i = 0; i < rows; i++) {
+        ScopedCount *scoped = g_ptr_array_index(counts, i);
+        ExecCount *cnt = scoped->count;
+
+        g_string_append_printf(
+            report,
+            "TCG_HOTBLOCK scope=%s %s rank=%u pc=0x%016" PRIx64
+            " instructions=%lu translations=%d executions=%" PRIu64 "\n",
+            scope, identity, i + 1, cnt->start_addr, cnt->insns,
+            cnt->trans_count, scoped->executions);
+    }
+    qemu_plugin_outs(report->str);
+    g_clear_pointer(&active_identity, g_free);
+    scope_open = false;
+    g_mutex_unlock(&lock);
 }
 
 static void plugin_init(void)
@@ -170,6 +296,28 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
                 fprintf(stderr, "boolean argument parsing failed: %s\n", opt);
                 return -1;
             }
+        } else if (g_strcmp0(tokens[0], "limit") == 0) {
+            char *end = NULL;
+            guint64 parsed;
+
+            if (!tokens[1] || !tokens[1][0]) {
+                fprintf(stderr, "invalid limit: %s\n", opt);
+                return -1;
+            }
+            parsed = g_ascii_strtoull(tokens[1], &end, 10);
+            if (!end || *end ||
+                parsed == 0 || parsed > 1024) {
+                fprintf(stderr, "invalid limit: %s\n", opt);
+                return -1;
+            }
+            limit = parsed;
+        } else if (g_strcmp0(tokens[0], "scope") == 0) {
+            if (!tokens[1] || !tokens[1][0]) {
+                fprintf(stderr, "invalid scope: %s\n", opt);
+                return -1;
+            }
+            g_free(scope_name);
+            scope_name = g_strdup(tokens[1]);
         } else {
             fprintf(stderr, "option parsing failed: %s\n", opt);
             return -1;
@@ -179,6 +327,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     plugin_init();
 
     qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);
+    qemu_plugin_register_scope_cb(id, scope_event, NULL);
     qemu_plugin_register_atexit_cb(id, plugin_exit, NULL);
     return 0;
 }

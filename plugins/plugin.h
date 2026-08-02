@@ -51,6 +51,8 @@ struct qemu_plugin_state {
     int num_vcpus;
 };
 
+extern struct qemu_plugin_state plugin;
+
 
 struct qemu_plugin_ctx {
     GModule *handle;
@@ -65,6 +67,8 @@ struct qemu_plugin_ctx {
     bool installing;
     bool uninstalling;
     bool resetting;
+    qemu_plugin_scope_cb_t scope_cb;
+    void *scope_udata;
 };
 
 struct qemu_plugin_ctx *plugin_id_to_ctx_locked(qemu_plugin_id_t id);

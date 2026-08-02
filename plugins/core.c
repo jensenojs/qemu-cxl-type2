@@ -32,6 +32,24 @@ struct qemu_plugin_cb {
 
 struct qemu_plugin_state plugin;
 
+QEMU_DISABLE_CFI
+void qemu_plugin_notify_scope(const char *scope, const char *identity,
+                              bool begin)
+{
+    struct qemu_plugin_ctx *ctx;
+
+    g_return_if_fail(scope != NULL);
+    g_return_if_fail(identity != NULL);
+
+    QEMU_LOCK_GUARD(&plugin.lock);
+    QTAILQ_FOREACH(ctx, &plugin.ctxs, entry) {
+        if (ctx->scope_cb && !ctx->uninstalling) {
+            ctx->scope_cb(ctx->id, scope, identity, begin,
+                          ctx->scope_udata);
+        }
+    }
+}
+
 struct qemu_plugin_ctx *plugin_id_to_ctx_locked(qemu_plugin_id_t id)
 {
     struct qemu_plugin_ctx *ctx;
