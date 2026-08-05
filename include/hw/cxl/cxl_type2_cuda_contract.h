@@ -61,5 +61,15 @@ int cxl_gpu_batch_htod_submit(const uint8_t *payload,
                               CXLGPUBatchHtoDEnqueue enqueue, void *opaque,
                               uint64_t *fail_idx,
                               uint64_t *successfully_enqueued);
+bool cxl_gpu_source_register_validate(const uint8_t *payload,
+                                      uint64_t payload_capacity,
+                                      uint64_t payload_bytes,
+                                      CXLGPUSourceRegisterV1 *header_out,
+                                      uint64_t *fail_index);
+bool cxl_gpu_direct_batch_validate(const uint8_t *payload,
+                                   uint64_t payload_capacity,
+                                   uint64_t range_count,
+                                   uint64_t payload_bytes,
+                                   uint64_t *fail_index);
 
 #endif

@@ -280,7 +280,7 @@ static void test_batch_wire_layout_and_validation(void)
     uint8_t *payload = valid_batch_payload(&payload_bytes);
     CXLGPUBatchHtoDRange range;
 
-    g_assert_cmphex(CXL_GPU_VERSION, ==, UINT64_C(0x00010f00));
+    g_assert_cmphex(CXL_GPU_VERSION, ==, UINT64_C(0x00011000));
     g_assert_cmpuint(CXL_GPU_DESCRIPTOR_PROTOCOL_VERSION, ==, 1);
     g_assert_cmpuint(CXL_GPU_CASE_PROTOCOL_VERSION, ==, 1);
     g_assert_cmphex(CXL_GPU_BATCH_DATA_OFFSET, ==, UINT64_C(0x802000));
@@ -365,6 +365,65 @@ static void test_batch_success_result(void)
     g_free(payload);
 }
 
+static void test_direct_source_wire_validation(void)
+{
+    CXLGPUSourceRegisterV1 header = {
+        .range_count = 2,
+        .run_count = 2,
+        .lease_handle = 7,
+        .logical_bytes = 228,
+        .unique_dmap_bytes = 8192,
+    };
+    CXLGPUSourceRangeV1 ranges[] = {
+        { .first_run = 0, .run_count = 1,
+          .first_run_byte_offset = 16, .length = 100 },
+        { .first_run = 1, .run_count = 1,
+          .first_run_byte_offset = 0, .length = 128 },
+    };
+    CXLGPUSourceRunV1 runs[] = {
+        { .guest_phys_addr = 0x10000, .length = 4096 },
+        { .guest_phys_addr = 0x20000, .length = 4096 },
+    };
+    uint8_t payload[sizeof(header) + sizeof(ranges) + sizeof(runs)] = { 0 };
+    CXLGPUSourceRegisterV1 parsed;
+    uint64_t fail_index;
+
+    memcpy(payload, &header, sizeof(header));
+    memcpy(payload + sizeof(header), ranges, sizeof(ranges));
+    memcpy(payload + sizeof(header) + sizeof(ranges), runs, sizeof(runs));
+    g_assert_true(cxl_gpu_source_register_validate(
+        payload, sizeof(payload), sizeof(payload), &parsed, &fail_index));
+    g_assert_cmpuint(parsed.logical_bytes, ==, 228);
+    g_assert_cmpuint(fail_index, ==, SIZE_MAX);
+
+    runs[1].guest_phys_addr = 0x10800;
+    memcpy(payload + sizeof(header) + sizeof(ranges), runs, sizeof(runs));
+    g_assert_false(cxl_gpu_source_register_validate(
+        payload, sizeof(payload), sizeof(payload), &parsed, &fail_index));
+    g_assert_cmpuint(fail_index, ==, 1);
+}
+
+static void test_direct_batch_wire_validation(void)
+{
+    CXLGPUDirectRangeV1 ranges[] = {
+        { .destination = 0x1000, .size = 64, .source_id = 3,
+          .source_range = 0, .source_offset = 16 },
+        { .destination = 0x2000, .size = 128, .source_id = 4,
+          .source_range = 1, .source_offset = 0 },
+    };
+    uint64_t fail_index;
+
+    g_assert_true(cxl_gpu_direct_batch_validate(
+        (const uint8_t *)ranges, sizeof(ranges), G_N_ELEMENTS(ranges),
+        sizeof(ranges), &fail_index));
+    g_assert_cmpuint(fail_index, ==, SIZE_MAX);
+    ranges[1].reserved0 = 1;
+    g_assert_false(cxl_gpu_direct_batch_validate(
+        (const uint8_t *)ranges, sizeof(ranges), G_N_ELEMENTS(ranges),
+        sizeof(ranges), &fail_index));
+    g_assert_cmpuint(fail_index, ==, 1);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -392,5 +451,9 @@ int main(int argc, char **argv)
                     test_batch_partial_enqueue_result);
     g_test_add_func("/cxl/type2/batch/success",
                     test_batch_success_result);
+    g_test_add_func("/cxl/type2/direct/source-wire",
+                    test_direct_source_wire_validation);
+    g_test_add_func("/cxl/type2/direct/batch-wire",
+                    test_direct_batch_wire_validation);
     return g_test_run();
 }

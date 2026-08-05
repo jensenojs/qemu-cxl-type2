@@ -23,6 +23,11 @@
 #define TYPE_VHOST_USER_FS "vhost-user-fs-device"
 OBJECT_DECLARE_SIMPLE_TYPE(VHostUserFS, VHOST_USER_FS)
 
+#define TYPE_VHOST_USER_FS_PCI "vhost-user-fs-pci-base"
+
+bool vhost_user_fs_pci_get_dax(Object *obj, VirtioSharedMemory **shmem,
+                               MemoryRegion **dax_mr);
+
 typedef struct {
     CharBackend chardev;
     char *tag;

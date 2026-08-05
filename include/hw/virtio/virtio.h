@@ -112,6 +112,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(VirtioSharedMemoryMapping, VIRTIO_SHARED_MEMORY_MAPPI
  * @fd: Duplicated file descriptor backing this mapping
  * @fd_offset: Offset in @fd backing the shared-memory window range
  * @allow_write: Whether the file mapping is writable
+ * @generation: Identity of the installed backing generation
+ * @source_pins: External users that require this backing to remain installed
+ * @revoke_pending: An unmap/reset requested revocation while externally pinned
  * @link: List entry for the shared memory region's mapping list
  *
  * A QOM object that represents an individual file descriptor-based shared
@@ -128,6 +131,10 @@ struct VirtioSharedMemoryMapping {
     int fd;
     uint64_t fd_offset;
     bool allow_write;
+    uint64_t generation;
+    uint64_t source_pins;
+    bool revoke_pending;
+    struct VirtioSharedMemory *owner;
     QTAILQ_ENTRY(VirtioSharedMemoryMapping) link;
 };
 
@@ -418,6 +425,12 @@ int virtio_add_shmem_map(VirtioSharedMemory *shmem,
 VirtioSharedMemoryMapping *virtio_find_shmem_map(VirtioSharedMemory *shmem,
                                           hwaddr offset, uint64_t size);
 
+int virtio_shared_memory_pin_range(
+    VirtioSharedMemory *shmem, hwaddr offset, uint64_t length,
+    VirtioSharedMemoryMapping **mapping, uint64_t *generation,
+    void **host_address);
+void virtio_shared_memory_unpin(VirtioSharedMemoryMapping *mapping);
+
 /**
  * virtio_del_shmem_map() - Remove a memory mapping from a shared region
  * @shmem: VirtioSharedMemory region
@@ -427,8 +440,8 @@ VirtioSharedMemoryMapping *virtio_find_shmem_map(VirtioSharedMemory *shmem,
  * Replaces the file range with an inaccessible anonymous reservation and
  * releases the mapping identity and duplicated file descriptor.
  */
-void virtio_del_shmem_map(VirtioSharedMemory *shmem, hwaddr offset,
-                          uint64_t size);
+int virtio_del_shmem_map(VirtioSharedMemory *shmem, hwaddr offset,
+                         uint64_t size);
 
 extern const VMStateInfo virtio_vmstate_info;
 

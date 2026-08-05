@@ -28,10 +28,29 @@ struct VHostUserFSPCI {
 
 typedef struct VHostUserFSPCI VHostUserFSPCI;
 
-#define TYPE_VHOST_USER_FS_PCI "vhost-user-fs-pci-base"
-
 DECLARE_INSTANCE_CHECKER(VHostUserFSPCI, VHOST_USER_FS_PCI,
                          TYPE_VHOST_USER_FS_PCI)
+
+bool vhost_user_fs_pci_get_dax(Object *obj, VirtioSharedMemory **shmem,
+                               MemoryRegion **dax_mr)
+{
+    VHostUserFSPCI *dev;
+    VirtioSharedMemory *region;
+
+    if (!obj || !shmem || !dax_mr ||
+        !object_dynamic_cast(obj, TYPE_VHOST_USER_FS_PCI)) {
+        return false;
+    }
+    dev = VHOST_USER_FS_PCI(obj);
+    region = virtio_find_shmem_region(
+        VIRTIO_DEVICE(&dev->vdev), VIRTIO_FS_SHMCAP_ID_CACHE);
+    if (!region) {
+        return false;
+    }
+    *shmem = region;
+    *dax_mr = &region->mr;
+    return true;
+}
 
 static const Property vhost_user_fs_pci_properties[] = {
     DEFINE_PROP_UINT32("vectors", VirtIOPCIProxy, nvectors,

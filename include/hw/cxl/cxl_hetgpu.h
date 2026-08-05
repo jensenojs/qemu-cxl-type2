@@ -224,6 +224,16 @@ typedef void (*HetGPUCoherencyCallback)(
     bool invalidate
 );
 
+typedef void (*HetGPUDriverIntervalCallback)(
+    void *opaque,
+    uint64_t call_id,
+    uint32_t occurrence,
+    const char *symbol,
+    int64_t begin_host_ns,
+    int64_t end_host_ns,
+    int result
+);
+
 /* Simulation memory allocation tracking */
 typedef struct HetGPUSimAlloc {
     HetGPUDevicePtr dev_ptr;
@@ -273,6 +283,8 @@ typedef struct HetGPUState {
     void *hetgpu_lib;
     bool formal_case_strict;
     bool detailed_logs;
+    HetGPUDriverIntervalCallback driver_interval_callback;
+    void *driver_interval_opaque;
     HetGPUKimiCaseBeginV2Fn kimi_case_begin_v2;
     HetGPUKimiCaseEndV2Fn kimi_case_end_v2;
 
@@ -347,6 +359,16 @@ int hetgpu_cuda_mem_get_info(HetGPUState *state, size_t *free_bytes,
                              size_t *total_bytes);
 void hetgpu_cuda_trace_set_call_id(uint64_t call_id);
 void hetgpu_cuda_trace_set_detailed_logs(bool enabled);
+
+/**
+ * The callback runs synchronously after the Driver call and inside the
+ * caller's existing HetGPU lock.  Registration must not race with Driver
+ * calls; the callback must not re-enter HetGPU.  A NULL callback clears it.
+ */
+void hetgpu_set_driver_interval_callback(
+    HetGPUState *state,
+    HetGPUDriverIntervalCallback callback,
+    void *opaque);
 
 /* ========================================================================
  * Context Management
@@ -425,6 +447,9 @@ HetGPUError hetgpu_memcpy_htod(HetGPUState *state, HetGPUDevicePtr dst,
                                const void *src, size_t size);
 int hetgpu_cuda_mem_host_alloc(HetGPUState *state, void **ptr, size_t size);
 int hetgpu_cuda_mem_free_host(HetGPUState *state, void *ptr);
+int hetgpu_cuda_mem_host_register(HetGPUState *state, void *ptr, size_t size,
+                                  unsigned int flags);
+int hetgpu_cuda_mem_host_unregister(HetGPUState *state, void *ptr);
 int hetgpu_cuda_memcpy_htod_async(HetGPUState *state, HetGPUDevicePtr dst,
                                   const void *src, size_t size,
                                   HetGPUStream stream);

@@ -38,6 +38,7 @@
 #include "hw/pci/msix.h"
 #include "hw/qdev-properties.h"
 #include "hw/qdev-properties-system.h"
+#include "hw/virtio/vhost-user-fs.h"
 #include "migration/vmstate.h"
 #include "system/memory.h"
 #include "io/channel-socket.h"
@@ -69,6 +70,9 @@ extern int LZ4_decompress_safe(const char *src, char *dst,
 /* A CXL.mem response is one fixed-size message. A missing response must
  * release the QEMU device path instead of consuming the outer CNB timeout. */
 #define CXL_MEMSIM_RESPONSE_TIMEOUT_NS (1000LL * 1000 * 1000)
+
+#define CXL_CUDA_MEMHOSTREGISTER_PORTABLE 0x01U
+#define CXL_CUDA_MEMHOSTREGISTER_READ_ONLY 0x08U
 
 typedef struct QEMU_PACKED CXLMemSimRequest {
     uint8_t op_type;
@@ -2453,8 +2457,240 @@ static void cxl_type2_notify_case_scope(uint64_t run_binding,
     qemu_plugin_notify_scope("type2-case", identity, begin);
 }
 
+static CXLType2IntervalIdentity cxl_type2_interval_identity(
+    uint64_t sequence, const char *owner, const char *category,
+    const char *operation, uint32_t operation_code, bool operation_code_valid)
+{
+    return (CXLType2IntervalIdentity) {
+        .valid = true,
+        .operation_code_valid = operation_code_valid,
+        .operation_code = operation_code,
+        .sequence = sequence,
+        .owner = owner,
+        .category = category,
+        .operation = operation,
+    };
+}
+
+static void cxl_type2_interval_fail(CXLType2IntervalLedger *ledger,
+                                    const char *error)
+{
+    if (!ledger->first_error) {
+        ledger->first_error = error;
+    }
+}
+
+static bool cxl_type2_interval_add(uint64_t *target, uint64_t value)
+{
+    if (UINT64_MAX - *target < value) {
+        return false;
+    }
+    *target += value;
+    return true;
+}
+
+static void cxl_type2_interval_reset(
+    CXLType2IntervalLedger *ledger, int64_t span_begin_ns,
+    CXLType2IntervalIdentity span_begin_identity)
+{
+    *ledger = (CXLType2IntervalLedger) {
+        .span_begin_ns = span_begin_ns,
+        .span_end_ns = span_begin_ns,
+        .last_begin_ns = span_begin_ns,
+        .union_end_ns = span_begin_ns,
+        .span_begin_identity = span_begin_identity,
+        .union_end_identity = span_begin_identity,
+    };
+}
+
+static void cxl_type2_interval_consider_gap(
+    CXLType2IntervalLedger *ledger, int64_t begin_ns, int64_t end_ns,
+    CXLType2IntervalIdentity previous, CXLType2IntervalIdentity next)
+{
+    uint64_t duration_ns;
+
+    if (end_ns < begin_ns) {
+        cxl_type2_interval_fail(ledger, "negative-gap");
+        return;
+    }
+    duration_ns = end_ns - begin_ns;
+    if (duration_ns > ledger->largest_gap_duration_ns) {
+        ledger->largest_gap_duration_ns = duration_ns;
+        ledger->largest_gap_begin_ns = begin_ns;
+        ledger->largest_gap_end_ns = end_ns;
+        ledger->largest_gap_previous = previous;
+        ledger->largest_gap_next = next;
+    }
+}
+
+static void cxl_type2_interval_record(
+    CXLType2IntervalLedger *ledger, int64_t begin_ns, int64_t end_ns,
+    CXLType2IntervalIdentity identity)
+{
+    uint64_t duration_ns;
+    uint64_t union_increment;
+
+    if (end_ns < begin_ns) {
+        cxl_type2_interval_fail(ledger, "clock-regressed-within-interval");
+        return;
+    }
+    if (begin_ns < ledger->span_begin_ns) {
+        cxl_type2_interval_fail(ledger, "interval-before-scope");
+        return;
+    }
+    if (ledger->interval_count > 0 && begin_ns < ledger->last_begin_ns) {
+        cxl_type2_interval_fail(ledger, "interval-order-regressed");
+        return;
+    }
+    duration_ns = end_ns - begin_ns;
+    if (!cxl_type2_interval_add(&ledger->total_duration_ns, duration_ns) ||
+        ledger->interval_count == UINT64_MAX) {
+        cxl_type2_interval_fail(ledger, "interval-counter-overflow");
+        return;
+    }
+
+    if (ledger->interval_count == 0 || begin_ns > ledger->union_end_ns) {
+        cxl_type2_interval_consider_gap(
+            ledger, ledger->union_end_ns, begin_ns,
+            ledger->union_end_identity, identity);
+        union_increment = duration_ns;
+        ledger->union_end_ns = end_ns;
+        ledger->union_end_identity = identity;
+    } else if (end_ns > ledger->union_end_ns) {
+        union_increment = end_ns - ledger->union_end_ns;
+        ledger->union_end_ns = end_ns;
+        ledger->union_end_identity = identity;
+    } else {
+        union_increment = 0;
+    }
+    if (!cxl_type2_interval_add(&ledger->union_duration_ns,
+                                union_increment)) {
+        cxl_type2_interval_fail(ledger, "interval-counter-overflow");
+        return;
+    }
+    ledger->interval_count++;
+    ledger->last_begin_ns = begin_ns;
+}
+
+static void cxl_type2_interval_finish(
+    CXLType2IntervalLedger *ledger, int64_t span_end_ns,
+    CXLType2IntervalIdentity span_end_identity)
+{
+    uint64_t span_duration_ns;
+
+    ledger->span_end_ns = span_end_ns;
+    if (span_end_ns < ledger->span_begin_ns ||
+        span_end_ns < ledger->union_end_ns) {
+        cxl_type2_interval_fail(ledger, "interval-after-scope");
+        return;
+    }
+    cxl_type2_interval_consider_gap(
+        ledger, ledger->union_end_ns, span_end_ns,
+        ledger->union_end_identity, span_end_identity);
+    span_duration_ns = span_end_ns - ledger->span_begin_ns;
+    if (ledger->union_duration_ns > span_duration_ns ||
+        ledger->total_duration_ns < ledger->union_duration_ns) {
+        cxl_type2_interval_fail(ledger, "interval-arithmetic-invalid");
+    }
+}
+
+static void cxl_type2_interval_format_identity(
+    const CXLType2IntervalIdentity *identity, char *sequence,
+    size_t sequence_size, char *operation, size_t operation_size)
+{
+    if (!identity->valid) {
+        pstrcpy(sequence, sequence_size, "null");
+        pstrcpy(operation, operation_size, "null");
+        return;
+    }
+    snprintf(sequence, sequence_size, "%" PRIu64, identity->sequence);
+    if (identity->operation_code_valid) {
+        if (identity->operation) {
+            snprintf(operation, operation_size, "%s-%u",
+                     identity->operation, identity->operation_code);
+        } else {
+            snprintf(operation, operation_size, "cmd-0x%02x",
+                     identity->operation_code);
+        }
+    } else {
+        pstrcpy(operation, operation_size,
+                identity->operation ? identity->operation : "null");
+    }
+}
+
+static void cxl_type2_log_interval_summary(
+    uint64_t run_binding, uint32_t case_kind, uint64_t epoch,
+    const char *category, CXLType2IntervalLedger *ledger)
+{
+    uint64_t span_duration_ns = ledger->span_end_ns >= ledger->span_begin_ns
+                                    ? ledger->span_end_ns - ledger->span_begin_ns
+                                    : 0;
+    uint64_t overlap_duration_ns =
+        ledger->total_duration_ns >= ledger->union_duration_ns
+            ? ledger->total_duration_ns - ledger->union_duration_ns
+            : 0;
+    uint64_t gap_duration_ns = span_duration_ns >= ledger->union_duration_ns
+                                   ? span_duration_ns - ledger->union_duration_ns
+                                   : 0;
+    char largest_begin[32] = "null";
+    char largest_end[32] = "null";
+    char previous_sequence[32];
+    char previous_operation[80];
+    char next_sequence[32];
+    char next_operation[80];
+
+    if (ledger->largest_gap_duration_ns > 0) {
+        snprintf(largest_begin, sizeof(largest_begin), "%" PRId64,
+                 ledger->largest_gap_begin_ns);
+        snprintf(largest_end, sizeof(largest_end), "%" PRId64,
+                 ledger->largest_gap_end_ns);
+    }
+    cxl_type2_interval_format_identity(
+        &ledger->largest_gap_previous, previous_sequence,
+        sizeof(previous_sequence), previous_operation,
+        sizeof(previous_operation));
+    cxl_type2_interval_format_identity(
+        &ledger->largest_gap_next, next_sequence, sizeof(next_sequence),
+        next_operation, sizeof(next_operation));
+
+    qemu_log("KIMI_INTERVAL_SUMMARY schema=interval-summary-v1 producer=qemu"
+             " clock_domain=host-monotonic run_binding=%" PRIu64
+             " case=%s case_epoch=%" PRIu64 " scope=case category=%s owner=qemu"
+             " status=%s span_begin_ns=%" PRId64 " span_end_ns=%" PRId64
+             " interval_count=%" PRIu64 " total_duration_ns=%" PRIu64
+             " union_duration_ns=%" PRIu64 " overlap_duration_ns=%" PRIu64
+             " gap_duration_ns=%" PRIu64
+             " largest_gap_begin_ns=%s largest_gap_end_ns=%s"
+             " previous_sequence=%s previous_owner=%s previous_category=%s"
+             " previous_operation=%s next_sequence=%s next_owner=%s"
+             " next_category=%s next_operation=%s first_error=%s\n",
+             run_binding, cxl_type2_paired_case_name(case_kind), epoch,
+             category, ledger->first_error ? "incomplete" : "complete",
+             ledger->span_begin_ns, ledger->span_end_ns,
+             ledger->interval_count, ledger->total_duration_ns,
+             ledger->union_duration_ns, overlap_duration_ns, gap_duration_ns,
+             largest_begin, largest_end, previous_sequence,
+             ledger->largest_gap_previous.valid
+                 ? ledger->largest_gap_previous.owner
+                 : "null",
+             ledger->largest_gap_previous.valid
+                 ? ledger->largest_gap_previous.category
+                 : "null",
+             previous_operation, next_sequence,
+             ledger->largest_gap_next.valid ? ledger->largest_gap_next.owner
+                                             : "null",
+             ledger->largest_gap_next.valid ? ledger->largest_gap_next.category
+                                             : "null",
+             next_operation, ledger->first_error ? ledger->first_error : "none");
+}
+
 static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
 {
+    int64_t span_begin_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+    CXLType2IntervalIdentity begin_identity = cxl_type2_interval_identity(
+        ct2d->paired_case.active_first_sequence, "qemu", "case", "case-begin",
+        0, false);
+
     ct2d->paired_case.active_command_count = 0;
     ct2d->paired_case.active_command_failures = 0;
     ct2d->paired_case.active_command_busy_ns = 0;
@@ -2464,6 +2700,11 @@ static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
            sizeof(ct2d->paired_case.active_command_calls));
     memset(ct2d->paired_case.active_command_busy_ns_by_command, 0,
            sizeof(ct2d->paired_case.active_command_busy_ns_by_command));
+    ct2d->paired_case.active_command_sequence = 0;
+    cxl_type2_interval_reset(&ct2d->paired_case.command_intervals,
+                             span_begin_ns, begin_identity);
+    cxl_type2_interval_reset(&ct2d->paired_case.driver_intervals,
+                             span_begin_ns, begin_identity);
     ct2d->paired_case.active_cxl_request_count = 0;
     ct2d->paired_case.active_cxl_read_count = 0;
     ct2d->paired_case.active_cxl_write_count = 0;
@@ -2472,10 +2713,45 @@ static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
     ct2d->paired_case.active_cxl_response_count = 0;
     ct2d->paired_case.active_cxl_request_failures = 0;
     ct2d->paired_case.active_cxl_server_reported_latency_ns = 0;
+    ct2d->paired_case.active_direct_register_calls = 0;
+    ct2d->paired_case.active_direct_unregister_calls = 0;
+    ct2d->paired_case.active_direct_logical_ranges = 0;
+    ct2d->paired_case.active_direct_fragments = 0;
+    ct2d->paired_case.active_direct_bytes = 0;
+    ct2d->paired_case.active_payload_batches = 0;
+    ct2d->paired_case.active_payload_source_bytes = 0;
+}
+
+static void cxl_type2_record_driver_interval(
+    void *opaque, uint64_t call_id, uint32_t occurrence, const char *symbol,
+    int64_t begin_host_ns, int64_t end_host_ns, int result)
+{
+    CXLType2State *ct2d = opaque;
+
+    (void)result;
+    if (ct2d->paired_case.active_case == CXL_GPU_CASE_NONE) {
+        return;
+    }
+    if (ct2d->paired_case.active_command_sequence == 0) {
+        cxl_type2_interval_fail(&ct2d->paired_case.driver_intervals,
+                                "driver-without-command-sequence");
+        return;
+    }
+    if (call_id != ct2d->gpu_cmd.call_id) {
+        cxl_type2_interval_fail(&ct2d->paired_case.driver_intervals,
+                                "driver-call-id-mismatch");
+        return;
+    }
+    cxl_type2_interval_record(
+        &ct2d->paired_case.driver_intervals, begin_host_ns, end_host_ns,
+        cxl_type2_interval_identity(
+            ct2d->paired_case.active_command_sequence, "qemu", "driver",
+            symbol, occurrence, true));
 }
 
 static void cxl_type2_record_case_command(CXLType2State *ct2d,
                                           uint32_t command,
+                                          uint64_t sequence,
                                           int64_t begin_host_ns,
                                           int64_t end_host_ns,
                                           uint32_t result)
@@ -2499,6 +2775,10 @@ static void cxl_type2_record_case_command(CXLType2State *ct2d,
     ct2d->paired_case.active_last_command_host_ns = end_host_ns;
     ct2d->paired_case.active_command_calls[command]++;
     ct2d->paired_case.active_command_busy_ns_by_command[command] += duration_ns;
+    cxl_type2_interval_record(
+        &ct2d->paired_case.command_intervals, begin_host_ns, end_host_ns,
+        cxl_type2_interval_identity(sequence, "qemu", "command", NULL,
+                                    command, true));
 }
 
 static void cxl_type2_log_case_summary(CXLType2State *ct2d,
@@ -2550,6 +2830,50 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
              ct2d->paired_case.active_cxl_response_count,
              ct2d->paired_case.active_cxl_request_failures,
              ct2d->paired_case.active_cxl_server_reported_latency_ns);
+
+    {
+        uint64_t live_sources = 0;
+        uint64_t live_physicals = 0;
+        uint64_t source_pending_refs = 0;
+        CXLType2DirectSource *source;
+        CXLType2DirectPhysical *physical;
+
+        for (source = ct2d->direct_sources; source; source = source->next) {
+            live_sources++;
+            source_pending_refs += source->pending_refcount;
+        }
+        for (physical = ct2d->direct_physicals; physical;
+             physical = physical->next) {
+            live_physicals++;
+        }
+        qemu_log(
+            "KIMI_DIRECT_SOURCE_SUMMARY schema=direct-source-summary-v1"
+            " run_binding=%" PRIu64 " case=%s case_epoch=%" PRIu64
+            " policy_enabled=%u register_calls=%" PRIu64
+            " unregister_calls=%" PRIu64 " logical_ranges=%" PRIu64
+            " driver_fragments=%" PRIu64 " direct_bytes=%" PRIu64
+            " payload_batches=%" PRIu64 " payload_source_bytes=%" PRIu64
+            " live_sources=%" PRIu64 " live_physicals=%" PRIu64
+            " pending_source_refs=%" PRIu64 " poisoned=%u\n",
+            run_binding, cxl_type2_paired_case_name(case_kind), epoch,
+            ct2d->cuda_direct_source,
+            ct2d->paired_case.active_direct_register_calls,
+            ct2d->paired_case.active_direct_unregister_calls,
+            ct2d->paired_case.active_direct_logical_ranges,
+            ct2d->paired_case.active_direct_fragments,
+            ct2d->paired_case.active_direct_bytes,
+            ct2d->paired_case.active_payload_batches,
+            ct2d->paired_case.active_payload_source_bytes, live_sources,
+            live_physicals, source_pending_refs,
+            ct2d->direct_source_poisoned);
+    }
+
+    cxl_type2_log_interval_summary(
+        run_binding, case_kind, epoch, "command",
+        &ct2d->paired_case.command_intervals);
+    cxl_type2_log_interval_summary(
+        run_binding, case_kind, epoch, "driver",
+        &ct2d->paired_case.driver_intervals);
 }
 
 static void cxl_type2_log_kimi_case_stage(uint64_t run_binding,
@@ -2795,6 +3119,480 @@ static int cxl_type2_htod_staging_release(CXLType2State *ct2d, void *data,
                                            size_t capacity,
                                            uint64_t buffer_id, bool *pooled);
 
+static CXLType2DirectPhysical *cxl_type2_direct_physical_find(
+    CXLType2State *ct2d, VirtioSharedMemoryMapping *mapping,
+    uint64_t generation, hwaddr mapping_offset, uint64_t length)
+{
+    CXLType2DirectPhysical *physical;
+
+    for (physical = ct2d->direct_physicals; physical;
+         physical = physical->next) {
+        if (physical->mapping == mapping &&
+            physical->generation == generation &&
+            physical->mapping_offset == mapping_offset &&
+            physical->length == length) {
+            return physical;
+        }
+    }
+    return NULL;
+}
+
+static bool cxl_type2_direct_physical_overlaps(
+    CXLType2State *ct2d, VirtioSharedMemoryMapping *mapping,
+    hwaddr mapping_offset, uint64_t length)
+{
+    CXLType2DirectPhysical *physical;
+
+    for (physical = ct2d->direct_physicals; physical;
+         physical = physical->next) {
+        if (physical->mapping == mapping &&
+            ranges_overlap(physical->mapping_offset, physical->length,
+                           mapping_offset, length)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int cxl_type2_direct_physical_put(CXLType2State *ct2d,
+                                         CXLType2DirectPhysical *physical)
+{
+    CXLType2DirectPhysical **cursor;
+    HetGPUState *hetgpu = &ct2d->gpu_info.hetgpu_state;
+    int result;
+
+    g_assert(physical && physical->references > 0);
+    if (physical->references > 1) {
+        physical->references--;
+        return CXL_GPU_SUCCESS;
+    }
+    result = hetgpu_cuda_mem_host_unregister(hetgpu, physical->host_address);
+    if (result != CXL_GPU_SUCCESS) {
+        ct2d->direct_source_poisoned = true;
+        return result;
+    }
+    physical->cuda_registered = false;
+    address_space_unmap(&address_space_memory, physical->host_address,
+                        physical->length, false, physical->length);
+    virtio_shared_memory_unpin(physical->mapping);
+    cursor = &ct2d->direct_physicals;
+    while (*cursor != physical) {
+        cursor = &(*cursor)->next;
+    }
+    *cursor = physical->next;
+    g_free(physical);
+    return CXL_GPU_SUCCESS;
+}
+
+static CXLType2DirectSource *cxl_type2_direct_source_find(
+    CXLType2State *ct2d, uint64_t source_id)
+{
+    CXLType2DirectSource *source;
+
+    for (source = ct2d->direct_sources; source; source = source->next) {
+        if (source->source_id == source_id) {
+            return source;
+        }
+    }
+    return NULL;
+}
+
+static int cxl_type2_direct_source_unregister(CXLType2State *ct2d,
+                                              uint64_t source_id)
+{
+    CXLType2DirectSource **cursor = &ct2d->direct_sources;
+    CXLType2DirectSource *source;
+    int first_error = CXL_GPU_SUCCESS;
+
+    while (*cursor && (*cursor)->source_id != source_id) {
+        cursor = &(*cursor)->next;
+    }
+    if (!*cursor) {
+        return CXL_GPU_ERROR_INVALID_VALUE;
+    }
+    source = *cursor;
+    if ((ct2d->paired_case.active_epoch &&
+         source->case_epoch != ct2d->paired_case.active_epoch) ||
+        source->pending_refcount) {
+        return CXL_GPU_ERROR_INVALID_VALUE;
+    }
+    for (uint32_t i = 0; i < source->run_count; i++) {
+        int result;
+
+        if (!source->runs[i].physical) {
+            continue;
+        }
+        result = cxl_type2_direct_physical_put(
+            ct2d, source->runs[i].physical);
+        if (result == CXL_GPU_SUCCESS) {
+            source->runs[i].physical = NULL;
+        } else if (first_error == CXL_GPU_SUCCESS) {
+            first_error = result;
+        }
+    }
+    if (first_error != CXL_GPU_SUCCESS) {
+        return first_error;
+    }
+    *cursor = source->next;
+    g_free(source->ranges);
+    g_free(source->runs);
+    g_free(source);
+    return CXL_GPU_SUCCESS;
+}
+
+static int cxl_type2_direct_sources_cleanup(CXLType2State *ct2d)
+{
+    int first_error = CXL_GPU_SUCCESS;
+
+    while (ct2d->direct_sources) {
+        uint64_t source_id = ct2d->direct_sources->source_id;
+        int result = cxl_type2_direct_source_unregister(ct2d, source_id);
+
+        if (result != CXL_GPU_SUCCESS) {
+            first_error = result;
+            break;
+        }
+    }
+    return first_error;
+}
+
+typedef struct CXLType2DirectValidatedRun {
+    CXLGPUSourceRunV1 wire;
+    VirtioSharedMemoryMapping *mapping;
+    uint64_t generation;
+    hwaddr mapping_offset;
+} CXLType2DirectValidatedRun;
+
+static int cxl_type2_direct_source_register(CXLType2State *ct2d,
+                                            uint64_t payload_bytes,
+                                            uint64_t *source_id_out)
+{
+    CXLGPUSourceRegisterV1 header;
+    CXLType2DirectValidatedRun *validated = NULL;
+    CXLType2DirectSource *source = NULL;
+    VirtioSharedMemory *shmem;
+    MemoryRegion *dax_mr;
+    const uint8_t *range_base;
+    const uint8_t *run_base;
+    uint64_t fail_index;
+    int result = CXL_GPU_ERROR_INVALID_VALUE;
+
+    if (!ct2d->cuda_direct_source || ct2d->direct_source_poisoned ||
+        !ct2d->direct_source_fs || !source_id_out ||
+        !ct2d->paired_case.active_epoch ||
+        !vhost_user_fs_pci_get_dax(ct2d->direct_source_fs, &shmem, &dax_mr) ||
+        !cxl_gpu_source_register_validate(
+            ct2d->gpu_cmd.batch_data, CXL_GPU_BATCH_DATA_SIZE, payload_bytes,
+            &header, &fail_index)) {
+        return CXL_GPU_ERROR_INVALID_VALUE;
+    }
+    range_base = ct2d->gpu_cmd.batch_data + sizeof(header);
+    run_base = range_base +
+               (uint64_t)header.range_count * sizeof(CXLGPUSourceRangeV1);
+    validated = g_new0(CXLType2DirectValidatedRun, header.run_count);
+
+    /* This pass has no mapping, CUDA, or table side effects. */
+    for (uint32_t i = 0; i < header.run_count; i++) {
+        hwaddr translated = 0;
+        hwaddr translated_len;
+        MemoryRegion *mr;
+        VirtioSharedMemoryMapping *mapping;
+
+        memcpy(&validated[i].wire, run_base + (uint64_t)i *
+               sizeof(validated[i].wire), sizeof(validated[i].wire));
+        translated_len = validated[i].wire.length;
+        mr = address_space_translate(
+            &address_space_memory, validated[i].wire.guest_phys_addr,
+            &translated, &translated_len, false, MEMTXATTRS_UNSPECIFIED);
+        if (mr != dax_mr || translated_len < validated[i].wire.length) {
+            goto out;
+        }
+        mapping = virtio_find_shmem_map(
+            shmem, translated, validated[i].wire.length);
+        if (!mapping || mapping->revoke_pending ||
+            (cxl_type2_direct_physical_overlaps(
+                 ct2d, mapping, translated, validated[i].wire.length) &&
+             !cxl_type2_direct_physical_find(
+                 ct2d, mapping, mapping->generation, translated,
+                 validated[i].wire.length))) {
+            goto out;
+        }
+        for (uint32_t j = 0; j < i; j++) {
+            if (validated[j].mapping == mapping &&
+                ranges_overlap(validated[j].mapping_offset,
+                               validated[j].wire.length, translated,
+                               validated[i].wire.length)) {
+                goto out;
+            }
+        }
+        validated[i].mapping = mapping;
+        validated[i].generation = mapping->generation;
+        validated[i].mapping_offset = translated;
+    }
+
+    source = g_new0(CXLType2DirectSource, 1);
+    source->case_epoch = ct2d->paired_case.active_epoch;
+    source->lease_handle = header.lease_handle;
+    source->logical_bytes = header.logical_bytes;
+    source->unique_dmap_bytes = header.unique_dmap_bytes;
+    source->range_count = header.range_count;
+    source->run_count = header.run_count;
+    source->ranges = g_new(CXLGPUSourceRangeV1, header.range_count);
+    source->runs = g_new0(CXLType2DirectRun, header.run_count);
+    memcpy(source->ranges, range_base,
+           (uint64_t)header.range_count * sizeof(*source->ranges));
+
+    for (uint32_t i = 0; i < header.run_count; i++) {
+        CXLType2DirectPhysical *physical = cxl_type2_direct_physical_find(
+            ct2d, validated[i].mapping, validated[i].generation,
+            validated[i].mapping_offset, validated[i].wire.length);
+
+        if (physical) {
+            if (physical->references == UINT64_MAX) {
+                result = CXL_GPU_ERROR_OUT_OF_MEMORY;
+                goto rollback;
+            }
+            physical->references++;
+        } else {
+            VirtioSharedMemoryMapping *pinned_mapping;
+            uint64_t pinned_generation;
+            void *mapping_host;
+            void *mapped_host;
+            hwaddr mapped_length = validated[i].wire.length;
+
+            if (virtio_shared_memory_pin_range(
+                    shmem, validated[i].mapping_offset,
+                    validated[i].wire.length, &pinned_mapping,
+                    &pinned_generation, &mapping_host) != 0 ||
+                pinned_mapping != validated[i].mapping ||
+                pinned_generation != validated[i].generation) {
+                goto rollback;
+            }
+            mapped_host = address_space_map(
+                &address_space_memory, validated[i].wire.guest_phys_addr,
+                &mapped_length, false, MEMTXATTRS_UNSPECIFIED);
+            if (!mapped_host || mapped_length != validated[i].wire.length ||
+                mapped_host != mapping_host ||
+                (uintptr_t)mapped_host % qemu_real_host_page_size()) {
+                if (mapped_host) {
+                    address_space_unmap(&address_space_memory, mapped_host,
+                                        mapped_length, false, 0);
+                }
+                virtio_shared_memory_unpin(pinned_mapping);
+                goto rollback;
+            }
+            result = hetgpu_cuda_mem_host_register(
+                &ct2d->gpu_info.hetgpu_state, mapped_host, mapped_length,
+                CXL_CUDA_MEMHOSTREGISTER_PORTABLE |
+                    CXL_CUDA_MEMHOSTREGISTER_READ_ONLY);
+            if (result != CXL_GPU_SUCCESS) {
+                address_space_unmap(&address_space_memory, mapped_host,
+                                    mapped_length, false, 0);
+                virtio_shared_memory_unpin(pinned_mapping);
+                goto rollback;
+            }
+            physical = g_new0(CXLType2DirectPhysical, 1);
+            physical->mapping = pinned_mapping;
+            physical->generation = pinned_generation;
+            physical->mapping_offset = validated[i].mapping_offset;
+            physical->guest_phys_addr = validated[i].wire.guest_phys_addr;
+            physical->length = mapped_length;
+            physical->host_address = mapped_host;
+            physical->references = 1;
+            physical->cuda_registered = true;
+            physical->next = ct2d->direct_physicals;
+            ct2d->direct_physicals = physical;
+        }
+        source->runs[i].physical = physical;
+    }
+    if (ct2d->next_direct_source_id == UINT64_MAX) {
+        result = CXL_GPU_ERROR_OUT_OF_MEMORY;
+        goto rollback;
+    }
+    source->source_id = ++ct2d->next_direct_source_id;
+    source->next = ct2d->direct_sources;
+    ct2d->direct_sources = source;
+    *source_id_out = source->source_id;
+    g_free(validated);
+    return CXL_GPU_SUCCESS;
+
+rollback:
+    for (uint32_t i = 0; i < source->run_count; i++) {
+        if (source->runs[i].physical) {
+            int cleanup = cxl_type2_direct_physical_put(
+                ct2d, source->runs[i].physical);
+            source->runs[i].physical = NULL;
+            if (cleanup != CXL_GPU_SUCCESS) {
+                result = cleanup;
+            }
+        }
+    }
+out:
+    if (source) {
+        g_free(source->ranges);
+        g_free(source->runs);
+        g_free(source);
+    }
+    g_free(validated);
+    return result;
+}
+
+static int cxl_type2_enqueue_htod_direct(CXLType2State *ct2d,
+                                         uint64_t dev_ptr,
+                                         const void *source_host, size_t size,
+                                         void *stream,
+                                         CXLType2DirectSource *source)
+{
+    CXLType2PendingHtoD *pending;
+    int64_t enqueue_start_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+    int result = hetgpu_cuda_memcpy_htod_async(
+        &ct2d->gpu_info.hetgpu_state, dev_ptr, source_host, size, stream);
+
+    if (result != CXL_GPU_SUCCESS) {
+        return result;
+    }
+    pending = g_new0(CXLType2PendingHtoD, 1);
+    pending->stream = stream;
+    pending->dev_ptr = dev_ptr;
+    pending->sequence = ++ct2d->next_htod_sequence;
+    pending->call_id = ct2d->gpu_cmd.call_id;
+    pending->enqueue_host_ns = enqueue_start_ns;
+    pending->size = size;
+    pending->direct_source = true;
+    pending->direct_host = source_host;
+    pending->source = source;
+    pending->next = ct2d->pending_htod;
+    ct2d->pending_htod = pending;
+    source->pending_refcount++;
+    ct2d->htod_pending_copies++;
+    ct2d->htod_pending_bytes += size;
+    ct2d->paired_case.active_direct_fragments++;
+    ct2d->paired_case.active_direct_bytes += size;
+    ct2d->htod_peak_pending_copies = MAX(ct2d->htod_peak_pending_copies,
+                                         ct2d->htod_pending_copies);
+    ct2d->htod_peak_pending_bytes = MAX(ct2d->htod_peak_pending_bytes,
+                                        ct2d->htod_pending_bytes);
+    return CXL_GPU_SUCCESS;
+}
+
+static bool cxl_type2_direct_range_is_valid(
+    CXLType2State *ct2d, const CXLGPUDirectRangeV1 *wire,
+    CXLType2DirectSource **source_out)
+{
+    CXLType2DirectSource *source = cxl_type2_direct_source_find(
+        ct2d, wire->source_id);
+    CXLGPUSourceRangeV1 *range;
+    uint64_t skip;
+    uint64_t remaining;
+
+    if (!source || source->case_epoch != ct2d->paired_case.active_epoch ||
+        wire->source_range >= source->range_count) {
+        return false;
+    }
+    range = &source->ranges[wire->source_range];
+    if (wire->source_offset > range->length ||
+        wire->size > range->length - wire->source_offset ||
+        wire->source_offset >
+            UINT64_MAX - range->first_run_byte_offset) {
+        return false;
+    }
+    skip = range->first_run_byte_offset + wire->source_offset;
+    remaining = wire->size;
+    for (uint32_t i = 0; i < range->run_count && remaining; i++) {
+        CXLType2DirectPhysical *physical =
+            source->runs[range->first_run + i].physical;
+
+        if (!physical) {
+            return false;
+        }
+        if (skip >= physical->length) {
+            skip -= physical->length;
+            continue;
+        }
+        uint64_t chunk = MIN(remaining, physical->length - skip);
+        remaining -= chunk;
+        skip = 0;
+    }
+    if (remaining) {
+        return false;
+    }
+    *source_out = source;
+    return true;
+}
+
+static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
+                                         uint64_t range_count,
+                                         uint64_t payload_bytes,
+                                         void *stream,
+                                         uint64_t *fail_index,
+                                         uint64_t *logical_enqueued,
+                                         uint64_t *fragments_enqueued)
+{
+    const uint8_t *payload = ct2d->gpu_cmd.batch_data;
+
+    *logical_enqueued = 0;
+    *fragments_enqueued = 0;
+    if (!ct2d->cuda_direct_source || ct2d->direct_source_poisoned ||
+        !cxl_gpu_direct_batch_validate(
+            payload, CXL_GPU_BATCH_DATA_SIZE, range_count, payload_bytes,
+            fail_index)) {
+        return CXL_GPU_ERROR_INVALID_VALUE;
+    }
+    /* Resolve every source and range before the first Driver enqueue. */
+    for (uint64_t i = 0; i < range_count; i++) {
+        CXLGPUDirectRangeV1 wire;
+        CXLType2DirectSource *source;
+
+        memcpy(&wire, payload + i * sizeof(wire), sizeof(wire));
+        if (!cxl_type2_direct_range_is_valid(ct2d, &wire, &source)) {
+            *fail_index = i;
+            return CXL_GPU_ERROR_INVALID_VALUE;
+        }
+    }
+
+    for (uint64_t i = 0; i < range_count; i++) {
+        CXLGPUDirectRangeV1 wire;
+        CXLType2DirectSource *source;
+        CXLGPUSourceRangeV1 *range;
+        uint64_t skip;
+        uint64_t remaining;
+        uint64_t copied = 0;
+
+        memcpy(&wire, payload + i * sizeof(wire), sizeof(wire));
+        g_assert(cxl_type2_direct_range_is_valid(ct2d, &wire, &source));
+        range = &source->ranges[wire.source_range];
+        skip = range->first_run_byte_offset + wire.source_offset;
+        remaining = wire.size;
+        for (uint32_t j = 0; j < range->run_count && remaining; j++) {
+            CXLType2DirectPhysical *physical =
+                source->runs[range->first_run + j].physical;
+            uint64_t chunk;
+            int result;
+
+            if (skip >= physical->length) {
+                skip -= physical->length;
+                continue;
+            }
+            chunk = MIN(remaining, physical->length - skip);
+            result = cxl_type2_enqueue_htod_direct(
+                ct2d, wire.destination + copied,
+                (const uint8_t *)physical->host_address + skip, chunk,
+                stream, source);
+            if (result != CXL_GPU_SUCCESS) {
+                *fail_index = i;
+                return result;
+            }
+            (*fragments_enqueued)++;
+            copied += chunk;
+            remaining -= chunk;
+            skip = 0;
+        }
+        (*logical_enqueued)++;
+    }
+    *fail_index = SIZE_MAX;
+    return CXL_GPU_SUCCESS;
+}
+
 static int cxl_type2_enqueue_htod_from_host(CXLType2State *ct2d,
                                              uint64_t dev_ptr,
                                              const void *source,
@@ -2899,9 +3697,14 @@ static int cxl_type2_batch_htod_enqueue_one(void *opaque,
 {
     CXLType2BatchHtoDEnqueueContext *context = opaque;
 
-    return cxl_type2_enqueue_htod_from_host(
+    int result = cxl_type2_enqueue_htod_from_host(
         context->ct2d, destination, source, size, context->stream,
         "bar2-batch");
+
+    if (result == CXL_GPU_SUCCESS) {
+        context->ct2d->paired_case.active_payload_source_bytes += size;
+    }
+    return result;
 }
 
 static int cxl_type2_htod_staging_release(CXLType2State *ct2d,
@@ -2980,7 +3783,9 @@ static int cxl_type2_release_pending_htod(CXLType2State *ct2d,
                                             pending->size, true, false)) {
             uint8_t *mem = memory_region_get_ram_ptr(&ct2d->device_mem);
             if (mem) {
-                memcpy(mem + pending->dev_ptr, pending->staging,
+                memcpy(mem + pending->dev_ptr,
+                       pending->direct_source ? pending->direct_host
+                                              : pending->staging,
                        pending->size);
                 if (ct2d->bar_coherency.enabled) {
                     cxl_bar_notify_gpu_access(&ct2d->bar_coherency,
@@ -2989,16 +3794,26 @@ static int cxl_type2_release_pending_htod(CXLType2State *ct2d,
                 }
             }
         }
-        bool pooled;
+        bool pooled = false;
         int64_t release_start_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
-        int result = cxl_type2_htod_staging_release(
-            ct2d, pending->staging, pending->staging_capacity,
-            pending->staging_id, &pooled);
+        int result;
+
+        if (pending->direct_source) {
+            g_assert(pending->source && pending->source->pending_refcount > 0);
+            pending->source->pending_refcount--;
+            result = CXL_GPU_SUCCESS;
+        } else {
+            result = cxl_type2_htod_staging_release(
+                ct2d, pending->staging, pending->staging_capacity,
+                pending->staging_id, &pooled);
+        }
         int64_t release_duration_ns =
             qemu_clock_get_ns(QEMU_CLOCK_HOST) - release_start_ns;
 
         ct2d->htod_pending_copies--;
-        ct2d->htod_pending_bytes -= pending->staging_capacity;
+        ct2d->htod_pending_bytes -= pending->direct_source
+                                        ? pending->size
+                                        : pending->staging_capacity;
         if (ct2d->paired_case.qemu_cuda_calls_enabled) {
             qemu_log("CXL TYPE2 TRACE copy_completion original_call_id=0x%016"
                      PRIx64 " completion_call_id=0x%016" PRIx64
@@ -3018,7 +3833,10 @@ static int cxl_type2_release_pending_htod(CXLType2State *ct2d,
                      pending->staging_capacity, completion,
                      qemu_clock_get_ns(QEMU_CLOCK_HOST) -
                          pending->enqueue_host_ns,
-                     pooled ? "pool" : "driver-free", release_duration_ns,
+                     pending->direct_source
+                         ? "direct-source"
+                         : pooled ? "pool" : "driver-free",
+                     release_duration_ns,
                      result, ct2d->htod_pending_copies,
                      ct2d->htod_pending_bytes, ct2d->htod_peak_pending_copies,
                      ct2d->htod_peak_pending_bytes, ct2d->htod_pooled_buffers,
@@ -3554,6 +4372,8 @@ static void cxl_type2_paired_case_begin(CXLType2State *ct2d,
     ct2d->paired_case.active_first_sequence = trace_sequence;
     ct2d->paired_case.active_config_binding = config_binding;
     cxl_type2_reset_case_summary(ct2d);
+    hetgpu_set_driver_interval_callback(
+        hetgpu, cxl_type2_record_driver_interval, ct2d);
     cxl_type2_notify_case_scope(run_binding, case_kind, epoch, true);
     ct2d->paired_case.next_epoch++;
     ct2d->gpu_cmd.results[0] = epoch;
@@ -3611,6 +4431,10 @@ static void cxl_type2_paired_case_end(CXLType2State *ct2d,
             CXL_GPU_SUCCESS) {
         sync_error = HETGPU_ERROR_UNKNOWN;
     }
+    if (sync_error == HETGPU_SUCCESS &&
+        cxl_type2_direct_sources_cleanup(ct2d) != CXL_GPU_SUCCESS) {
+        sync_error = HETGPU_ERROR_UNKNOWN;
+    }
     pool_clear_result = cxl_type2_clear_htod_staging_pool(ct2d);
     if (sync_error == HETGPU_SUCCESS &&
         pool_clear_result != CXL_GPU_SUCCESS) {
@@ -3665,16 +4489,23 @@ static void cxl_type2_paired_case_end(CXLType2State *ct2d,
     ct2d->gpu_cmd.results[2] = result.outcome;
     ct2d->gpu_cmd.results[3] = reset_error;
 
-    qemu_log("KIMI_CASE_END run_binding=%" PRIu64 " case=%s epoch=%" PRIu64
-             " last_sequence=%" PRIu64 " app_exit=%d sync_status=%u"
-             " concordia_status=%u concordia_reason=%u stateful_launches=%"
-             PRIu64 " reset_status=%u detail=%.*s\n",
-             run_binding, cxl_type2_paired_case_name(case_kind), epoch,
-             trace_sequence, application_exit, sync_error, result.outcome,
-             result.reason, result.stateful_launches, reset_error,
-             (int)MIN(result.error_len, HETGPU_KIMI_CASE_ERROR_BYTES),
-             result.error);
+    {
+        int64_t interval_end_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+        CXLType2IntervalIdentity end_identity = cxl_type2_interval_identity(
+            trace_sequence, "qemu", "case", "case-end", 0, false);
 
+        if (hetgpu->driver_interval_callback !=
+                cxl_type2_record_driver_interval ||
+            hetgpu->driver_interval_opaque != ct2d) {
+            cxl_type2_interval_fail(&ct2d->paired_case.driver_intervals,
+                                    "driver-observer-detached");
+        }
+        hetgpu_set_driver_interval_callback(hetgpu, NULL, NULL);
+        cxl_type2_interval_finish(&ct2d->paired_case.command_intervals,
+                                  interval_end_ns, end_identity);
+        cxl_type2_interval_finish(&ct2d->paired_case.driver_intervals,
+                                  interval_end_ns, end_identity);
+    }
     cxl_type2_log_case_summary(ct2d, run_binding, case_kind, epoch);
     cxl_type2_notify_case_scope(run_binding, case_kind, epoch, false);
 
@@ -3686,6 +4517,16 @@ static void cxl_type2_paired_case_end(CXLType2State *ct2d,
         : !result_valid ? (result.reason ? result.reason : HETGPU_ERROR_UNKNOWN)
         : reset_error != HETGPU_SUCCESS ? reset_error : HETGPU_SUCCESS,
         true);
+
+    qemu_log("KIMI_CASE_END run_binding=%" PRIu64 " case=%s epoch=%" PRIu64
+             " last_sequence=%" PRIu64 " app_exit=%d sync_status=%u"
+             " concordia_status=%u concordia_reason=%u stateful_launches=%"
+             PRIu64 " reset_status=%u detail=%.*s\n",
+             run_binding, cxl_type2_paired_case_name(case_kind), epoch,
+             trace_sequence, application_exit, sync_error, result.outcome,
+             result.reason, result.stateful_launches, reset_error,
+             (int)MIN(result.error_len, HETGPU_KIMI_CASE_ERROR_BYTES),
+             result.error);
 
     ct2d->paired_case.active_case = CXL_GPU_CASE_NONE;
     ct2d->paired_case.active_epoch = 0;
@@ -3735,6 +4576,9 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
     ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
     hetgpu_cuda_trace_set_detailed_logs(ct2d->paired_case.qemu_cuda_calls_enabled);
     hetgpu_cuda_trace_set_call_id(ct2d->gpu_cmd.call_id);
+    if (ct2d->paired_case.active_case != CXL_GPU_CASE_NONE) {
+        ct2d->paired_case.active_command_sequence = trace_sequence;
+    }
 
     if (ct2d->paired_case.required && ct2d->paired_case.failed) {
         ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_DEINITIALIZED;
@@ -4091,6 +4935,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
 
             ct2d->gpu_cmd.results[0] = SIZE_MAX;
             ct2d->gpu_cmd.results[1] = 0;
+            ct2d->paired_case.active_payload_batches++;
             if (!hetgpu->initialized) {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
                 break;
@@ -5813,6 +6658,56 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         }
         break;
 
+    case CXL_GPU_CMD_SOURCE_REGISTER:
+        {
+            uint64_t source_id = 0;
+
+            ct2d->gpu_cmd.cmd_result = cxl_type2_direct_source_register(
+                ct2d, ct2d->gpu_cmd.params[0], &source_id);
+            if (ct2d->gpu_cmd.cmd_result == CXL_GPU_SUCCESS) {
+                ct2d->gpu_cmd.results[0] = source_id;
+                ct2d->paired_case.active_direct_register_calls++;
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_SOURCE_UNREGISTER:
+        ct2d->gpu_cmd.cmd_result = cxl_type2_direct_source_unregister(
+            ct2d, ct2d->gpu_cmd.params[0]);
+        if (ct2d->gpu_cmd.cmd_result == CXL_GPU_SUCCESS) {
+            ct2d->paired_case.active_direct_unregister_calls++;
+        }
+        break;
+
+    case CXL_GPU_CMD_BATCH_HTOD_DIRECT_ASYNC:
+        {
+            uint64_t fail_idx = SIZE_MAX;
+            uint64_t logical_enqueued = 0;
+            uint64_t fragments_enqueued = 0;
+            void *stream = NULL;
+
+            ct2d->gpu_cmd.results[0] = SIZE_MAX;
+            if (!hetgpu->initialized) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
+                break;
+            }
+            if (!ct2d->gpu_cmd.batch_data ||
+                !cxl_type2_stream_from_wire(ct2d, ct2d->gpu_cmd.params[2],
+                                            &stream)) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                break;
+            }
+            ct2d->gpu_cmd.cmd_result = cxl_type2_direct_batch_submit(
+                ct2d, ct2d->gpu_cmd.params[0], ct2d->gpu_cmd.params[1],
+                stream, &fail_idx, &logical_enqueued, &fragments_enqueued);
+            ct2d->gpu_cmd.results[0] = fail_idx;
+            ct2d->gpu_cmd.results[1] = logical_enqueued;
+            ct2d->gpu_cmd.results[2] = fragments_enqueued;
+            ct2d->paired_case.active_direct_logical_ranges +=
+                logical_enqueued;
+        }
+        break;
+
     case CXL_GPU_CMD_BULK_DTOH:
         /* Bulk device-to-host transfer using BAR4 region */
         {
@@ -6306,9 +7201,10 @@ complete:
     int64_t trace_end_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
     int64_t trace_duration_ns = trace_end_ns - trace_start_ns;
     if (cmd != CXL_GPU_CMD_CASE_BEGIN && cmd != CXL_GPU_CMD_CASE_END) {
-        cxl_type2_record_case_command(ct2d, cmd, trace_start_ns,
+        cxl_type2_record_case_command(ct2d, cmd, trace_sequence, trace_start_ns,
                                       trace_end_ns, ct2d->gpu_cmd.cmd_result);
     }
+    ct2d->paired_case.active_command_sequence = 0;
     if (ct2d->paired_case.qemu_cuda_calls_enabled) qemu_log("CXL TYPE2 TRACE cmd_end seq=%" PRIu64
              " call_id=0x%016" PRIx64
              " cmd=0x%x host_ns=%" PRId64 " result=%u duration_ns=%" PRId64
@@ -6636,6 +7532,24 @@ static void cxl_type2_reset(DeviceState *dev)
     cxl_cstate->bi_control_opaque = ct2d;
     ct2d->bi_enabled = false;
 
+    if (ct2d->direct_sources || ct2d->direct_physicals) {
+        int result = HETGPU_ERROR_UNKNOWN;
+
+        if (ct2d->gpu_info.hetgpu_state.initialized &&
+            hetgpu_synchronize(&ct2d->gpu_info.hetgpu_state) ==
+                HETGPU_SUCCESS &&
+            cxl_type2_release_pending_htod(ct2d, NULL, true, UINT64_MAX,
+                                           "device-reset") ==
+                CXL_GPU_SUCCESS) {
+            result = cxl_type2_direct_sources_cleanup(ct2d);
+        }
+        if (result != CXL_GPU_SUCCESS) {
+            ct2d->direct_source_poisoned = true;
+            ct2d->paired_case.failed = true;
+            ct2d->paired_case.failure_code = result;
+        }
+    }
+
     /* Reset statistics */
     memset(&ct2d->stats, 0, sizeof(ct2d->stats));
 
@@ -6716,6 +7630,19 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
         }
         ct2d->paired_case.next_epoch = 1;
         ct2d->paired_case.active_case = CXL_GPU_CASE_NONE;
+    }
+
+    if (ct2d->cuda_direct_source) {
+        VirtioSharedMemory *source_shmem;
+        MemoryRegion *source_mr;
+
+        if (!ct2d->direct_source_fs ||
+            !vhost_user_fs_pci_get_dax(ct2d->direct_source_fs,
+                                       &source_shmem, &source_mr)) {
+            error_setg(errp, "cuda-direct-source requires direct-source-fs "
+                       "to reference a realized vhost-user-fs-pci DAX device");
+            return;
+        }
     }
 
     if (ct2d->hdmdb && !ct2d->flitmode) {
@@ -6940,6 +7867,9 @@ static void cxl_type2_exit(PCIDevice *pci_dev)
         (void)cxl_type2_release_pending_htod(ct2d, NULL, true, UINT64_MAX,
                                              "device-exit");
         (void)cxl_type2_clear_htod_staging_pool(ct2d);
+        if (cxl_type2_direct_sources_cleanup(ct2d) != CXL_GPU_SUCCESS) {
+            error_report("CXL Type2 direct source cleanup failed at device exit");
+        }
     }
 
     (void)cxl_type2_clear_gpu_handles(ct2d, 0, CXL_GPU_CASE_NONE, 0);
@@ -6993,6 +7923,10 @@ static const Property cxl_type2_props[] = {
                      CXL_TYPE2_DEFAULT_MEM_SIZE),
     DEFINE_PROP_SIZE("htod-staging-pool-size", CXLType2State,
                      htod_staging_pool_size, 0),
+    DEFINE_PROP_BOOL("cuda-direct-source", CXLType2State,
+                     cuda_direct_source, false),
+    DEFINE_PROP_LINK("direct-source-fs", CXLType2State, direct_source_fs,
+                     TYPE_VHOST_USER_FS_PCI, Object *),
     DEFINE_PROP_UINT64("sn", CXLType2State, sn, 0),
     DEFINE_PROP_PCIE_LINK_SPEED("x-speed", CXLType2State,
                                 speed, PCIE_LINK_SPEED_64),

@@ -1954,6 +1954,10 @@ vhost_user_backend_handle_shmem_unmap(struct vhost_dev *dev,
         ret = -EFAULT;
         goto send_reply;
     }
+    if (mmap->source_pins) {
+        ret = virtio_del_shmem_map(shmem, vu_mmap->shm_offset,
+                                   vu_mmap->len);
+    }
 
 send_reply:
     trace_vhost_user_shmem_unmap(vu_mmap->shmid, vu_mmap->shm_offset,
@@ -1969,7 +1973,12 @@ send_reply:
 
     if (!ret && shmem && mmap) {
         /* Free the MemoryRegion only after reply */
-        virtio_del_shmem_map(shmem, vu_mmap->shm_offset, vu_mmap->len);
+        ret = virtio_del_shmem_map(shmem, vu_mmap->shm_offset,
+                                   vu_mmap->len);
+        if (ret) {
+            error_report("Unable to revoke VIRTIO Shared Memory mapping after unmap reply: %s",
+                         strerror(-ret));
+        }
     }
 
     return 0;

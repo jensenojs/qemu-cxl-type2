@@ -3094,12 +3094,17 @@ static void virtio_shared_memory_mapping_instance_init(Object *obj)
     mapping->fd = -1;
     mapping->fd_offset = 0;
     mapping->allow_write = false;
+    mapping->generation = 0;
+    mapping->source_pins = 0;
+    mapping->revoke_pending = false;
+    mapping->owner = NULL;
 }
 
 static void virtio_shared_memory_mapping_instance_finalize(Object *obj)
 {
     VirtioSharedMemoryMapping *mapping = VIRTIO_SHARED_MEMORY_MAPPING(obj);
 
+    g_assert(mapping->source_pins == 0);
     if (mapping->fd >= 0) {
         close(mapping->fd);
         mapping->fd = -1;
@@ -3139,6 +3144,8 @@ VirtioSharedMemoryMapping *virtio_shared_memory_mapping_new(uint8_t shmid,
 int virtio_add_shmem_map(VirtioSharedMemory *shmem,
                          VirtioSharedMemoryMapping *mapping)
 {
+    static uint64_t next_generation;
+    uint64_t generation;
     size_t host_page_size = qemu_real_host_page_size();
 
     if (!mapping) {
@@ -3163,6 +3170,12 @@ int virtio_add_shmem_map(VirtioSharedMemory *shmem,
         return -1;
     }
 
+    generation = qatomic_fetch_inc(&next_generation) + 1;
+    if (generation == 0) {
+        error_report("VIRTIO Shared Memory mapping generation overflow");
+        return -EOVERFLOW;
+    }
+
     void *addr = shmem->host_addr + mapping->offset;
     int prot = PROT_READ | (mapping->allow_write ? PROT_WRITE : 0);
     void *mapped = mmap(addr, mapping->len, prot, MAP_SHARED | MAP_FIXED,
@@ -3172,6 +3185,9 @@ int virtio_add_shmem_map(VirtioSharedMemory *shmem,
                      strerror(errno));
         return -1;
     }
+
+    mapping->generation = generation;
+    mapping->owner = shmem;
 
     /* Add to the mapped regions list */
     QTAILQ_INSERT_TAIL(&shmem->mmaps, mapping, link);
@@ -3184,21 +3200,18 @@ VirtioSharedMemoryMapping *virtio_find_shmem_map(VirtioSharedMemory *shmem,
 {
     VirtioSharedMemoryMapping *mapping;
     QTAILQ_FOREACH(mapping, &shmem->mmaps, link) {
-        if (mapping->offset == offset && mapping->len == size) {
+        if (size && offset >= mapping->offset &&
+            offset - mapping->offset <= mapping->len &&
+            size <= mapping->len - (offset - mapping->offset)) {
             return mapping;
         }
     }
     return NULL;
 }
 
-void virtio_del_shmem_map(VirtioSharedMemory *shmem, hwaddr offset,
-                          uint64_t size)
+static int virtio_revoke_shmem_mapping(VirtioSharedMemory *shmem,
+                                       VirtioSharedMemoryMapping *mapping)
 {
-    VirtioSharedMemoryMapping *mapping = virtio_find_shmem_map(shmem, offset, size);
-    if (mapping == NULL) {
-        return;
-    }
-
     void *addr = shmem->host_addr + mapping->offset;
     void *reserved = mmap(addr, mapping->len, PROT_NONE,
                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED |
@@ -3206,7 +3219,7 @@ void virtio_del_shmem_map(VirtioSharedMemory *shmem, hwaddr offset,
     if (reserved != addr) {
         error_report("Unable to revoke VIRTIO Shared Memory range: %s",
                      strerror(errno));
-        abort();
+        return -errno;
     }
 
     /*
@@ -3214,7 +3227,68 @@ void virtio_del_shmem_map(VirtioSharedMemory *shmem, hwaddr offset,
      * when the reference count reaches zero.
      */
     QTAILQ_REMOVE(&shmem->mmaps, mapping, link);
+    mapping->owner = NULL;
     object_unref(OBJECT(mapping));
+    return 0;
+}
+
+int virtio_shared_memory_pin_range(
+    VirtioSharedMemory *shmem, hwaddr offset, uint64_t length,
+    VirtioSharedMemoryMapping **mapping_out, uint64_t *generation,
+    void **host_address)
+{
+    VirtioSharedMemoryMapping *mapping;
+
+    if (!shmem || !length || !mapping_out || !generation || !host_address) {
+        return -EINVAL;
+    }
+    mapping = virtio_find_shmem_map(shmem, offset, length);
+    if (!mapping) {
+        return -ENOENT;
+    }
+    if (mapping->revoke_pending || mapping->source_pins == UINT64_MAX) {
+        return mapping->source_pins == UINT64_MAX ? -EOVERFLOW : -EBUSY;
+    }
+    object_ref(OBJECT(mapping));
+    mapping->source_pins++;
+    *mapping_out = mapping;
+    *generation = mapping->generation;
+    *host_address = shmem->host_addr + offset;
+    return 0;
+}
+
+void virtio_shared_memory_unpin(VirtioSharedMemoryMapping *mapping)
+{
+    VirtioSharedMemory *owner;
+    bool revoke;
+
+    g_assert(mapping && mapping->source_pins > 0);
+    owner = mapping->owner;
+    mapping->source_pins--;
+    revoke = mapping->source_pins == 0 && mapping->revoke_pending;
+    if (revoke) {
+        mapping->revoke_pending = false;
+        if (virtio_revoke_shmem_mapping(owner, mapping) != 0) {
+            mapping->revoke_pending = true;
+        }
+    }
+    object_unref(OBJECT(mapping));
+}
+
+int virtio_del_shmem_map(VirtioSharedMemory *shmem, hwaddr offset,
+                         uint64_t size)
+{
+    VirtioSharedMemoryMapping *mapping =
+        virtio_find_shmem_map(shmem, offset, size);
+
+    if (!mapping || mapping->offset != offset || mapping->len != size) {
+        return -ENOENT;
+    }
+    if (mapping->source_pins) {
+        mapping->revoke_pending = true;
+        return -EBUSY;
+    }
+    return virtio_revoke_shmem_mapping(shmem, mapping);
 }
 
 /* A wrapper for use as a VMState .put function */
@@ -3376,10 +3450,12 @@ void virtio_reset(void *opaque)
         QTAILQ_FOREACH(mapping, &shmem->mmaps, link) {
             mapped++;
         }
-        while (!QTAILQ_EMPTY(&shmem->mmaps)) {
-            mapping = QTAILQ_FIRST(&shmem->mmaps);
-            virtio_del_shmem_map(shmem, mapping->offset, mapping->len);
-            removed++;
+        VirtioSharedMemoryMapping *next;
+        QTAILQ_FOREACH_SAFE(mapping, &shmem->mmaps, link, next) {
+            if (virtio_del_shmem_map(shmem, mapping->offset,
+                                     mapping->len) == 0) {
+                removed++;
+            }
         }
         QTAILQ_FOREACH(mapping, &shmem->mmaps, link) {
             remaining++;
@@ -4238,7 +4314,11 @@ static void virtio_device_instance_finalize(Object *obj)
         shmem = QSIMPLEQ_FIRST(&vdev->shmem_list);
         while (!QTAILQ_EMPTY(&shmem->mmaps)) {
             VirtioSharedMemoryMapping *mapping = QTAILQ_FIRST(&shmem->mmaps);
-            virtio_del_shmem_map(shmem, mapping->offset, mapping->len);
+            if (virtio_del_shmem_map(shmem, mapping->offset,
+                                     mapping->len) != 0) {
+                error_report("VIRTIO shared-memory mapping still pinned at device finalization");
+                abort();
+            }
         }
 
         void *host_addr = shmem->host_addr;

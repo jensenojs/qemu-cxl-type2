@@ -239,3 +239,124 @@ int cxl_gpu_batch_htod_submit(const uint8_t *payload,
     return cxl_gpu_batch_htod_enqueue(payload, range_count, enqueue, opaque,
                                       fail_idx, successfully_enqueued);
 }
+
+bool cxl_gpu_source_register_validate(const uint8_t *payload,
+                                      uint64_t payload_capacity,
+                                      uint64_t payload_bytes,
+                                      CXLGPUSourceRegisterV1 *header_out,
+                                      uint64_t *fail_index)
+{
+    CXLGPUSourceRegisterV1 header;
+    const uint8_t *range_base;
+    const uint8_t *run_base;
+    uint64_t ranges_bytes;
+    uint64_t runs_bytes;
+    uint64_t logical_bytes = 0;
+    uint64_t unique_bytes = 0;
+    uint64_t previous_end = 0;
+
+    if (!payload || !header_out || !fail_index ||
+        payload_bytes < sizeof(header) || payload_bytes > payload_capacity) {
+        return false;
+    }
+    *fail_index = SIZE_MAX;
+    memcpy(&header, payload, sizeof(header));
+    if (header.flags || header.reserved0 || header.reserved1 ||
+        !header.lease_handle || !header.range_count || !header.run_count ||
+        header.range_count > UINT32_MAX || header.run_count > UINT32_MAX ||
+        header.range_count >
+            (payload_bytes - sizeof(header)) / sizeof(CXLGPUSourceRangeV1)) {
+        return false;
+    }
+    ranges_bytes = (uint64_t)header.range_count * sizeof(CXLGPUSourceRangeV1);
+    if (header.run_count >
+        (payload_bytes - sizeof(header) - ranges_bytes) /
+            sizeof(CXLGPUSourceRunV1)) {
+        return false;
+    }
+    runs_bytes = (uint64_t)header.run_count * sizeof(CXLGPUSourceRunV1);
+    if (sizeof(header) + ranges_bytes + runs_bytes != payload_bytes) {
+        return false;
+    }
+    range_base = payload + sizeof(header);
+    run_base = range_base + ranges_bytes;
+
+    for (uint64_t i = 0; i < header.run_count; i++) {
+        CXLGPUSourceRunV1 run;
+
+        memcpy(&run, run_base + i * sizeof(run), sizeof(run));
+        if (!run.length || run.guest_phys_addr > UINT64_MAX - run.length ||
+            (i && run.guest_phys_addr < previous_end) ||
+            unique_bytes > UINT64_MAX - run.length) {
+            *fail_index = i;
+            return false;
+        }
+        previous_end = run.guest_phys_addr + run.length;
+        unique_bytes += run.length;
+    }
+    if (unique_bytes != header.unique_dmap_bytes) {
+        return false;
+    }
+
+    for (uint64_t i = 0; i < header.range_count; i++) {
+        CXLGPUSourceRangeV1 range;
+        uint64_t available = 0;
+
+        memcpy(&range, range_base + i * sizeof(range), sizeof(range));
+        if (!range.run_count || !range.length ||
+            range.first_run >= header.run_count ||
+            range.run_count > header.run_count - range.first_run) {
+            *fail_index = i;
+            return false;
+        }
+        for (uint64_t j = 0; j < range.run_count; j++) {
+            CXLGPUSourceRunV1 run;
+            uint64_t offset = j ? 0 : range.first_run_byte_offset;
+
+            memcpy(&run, run_base +
+                   (range.first_run + j) * sizeof(run), sizeof(run));
+            if (offset >= run.length || available > UINT64_MAX -
+                                              (run.length - offset)) {
+                *fail_index = i;
+                return false;
+            }
+            available += run.length - offset;
+        }
+        if (range.length > available || logical_bytes > UINT64_MAX - range.length) {
+            *fail_index = i;
+            return false;
+        }
+        logical_bytes += range.length;
+    }
+    if (logical_bytes != header.logical_bytes) {
+        return false;
+    }
+    *header_out = header;
+    return true;
+}
+
+bool cxl_gpu_direct_batch_validate(const uint8_t *payload,
+                                   uint64_t payload_capacity,
+                                   uint64_t range_count,
+                                   uint64_t payload_bytes,
+                                   uint64_t *fail_index)
+{
+    if (!payload || !fail_index || !range_count ||
+        range_count > payload_capacity / sizeof(CXLGPUDirectRangeV1) ||
+        payload_bytes != range_count * sizeof(CXLGPUDirectRangeV1)) {
+        return false;
+    }
+    *fail_index = SIZE_MAX;
+    for (uint64_t i = 0; i < range_count; i++) {
+        CXLGPUDirectRangeV1 range;
+
+        memcpy(&range, payload + i * sizeof(range), sizeof(range));
+        if (!range.size || !range.source_id || range.reserved0 ||
+            range.destination > UINT64_MAX - range.size ||
+            range.source_offset > UINT64_MAX - range.size) {
+            *fail_index = i;
+            return false;
+        }
+    }
+    return true;
+}

@@ -59,6 +59,8 @@ typedef int (*cuMemcpyDtoH_fn)(void *, uint64_t, size_t);
 typedef int (*cuMemcpyHtoDAsync_fn)(uint64_t, const void *, size_t, void *);
 typedef int (*cuMemHostAlloc_fn)(void **, size_t, unsigned int);
 typedef int (*cuMemFreeHost_fn)(void *);
+typedef int (*cuMemHostRegister_fn)(void *, size_t, unsigned int);
+typedef int (*cuMemHostUnregister_fn)(void *);
 typedef int (*cuMemcpyDtoD_fn)(uint64_t, uint64_t, size_t);
 typedef struct CudaMemcpy2D {
     size_t src_x_bytes;
@@ -211,8 +213,22 @@ void hetgpu_cuda_trace_set_detailed_logs(bool enabled) {
   g_cuda_trace_detailed_logs = enabled;
 }
 
-#define HETGPU_CUDA_CALL(field, ...)                                           \
+void hetgpu_set_driver_interval_callback(
+    HetGPUState *state,
+    HetGPUDriverIntervalCallback callback,
+    void *opaque)
+{
+    if (!state) {
+        return;
+    }
+
+    state->driver_interval_callback = callback;
+    state->driver_interval_opaque = opaque;
+}
+
+#define HETGPU_CUDA_CALL_STATE(driver_state, field, ...)                       \
   ({                                                                           \
+    HetGPUState *_driver_state = (driver_state);                               \
     uint32_t _driver_occurrence = ++g_cuda_trace_occurrence;                   \
     int64_t _driver_start_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);             \
     if (g_cuda_trace_detailed_logs) {                                          \
@@ -223,6 +239,12 @@ void hetgpu_cuda_trace_set_detailed_logs(bool enabled) {
     }                                                                          \
     int _driver_result = g_cuda_funcs.field(__VA_ARGS__);                      \
     int64_t _driver_end_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);               \
+    if (_driver_state && _driver_state->driver_interval_callback) {            \
+      _driver_state->driver_interval_callback(                                 \
+          _driver_state->driver_interval_opaque, g_cuda_trace_call_id,         \
+          _driver_occurrence, #field, _driver_start_ns, _driver_end_ns,        \
+          _driver_result);                                                     \
+    }                                                                          \
     if (g_cuda_trace_detailed_logs) {                                          \
       qemu_log("CXL TYPE2 TRACE driver_end call_id=0x%016" PRIx64              \
                " occurrence=%u symbol=%s host_ns=%" PRId64                     \
@@ -233,6 +255,9 @@ void hetgpu_cuda_trace_set_detailed_logs(bool enabled) {
     }                                                                          \
     _driver_result;                                                            \
   })
+
+#define HETGPU_CUDA_CALL(field, ...) \
+    HETGPU_CUDA_CALL_STATE(state, field, __VA_ARGS__)
 
 /* Loaded function pointers */
 static struct {
@@ -254,6 +279,8 @@ static struct {
     cuMemcpyHtoDAsync_fn cuMemcpyHtoDAsync;
     cuMemHostAlloc_fn cuMemHostAlloc;
     cuMemFreeHost_fn cuMemFreeHost;
+    cuMemHostRegister_fn cuMemHostRegister;
+    cuMemHostUnregister_fn cuMemHostUnregister;
     cuMemcpyDtoD_fn cuMemcpyDtoD;
     cuMemcpy2D_fn cuMemcpy2D;
     cuPointerGetAttribute_fn cuPointerGetAttribute;
@@ -426,6 +453,10 @@ static HetGPUError hetgpu_init_internal(HetGPUState *state,
                 dlsym(g_cuda_lib_handle, "cuMemHostAlloc");
             g_cuda_funcs.cuMemFreeHost =
                 dlsym(g_cuda_lib_handle, "cuMemFreeHost");
+            g_cuda_funcs.cuMemHostRegister =
+                dlsym(g_cuda_lib_handle, "cuMemHostRegister_v2");
+            g_cuda_funcs.cuMemHostUnregister =
+                dlsym(g_cuda_lib_handle, "cuMemHostUnregister");
             g_cuda_funcs.cuMemcpyDtoD = dlsym(g_cuda_lib_handle, "cuMemcpyDtoD_v2");
             g_cuda_funcs.cuMemcpy2D = dlsym(g_cuda_lib_handle, "cuMemcpy2D_v2");
             g_cuda_funcs.cuPointerGetAttribute = dlsym(g_cuda_lib_handle, "cuPointerGetAttribute");
@@ -888,7 +919,7 @@ HetGPUError hetgpu_get_device_count(int *count)
 
     if (g_cuda_funcs.cuDeviceGetCount) {
         *count = -999;  /* Sentinel value to detect if function updates it */
-        int err = HETGPU_CUDA_CALL(cuDeviceGetCount, count);
+        int err = HETGPU_CUDA_CALL_STATE(NULL, cuDeviceGetCount, count);
         fprintf(stderr, "CXL hetGPU: cuDeviceGetCount returned err=%d, count=%d\n", err, *count);
         fflush(stderr);
         if (err != 0) {
@@ -1467,6 +1498,39 @@ int hetgpu_cuda_mem_free_host(HetGPUState *state, void *ptr)
         return CUDA_ERROR_INVALID_CONTEXT;
     }
     int result = HETGPU_CUDA_CALL(cuMemFreeHost, ptr);
+    cuda_unlock(state);
+    return result;
+}
+
+int hetgpu_cuda_mem_host_register(HetGPUState *state, void *ptr, size_t size,
+                                  unsigned int flags)
+{
+    int result;
+
+    if (!state || !state->initialized || !ptr || !size ||
+        !g_cuda_funcs.cuMemHostRegister) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if (!cuda_lock(state)) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    result = HETGPU_CUDA_CALL(cuMemHostRegister, ptr, size, flags);
+    cuda_unlock(state);
+    return result;
+}
+
+int hetgpu_cuda_mem_host_unregister(HetGPUState *state, void *ptr)
+{
+    int result;
+
+    if (!state || !state->initialized || !ptr ||
+        !g_cuda_funcs.cuMemHostUnregister) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if (!cuda_lock(state)) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    result = HETGPU_CUDA_CALL(cuMemHostUnregister, ptr);
     cuda_unlock(state);
     return result;
 }

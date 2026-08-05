@@ -120,10 +120,56 @@ typedef struct CXLGPUBatchHtoDRange {
     uint64_t size;
 } CXLGPUBatchHtoDRange;
 
+typedef struct CXLGPUSourceRegisterV1 {
+    uint32_t flags;
+    uint32_t range_count;
+    uint32_t run_count;
+    uint32_t reserved0;
+    uint64_t lease_handle;
+    uint64_t logical_bytes;
+    uint64_t unique_dmap_bytes;
+    uint64_t reserved1;
+} CXLGPUSourceRegisterV1;
+
+typedef struct CXLGPUSourceRangeV1 {
+    uint32_t first_run;
+    uint32_t run_count;
+    uint64_t first_run_byte_offset;
+    uint64_t length;
+} CXLGPUSourceRangeV1;
+
+typedef struct CXLGPUSourceRunV1 {
+    uint64_t guest_phys_addr;
+    uint64_t length;
+} CXLGPUSourceRunV1;
+
+typedef struct CXLGPUDirectRangeV1 {
+    uint64_t destination;
+    uint64_t size;
+    uint64_t source_id;
+    uint32_t source_range;
+    uint32_t reserved0;
+    uint64_t source_offset;
+} CXLGPUDirectRangeV1;
+
 _Static_assert(sizeof(CXLGPUBatchHtoDHeader) == 32,
                "CXL GPU batch header size mismatch");
 _Static_assert(sizeof(CXLGPUBatchHtoDRange) == 24,
                "CXL GPU batch range size mismatch");
+_Static_assert(sizeof(CXLGPUSourceRegisterV1) == 48,
+               "CXL GPU source register size mismatch");
+_Static_assert(sizeof(CXLGPUSourceRangeV1) == 24,
+               "CXL GPU source range size mismatch");
+_Static_assert(sizeof(CXLGPUSourceRunV1) == 16,
+               "CXL GPU source run size mismatch");
+_Static_assert(sizeof(CXLGPUDirectRangeV1) == 40,
+               "CXL GPU direct range size mismatch");
+_Static_assert(offsetof(CXLGPUSourceRegisterV1, lease_handle) == 16,
+               "CXL GPU source lease offset mismatch");
+_Static_assert(offsetof(CXLGPUSourceRangeV1, first_run_byte_offset) == 8,
+               "CXL GPU source range offset mismatch");
+_Static_assert(offsetof(CXLGPUDirectRangeV1, source_offset) == 32,
+               "CXL GPU direct source offset mismatch");
 _Static_assert(offsetof(CXLGPUBatchHtoDHeader, payload_bytes) == 16,
                "CXL GPU batch payload size offset mismatch");
 
@@ -156,7 +202,7 @@ _Static_assert(CXL_GPU_BATCH_DATA_OFFSET >=
 
 /* Magic number */
 #define CXL_GPU_MAGIC               0x43584C32  /* "CXL2" */
-#define CXL_GPU_VERSION             0x00010F00  /* v1.15.0: batch async HtoD */
+#define CXL_GPU_VERSION             0x00011000  /* v1.16.0: direct source */
 
 #define CXL_GPU_STREAM_WIRE_NULL       0xffffffffffffffffULL
 #define CXL_GPU_STREAM_WIRE_LEGACY     0xfffffffffffffffeULL
@@ -217,6 +263,9 @@ typedef enum {
     CXL_GPU_CMD_MEM_COPY_HTOD_ASYNC = 0x29,
     CXL_GPU_CMD_MEM_COPY_2D_DTOD = 0x2A,
     CXL_GPU_CMD_BATCH_HTOD_ASYNC = 0x2B,
+    CXL_GPU_CMD_SOURCE_REGISTER = 0x2C,
+    CXL_GPU_CMD_SOURCE_UNREGISTER = 0x2D,
+    CXL_GPU_CMD_BATCH_HTOD_DIRECT_ASYNC = 0x2E,
 
     CXL_GPU_CMD_MODULE_LOAD_PTX = 0x30,
     CXL_GPU_CMD_MODULE_UNLOAD   = 0x31,

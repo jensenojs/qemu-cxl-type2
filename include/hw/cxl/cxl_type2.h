@@ -19,6 +19,7 @@
 #include "hw/cxl/cxl_type2_gpu_cmd.h"
 #include "hw/cxl/cxl_type2_coherency.h"
 #include "hw/cxl/cxl_p2p_dma.h"
+#include "hw/virtio/virtio.h"
 #include "qemu/thread.h"
 #include "io/channel-socket.h"
 
@@ -190,8 +191,41 @@ typedef struct CXLType2PendingHtoD {
     uint64_t call_id;
     int64_t enqueue_host_ns;
     size_t size;
+    bool direct_source;
+    const void *direct_host;
+    struct CXLType2DirectSource *source;
     struct CXLType2PendingHtoD *next;
 } CXLType2PendingHtoD;
+
+typedef struct CXLType2DirectPhysical {
+    VirtioSharedMemoryMapping *mapping;
+    uint64_t generation;
+    hwaddr mapping_offset;
+    hwaddr guest_phys_addr;
+    uint64_t length;
+    void *host_address;
+    uint64_t references;
+    bool cuda_registered;
+    struct CXLType2DirectPhysical *next;
+} CXLType2DirectPhysical;
+
+typedef struct CXLType2DirectRun {
+    CXLType2DirectPhysical *physical;
+} CXLType2DirectRun;
+
+typedef struct CXLType2DirectSource {
+    uint64_t source_id;
+    uint64_t case_epoch;
+    uint64_t lease_handle;
+    uint64_t logical_bytes;
+    uint64_t unique_dmap_bytes;
+    CXLGPUSourceRangeV1 *ranges;
+    CXLType2DirectRun *runs;
+    uint32_t range_count;
+    uint32_t run_count;
+    uint64_t pending_refcount;
+    struct CXLType2DirectSource *next;
+} CXLType2DirectSource;
 
 typedef struct CXLType2HtoDStagingBuffer {
     void *data;
@@ -206,6 +240,34 @@ typedef struct CXLType2EventHtoDMark {
     uint64_t sequence;
     struct CXLType2EventHtoDMark *next;
 } CXLType2EventHtoDMark;
+
+typedef struct CXLType2IntervalIdentity {
+    bool valid;
+    bool operation_code_valid;
+    uint32_t operation_code;
+    uint64_t sequence;
+    const char *owner;
+    const char *category;
+    const char *operation;
+} CXLType2IntervalIdentity;
+
+typedef struct CXLType2IntervalLedger {
+    int64_t span_begin_ns;
+    int64_t span_end_ns;
+    int64_t last_begin_ns;
+    int64_t union_end_ns;
+    uint64_t interval_count;
+    uint64_t total_duration_ns;
+    uint64_t union_duration_ns;
+    uint64_t largest_gap_duration_ns;
+    int64_t largest_gap_begin_ns;
+    int64_t largest_gap_end_ns;
+    CXLType2IntervalIdentity span_begin_identity;
+    CXLType2IntervalIdentity union_end_identity;
+    CXLType2IntervalIdentity largest_gap_previous;
+    CXLType2IntervalIdentity largest_gap_next;
+    const char *first_error;
+} CXLType2IntervalLedger;
 
 /* Main Type 2 device state */
 typedef struct CXLType2State {
@@ -291,6 +353,12 @@ typedef struct CXLType2State {
     uint64_t htod_driver_allocations;
     uint64_t htod_driver_frees;
     uint64_t htod_pool_evictions;
+    bool cuda_direct_source;
+    Object *direct_source_fs;
+    CXLType2DirectPhysical *direct_physicals;
+    CXLType2DirectSource *direct_sources;
+    uint64_t next_direct_source_id;
+    bool direct_source_poisoned;
 
     struct {
         bool required;
@@ -316,6 +384,9 @@ typedef struct CXLType2State {
         int64_t active_last_command_host_ns;
         uint64_t active_command_calls[256];
         uint64_t active_command_busy_ns_by_command[256];
+        uint64_t active_command_sequence;
+        CXLType2IntervalLedger command_intervals;
+        CXLType2IntervalLedger driver_intervals;
         uint64_t active_cxl_request_count;
         uint64_t active_cxl_read_count;
         uint64_t active_cxl_write_count;
@@ -324,6 +395,13 @@ typedef struct CXLType2State {
         uint64_t active_cxl_response_count;
         uint64_t active_cxl_request_failures;
         uint64_t active_cxl_server_reported_latency_ns;
+        uint64_t active_direct_register_calls;
+        uint64_t active_direct_unregister_calls;
+        uint64_t active_direct_logical_ranges;
+        uint64_t active_direct_fragments;
+        uint64_t active_direct_bytes;
+        uint64_t active_payload_batches;
+        uint64_t active_payload_source_bytes;
     } paired_case;
 
     /* Bulk transfer region for large memory operations */
