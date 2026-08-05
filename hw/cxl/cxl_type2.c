@@ -3172,8 +3172,6 @@ static int cxl_type2_direct_physical_put(CXLType2State *ct2d,
         return result;
     }
     physical->cuda_registered = false;
-    address_space_unmap(&address_space_memory, physical->host_address,
-                        physical->length, false, physical->length);
     virtio_shared_memory_unpin(physical->mapping);
     cursor = &ct2d->direct_physicals;
     while (*cursor != physical) {
@@ -3399,8 +3397,6 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
             VirtioSharedMemoryMapping *pinned_mapping;
             uint64_t pinned_generation;
             void *mapping_host;
-            void *mapped_host;
-            hwaddr mapped_length = validated[i].wire.length;
 
             if (virtio_shared_memory_pin_range(
                     shmem, validated[i].mapping_offset,
@@ -3417,42 +3413,22 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
                 virtio_shared_memory_unpin(pinned_mapping);
                 goto rollback;
             }
-            mapped_host = address_space_map(
-                &address_space_memory, validated[i].wire.guest_phys_addr,
-                &mapped_length, false, MEMTXATTRS_UNSPECIFIED);
-            if (!mapped_host) {
-                *failure_stage_out = "host-map";
-                *failure_index_out = i;
-                virtio_shared_memory_unpin(pinned_mapping);
-                goto rollback;
-            }
-            if (mapped_length != validated[i].wire.length) {
-                *failure_stage_out = "host-map-length";
-                *failure_index_out = i;
-            } else if (mapped_host != mapping_host) {
-                *failure_stage_out = "host-map-identity";
-                *failure_index_out = i;
-            } else if ((uintptr_t)mapped_host % qemu_real_host_page_size()) {
+            if ((uintptr_t)mapping_host % qemu_real_host_page_size()) {
                 *failure_stage_out = "host-map-alignment";
                 *failure_index_out = i;
             }
             if (*failure_stage_out) {
-                if (mapped_host) {
-                    address_space_unmap(&address_space_memory, mapped_host,
-                                        mapped_length, false, 0);
-                }
                 virtio_shared_memory_unpin(pinned_mapping);
                 goto rollback;
             }
             result = hetgpu_cuda_mem_host_register(
-                &ct2d->gpu_info.hetgpu_state, mapped_host, mapped_length,
+                &ct2d->gpu_info.hetgpu_state, mapping_host,
+                validated[i].wire.length,
                 CXL_CUDA_MEMHOSTREGISTER_PORTABLE |
                     CXL_CUDA_MEMHOSTREGISTER_READ_ONLY);
             if (result != CXL_GPU_SUCCESS) {
                 *failure_stage_out = "cuda-host-register";
                 *failure_index_out = i;
-                address_space_unmap(&address_space_memory, mapped_host,
-                                    mapped_length, false, 0);
                 virtio_shared_memory_unpin(pinned_mapping);
                 goto rollback;
             }
@@ -3461,8 +3437,8 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
             physical->generation = pinned_generation;
             physical->mapping_offset = validated[i].mapping_offset;
             physical->guest_phys_addr = validated[i].wire.guest_phys_addr;
-            physical->length = mapped_length;
-            physical->host_address = mapped_host;
+            physical->length = validated[i].wire.length;
+            physical->host_address = mapping_host;
             physical->references = 1;
             physical->cuda_registered = true;
             physical->next = ct2d->direct_physicals;

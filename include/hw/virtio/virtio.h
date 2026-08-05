@@ -425,6 +425,20 @@ int virtio_add_shmem_map(VirtioSharedMemory *shmem,
 VirtioSharedMemoryMapping *virtio_find_shmem_map(VirtioSharedMemory *shmem,
                                           hwaddr offset, uint64_t size);
 
+/**
+ * virtio_shared_memory_pin_range() - Pin one installed backing range
+ * @shmem: Shared-memory region containing the range
+ * @offset: Offset within @shmem
+ * @length: Number of bytes that must be covered by one mapping
+ * @mapping: Returns the referenced mapping that covers the complete range
+ * @generation: Returns the installed backing generation
+ * @host_address: Returns the host pointer for @offset
+ *
+ * The returned host range remains installed and valid until the matching
+ * virtio_shared_memory_unpin(). Revocation is deferred while it is pinned.
+ *
+ * Returns: 0 on success, or a negative errno value.
+ */
 int virtio_shared_memory_pin_range(
     VirtioSharedMemory *shmem, hwaddr offset, uint64_t length,
     VirtioSharedMemoryMapping **mapping, uint64_t *generation,
