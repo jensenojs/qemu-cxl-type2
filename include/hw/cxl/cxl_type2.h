@@ -221,6 +221,7 @@ typedef struct CXLType2State {
     MemoryRegion cache_io;             /* Cache access interceptor */
     MemoryRegion gpu_descriptor_mem;   /* RAM-backed BAR2 command descriptor */
     MemoryRegion gpu_data_mem;         /* RAM-backed BAR2 command data window */
+    MemoryRegion gpu_batch_data_mem;   /* RAM-backed BAR2 batch payload */
     MemoryRegion device_mem;           /* Type 3: Device-attached memory */
     MemoryRegion device_mem_io;        /* Device memory interceptor */
 
@@ -235,6 +236,7 @@ typedef struct CXLType2State {
         uint64_t results[4];
         uint8_t  *data;                /* Host pointer into gpu_data_mem */
         size_t   data_size;            /* Size of data buffer */
+        uint8_t  *batch_data;          /* Host pointer into gpu_batch_data_mem */
         CXLGPURAMCommandDescriptor *descriptor;
         uint64_t device_generation;
         uint64_t last_accepted_submission;

@@ -101,7 +101,31 @@ _Static_assert(offsetof(CXLGPURAMCommandDescriptor, device_generation) == 0xb8,
  * this window independent from the decoded CUBIN size. */
 #define CXL_GPU_DATA_OFFSET         0x1000    /* Data buffer offset */
 #define CXL_GPU_DATA_SIZE           0x800000  /* Data buffer size (8 MiB) */
-#define CXL_GPU_CMD_REG_SIZE        0x802000  /* registers + 8 MiB payload + descriptor page */
+#define CXL_GPU_BATCH_DATA_OFFSET   0x802000
+#define CXL_GPU_BATCH_DATA_SIZE     0x2000000 /* 32 MiB batch payload */
+#define CXL_GPU_CMD_REG_SIZE        (CXL_GPU_BATCH_DATA_OFFSET + CXL_GPU_BATCH_DATA_SIZE)
+
+typedef struct CXLGPUBatchHtoDHeader {
+    uint32_t header_size;
+    uint32_t range_count;
+    uint32_t range_size;
+    uint32_t reserved0;
+    uint64_t payload_bytes;
+    uint64_t reserved1;
+} CXLGPUBatchHtoDHeader;
+
+typedef struct CXLGPUBatchHtoDRange {
+    uint64_t source_offset;
+    uint64_t destination;
+    uint64_t size;
+} CXLGPUBatchHtoDRange;
+
+_Static_assert(sizeof(CXLGPUBatchHtoDHeader) == 32,
+               "CXL GPU batch header size mismatch");
+_Static_assert(sizeof(CXLGPUBatchHtoDRange) == 24,
+               "CXL GPU batch range size mismatch");
+_Static_assert(offsetof(CXLGPUBatchHtoDHeader, payload_bytes) == 16,
+               "CXL GPU batch payload size offset mismatch");
 
 _Static_assert(CXL_GPU_DESCRIPTOR_OFFSET % CXL_GPU_DESCRIPTOR_REGION_SIZE == 0,
                "CXL GPU descriptor region must be page aligned");
@@ -109,6 +133,9 @@ _Static_assert(CXL_GPU_DESCRIPTOR_WIRE_SIZE <= CXL_GPU_DESCRIPTOR_REGION_SIZE,
                "CXL GPU descriptor wire does not fit in its RAM region");
 _Static_assert(CXL_GPU_DESCRIPTOR_OFFSET >= CXL_GPU_DATA_OFFSET + CXL_GPU_DATA_SIZE,
                "CXL GPU descriptor region overlaps the payload window");
+_Static_assert(CXL_GPU_BATCH_DATA_OFFSET >=
+                   CXL_GPU_DESCRIPTOR_OFFSET + CXL_GPU_DESCRIPTOR_REGION_SIZE,
+               "CXL GPU batch region overlaps the descriptor");
 
 /* Module payload encoding in CXL_GPU_REG_PARAM1. */
 #define CXL_GPU_MODULE_DATA_ZSTD    (1U << 0)
@@ -129,7 +156,7 @@ _Static_assert(CXL_GPU_DESCRIPTOR_OFFSET >= CXL_GPU_DATA_OFFSET + CXL_GPU_DATA_S
 
 /* Magic number */
 #define CXL_GPU_MAGIC               0x43584C32  /* "CXL2" */
-#define CXL_GPU_VERSION             0x00010E00  /* v1.14.0: CUDA 12 graph executable update */
+#define CXL_GPU_VERSION             0x00010F00  /* v1.15.0: batch async HtoD */
 
 #define CXL_GPU_STREAM_WIRE_NULL       0xffffffffffffffffULL
 #define CXL_GPU_STREAM_WIRE_LEGACY     0xfffffffffffffffeULL
@@ -189,6 +216,7 @@ typedef enum {
     CXL_GPU_CMD_MEM_PREFETCH_ASYNC = 0x28,
     CXL_GPU_CMD_MEM_COPY_HTOD_ASYNC = 0x29,
     CXL_GPU_CMD_MEM_COPY_2D_DTOD = 0x2A,
+    CXL_GPU_CMD_BATCH_HTOD_ASYNC = 0x2B,
 
     CXL_GPU_CMD_MODULE_LOAD_PTX = 0x30,
     CXL_GPU_CMD_MODULE_UNLOAD   = 0x31,

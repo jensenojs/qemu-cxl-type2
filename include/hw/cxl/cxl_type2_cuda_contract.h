@@ -31,6 +31,8 @@ bool cxl_type2_cuda_mem_info_is_allowed(bool active_case, bool live_context,
 
 typedef int (*CXLType2CudaAttributeQuery)(void *opaque, int32_t attribute);
 typedef int (*CXLType2CudaMemInfoQuery)(void *opaque);
+typedef int (*CXLGPUBatchHtoDEnqueue)(void *opaque, uint64_t destination,
+                                      const void *source, size_t size);
 
 /*
  * The command handler must enter the real CUDA helper only through these
@@ -44,5 +46,20 @@ bool cxl_type2_cuda_dispatch_mem_info(bool active_case, bool live_context,
                                       uint64_t token, uint64_t active_epoch,
                                       CXLType2CudaMemInfoQuery query,
                                       void *opaque, int *query_result);
+bool cxl_gpu_batch_htod_validate(const uint8_t *payload,
+                                 uint64_t payload_capacity,
+                                 uint64_t expected_range_count,
+                                 uint64_t expected_payload_bytes,
+                                 uint64_t *fail_idx);
+int cxl_gpu_batch_htod_enqueue(const uint8_t *payload, uint64_t range_count,
+                               CXLGPUBatchHtoDEnqueue enqueue, void *opaque,
+                               uint64_t *fail_idx,
+                               uint64_t *successfully_enqueued);
+int cxl_gpu_batch_htod_submit(const uint8_t *payload,
+                              uint64_t payload_capacity,
+                              uint64_t range_count, uint64_t payload_bytes,
+                              CXLGPUBatchHtoDEnqueue enqueue, void *opaque,
+                              uint64_t *fail_idx,
+                              uint64_t *successfully_enqueued);
 
 #endif

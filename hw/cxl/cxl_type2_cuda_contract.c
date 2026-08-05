@@ -132,3 +132,110 @@ bool cxl_type2_cuda_dispatch_mem_info(bool active_case, bool live_context,
     *query_result = query(opaque);
     return true;
 }
+
+bool cxl_gpu_batch_htod_validate(const uint8_t *payload,
+                                 uint64_t payload_capacity,
+                                 uint64_t expected_range_count,
+                                 uint64_t expected_payload_bytes,
+                                 uint64_t *fail_idx)
+{
+    CXLGPUBatchHtoDHeader header;
+    uint64_t source_offset;
+
+    if (!fail_idx) {
+        return false;
+    }
+    *fail_idx = SIZE_MAX;
+    if (!payload || expected_range_count == 0 ||
+        expected_range_count > UINT32_MAX ||
+        expected_payload_bytes < sizeof(header) ||
+        expected_payload_bytes > payload_capacity) {
+        return false;
+    }
+    memcpy(&header, payload, sizeof(header));
+    if (header.header_size != sizeof(header) ||
+        header.range_count != expected_range_count ||
+        header.range_size != sizeof(CXLGPUBatchHtoDRange) ||
+        header.reserved0 != 0 || header.reserved1 != 0 ||
+        header.payload_bytes != expected_payload_bytes ||
+        expected_range_count >
+            (expected_payload_bytes - sizeof(header)) /
+                sizeof(CXLGPUBatchHtoDRange)) {
+        return false;
+    }
+
+    source_offset = sizeof(header) +
+                    expected_range_count * sizeof(CXLGPUBatchHtoDRange);
+    if (source_offset > UINT64_MAX - 63) {
+        return false;
+    }
+    source_offset = (source_offset + 63) & ~UINT64_C(63);
+    if (source_offset > expected_payload_bytes) {
+        return false;
+    }
+
+    for (uint64_t i = 0; i < expected_range_count; i++) {
+        CXLGPUBatchHtoDRange range;
+
+        memcpy(&range, payload + sizeof(header) + i * sizeof(range),
+               sizeof(range));
+        if (!range.size || range.source_offset != source_offset ||
+            range.size > expected_payload_bytes - source_offset ||
+            range.destination > UINT64_MAX - range.size) {
+            *fail_idx = i;
+            return false;
+        }
+        source_offset += range.size;
+    }
+    if (source_offset != expected_payload_bytes) {
+        *fail_idx = expected_range_count - 1;
+        return false;
+    }
+    return true;
+}
+
+int cxl_gpu_batch_htod_enqueue(const uint8_t *payload, uint64_t range_count,
+                               CXLGPUBatchHtoDEnqueue enqueue, void *opaque,
+                               uint64_t *fail_idx,
+                               uint64_t *successfully_enqueued)
+{
+    if (!payload || !enqueue || !fail_idx || !successfully_enqueued) {
+        return CXL_GPU_ERROR_INVALID_VALUE;
+    }
+    *fail_idx = SIZE_MAX;
+    *successfully_enqueued = 0;
+    for (uint64_t i = 0; i < range_count; i++) {
+        CXLGPUBatchHtoDRange range;
+        int result;
+
+        memcpy(&range, payload + sizeof(CXLGPUBatchHtoDHeader) +
+                           i * sizeof(range), sizeof(range));
+        result = enqueue(opaque, range.destination,
+                         payload + range.source_offset, range.size);
+        if (result != CXL_GPU_SUCCESS) {
+            *fail_idx = i;
+            return result;
+        }
+        (*successfully_enqueued)++;
+    }
+    return CXL_GPU_SUCCESS;
+}
+
+int cxl_gpu_batch_htod_submit(const uint8_t *payload,
+                              uint64_t payload_capacity,
+                              uint64_t range_count, uint64_t payload_bytes,
+                              CXLGPUBatchHtoDEnqueue enqueue, void *opaque,
+                              uint64_t *fail_idx,
+                              uint64_t *successfully_enqueued)
+{
+    if (!successfully_enqueued || !fail_idx) {
+        return CXL_GPU_ERROR_INVALID_VALUE;
+    }
+    *successfully_enqueued = 0;
+    if (!cxl_gpu_batch_htod_validate(payload, payload_capacity, range_count,
+                                     payload_bytes, fail_idx)) {
+        return CXL_GPU_ERROR_INVALID_VALUE;
+    }
+    return cxl_gpu_batch_htod_enqueue(payload, range_count, enqueue, opaque,
+                                      fail_idx, successfully_enqueued);
+}

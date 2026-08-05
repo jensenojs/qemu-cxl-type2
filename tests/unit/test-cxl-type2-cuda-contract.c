@@ -6,6 +6,59 @@ typedef struct QueryCounter {
     int32_t attribute;
 } QueryCounter;
 
+typedef struct BatchEnqueueCounter {
+    uint64_t calls;
+    uint64_t fail_at;
+    uint64_t bytes;
+} BatchEnqueueCounter;
+
+static uint8_t *valid_batch_payload(uint64_t *payload_bytes)
+{
+    const uint64_t count = 3;
+    const uint64_t source_begin = 128;
+    const uint64_t sizes[] = { 3, 5, 7 };
+    CXLGPUBatchHtoDHeader header = {
+        .header_size = sizeof(CXLGPUBatchHtoDHeader),
+        .range_count = count,
+        .range_size = sizeof(CXLGPUBatchHtoDRange),
+        .payload_bytes = source_begin + 15,
+    };
+    uint8_t *payload = g_malloc0(header.payload_bytes);
+    uint64_t source_offset = source_begin;
+
+    memcpy(payload, &header, sizeof(header));
+    for (uint64_t i = 0; i < count; i++) {
+        CXLGPUBatchHtoDRange range = {
+            .source_offset = source_offset,
+            .destination = UINT64_C(0x1000) + i * 0x100,
+            .size = sizes[i],
+        };
+
+        memcpy(payload + sizeof(header) + i * sizeof(range),
+               &range, sizeof(range));
+        memset(payload + source_offset, (int)(i + 1), sizes[i]);
+        source_offset += sizes[i];
+    }
+    *payload_bytes = header.payload_bytes;
+    return payload;
+}
+
+static int count_batch_enqueue(void *opaque, uint64_t destination,
+                               const void *source, size_t size)
+{
+    BatchEnqueueCounter *counter = opaque;
+
+    g_assert_cmphex(destination, ==,
+                    UINT64_C(0x1000) + counter->calls * 0x100);
+    g_assert_cmpuint(*(const uint8_t *)source, ==, counter->calls + 1);
+    if (counter->calls == counter->fail_at) {
+        return CXL_GPU_ERROR_OUT_OF_MEMORY;
+    }
+    counter->calls++;
+    counter->bytes += size;
+    return CXL_GPU_SUCCESS;
+}
+
 static int count_attribute_query(void *opaque, int32_t attribute)
 {
     QueryCounter *counter = opaque;
@@ -220,6 +273,98 @@ static void test_mem_info_dispatch_rejects_before_query(void)
     g_assert_cmpint(result, ==, 41);
 }
 
+static void test_batch_wire_layout_and_validation(void)
+{
+    uint64_t payload_bytes;
+    uint64_t fail_idx;
+    uint8_t *payload = valid_batch_payload(&payload_bytes);
+    CXLGPUBatchHtoDRange range;
+
+    g_assert_cmphex(CXL_GPU_VERSION, ==, UINT64_C(0x00010f00));
+    g_assert_cmpuint(CXL_GPU_DESCRIPTOR_PROTOCOL_VERSION, ==, 1);
+    g_assert_cmpuint(CXL_GPU_CASE_PROTOCOL_VERSION, ==, 1);
+    g_assert_cmphex(CXL_GPU_BATCH_DATA_OFFSET, ==, UINT64_C(0x802000));
+    g_assert_cmphex(CXL_GPU_CMD_REG_SIZE, ==, UINT64_C(0x2802000));
+    g_assert_true(cxl_gpu_batch_htod_validate(
+        payload, CXL_GPU_BATCH_DATA_SIZE, 3, payload_bytes, &fail_idx));
+    g_assert_cmpuint(fail_idx, ==, SIZE_MAX);
+
+    memcpy(&range, payload + sizeof(CXLGPUBatchHtoDHeader) + sizeof(range),
+           sizeof(range));
+    range.source_offset = 64;
+    memcpy(payload + sizeof(CXLGPUBatchHtoDHeader) + sizeof(range),
+           &range, sizeof(range));
+    g_assert_false(cxl_gpu_batch_htod_validate(
+        payload, CXL_GPU_BATCH_DATA_SIZE, 3, payload_bytes, &fail_idx));
+    g_assert_cmpuint(fail_idx, ==, 1);
+    g_free(payload);
+}
+
+static void test_batch_rejects_header_without_enqueue(void)
+{
+    uint64_t payload_bytes;
+    uint64_t fail_idx;
+    uint64_t enqueued;
+    uint8_t *payload = valid_batch_payload(&payload_bytes);
+    CXLGPUBatchHtoDHeader header;
+    BatchEnqueueCounter counter = { .fail_at = UINT64_MAX };
+
+    memcpy(&header, payload, sizeof(header));
+    header.reserved0 = 1;
+    memcpy(payload, &header, sizeof(header));
+    g_assert_cmpint(cxl_gpu_batch_htod_submit(
+                        payload, CXL_GPU_BATCH_DATA_SIZE, 3, payload_bytes,
+                        count_batch_enqueue, &counter, &fail_idx,
+                        &enqueued),
+                    ==, CXL_GPU_ERROR_INVALID_VALUE);
+    g_assert_cmpuint(fail_idx, ==, SIZE_MAX);
+    g_assert_cmpuint(enqueued, ==, 0);
+    g_assert_cmpuint(counter.calls, ==, 0);
+    g_free(payload);
+}
+
+static void test_batch_partial_enqueue_result(void)
+{
+    uint64_t payload_bytes;
+    uint64_t fail_idx;
+    uint64_t enqueued;
+    uint8_t *payload = valid_batch_payload(&payload_bytes);
+    BatchEnqueueCounter counter = { .fail_at = 2 };
+    int result;
+
+    g_assert_true(cxl_gpu_batch_htod_validate(
+        payload, CXL_GPU_BATCH_DATA_SIZE, 3, payload_bytes, &fail_idx));
+    result = cxl_gpu_batch_htod_enqueue(
+        payload, 3, count_batch_enqueue, &counter, &fail_idx, &enqueued);
+    g_assert_cmpint(result, ==, CXL_GPU_ERROR_OUT_OF_MEMORY);
+    g_assert_cmpuint(fail_idx, ==, 2);
+    g_assert_cmpuint(enqueued, ==, 2);
+    g_assert_cmpuint(counter.calls, ==, 2);
+    g_assert_cmpuint(counter.bytes, ==, 8);
+    g_free(payload);
+}
+
+static void test_batch_success_result(void)
+{
+    uint64_t payload_bytes;
+    uint64_t fail_idx;
+    uint64_t enqueued;
+    uint8_t *payload = valid_batch_payload(&payload_bytes);
+    BatchEnqueueCounter counter = { .fail_at = UINT64_MAX };
+    int result;
+
+    g_assert_true(cxl_gpu_batch_htod_validate(
+        payload, CXL_GPU_BATCH_DATA_SIZE, 3, payload_bytes, &fail_idx));
+    result = cxl_gpu_batch_htod_enqueue(
+        payload, 3, count_batch_enqueue, &counter, &fail_idx, &enqueued);
+    g_assert_cmpint(result, ==, CXL_GPU_SUCCESS);
+    g_assert_cmpuint(fail_idx, ==, SIZE_MAX);
+    g_assert_cmpuint(enqueued, ==, 3);
+    g_assert_cmpuint(counter.calls, ==, 3);
+    g_assert_cmpuint(counter.bytes, ==, 15);
+    g_free(payload);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -239,5 +384,13 @@ int main(int argc, char **argv)
                     test_descriptor_rejects_identity_errors);
     g_test_add_func("/cxl/type2/descriptor/case-epoch",
                     test_descriptor_case_epoch_gate);
+    g_test_add_func("/cxl/type2/batch/wire-validation",
+                    test_batch_wire_layout_and_validation);
+    g_test_add_func("/cxl/type2/batch/header-zero-enqueue",
+                    test_batch_rejects_header_without_enqueue);
+    g_test_add_func("/cxl/type2/batch/partial-enqueue",
+                    test_batch_partial_enqueue_result);
+    g_test_add_func("/cxl/type2/batch/success",
+                    test_batch_success_result);
     return g_test_run();
 }

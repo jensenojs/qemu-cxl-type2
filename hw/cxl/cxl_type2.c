@@ -2856,6 +2856,7 @@ static int cxl_type2_enqueue_htod_from_host(CXLType2State *ct2d,
                                         ct2d->htod_pending_bytes);
     if (ct2d->paired_case.qemu_cuda_calls_enabled) {
         qemu_log("CXL TYPE2 TRACE copy_driver call_id=0x%016" PRIx64
+                 " sequence=%" PRIu64
                  " direction=htod bytes=%zu backend_result=%d "
                  "implementation=async-enqueue stream_forwarded=1 "
                  "transport=%s staging_id=%" PRIu64 " capacity_bytes=%zu "
@@ -2871,7 +2872,8 @@ static int cxl_type2_enqueue_htod_from_host(CXLType2State *ct2d,
                  " pool_hits=%" PRIu64 " pool_misses=%" PRIu64
                  " driver_allocations=%" PRIu64
                  " driver_frees=%" PRIu64 " evictions=%" PRIu64 "\n",
-                 ct2d->gpu_cmd.call_id, size, result, transport, staging_id,
+                 ct2d->gpu_cmd.call_id, pending->sequence, size, result,
+                 transport, staging_id,
                  staging_capacity, pool_hit ? "pool" : "driver",
                  acquire_duration_ns, pool_hit ? 0 : acquire_duration_ns,
                  staging_duration_ns, enqueue_duration_ns,
@@ -2884,6 +2886,22 @@ static int cxl_type2_enqueue_htod_from_host(CXLType2State *ct2d,
                  ct2d->htod_driver_frees, ct2d->htod_pool_evictions);
     }
     return CXL_GPU_SUCCESS;
+}
+
+typedef struct CXLType2BatchHtoDEnqueueContext {
+    CXLType2State *ct2d;
+    void *stream;
+} CXLType2BatchHtoDEnqueueContext;
+
+static int cxl_type2_batch_htod_enqueue_one(void *opaque,
+                                            uint64_t destination,
+                                            const void *source, size_t size)
+{
+    CXLType2BatchHtoDEnqueueContext *context = opaque;
+
+    return cxl_type2_enqueue_htod_from_host(
+        context->ct2d, destination, source, size, context->stream,
+        "bar2-batch");
 }
 
 static int cxl_type2_htod_staging_release(CXLType2State *ct2d,
@@ -4059,6 +4077,41 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             }
             ct2d->gpu_cmd.cmd_result = cxl_type2_enqueue_htod_from_host(
                 ct2d, dev_ptr, ct2d->gpu_cmd.data, size, stream, "bar2");
+        }
+        break;
+
+    case CXL_GPU_CMD_BATCH_HTOD_ASYNC:
+        {
+            uint64_t range_count = ct2d->gpu_cmd.params[0];
+            uint64_t payload_bytes = ct2d->gpu_cmd.params[1];
+            uint64_t fail_idx = SIZE_MAX;
+            uint64_t enqueued = 0;
+            void *stream = NULL;
+            CXLType2BatchHtoDEnqueueContext context;
+
+            ct2d->gpu_cmd.results[0] = SIZE_MAX;
+            ct2d->gpu_cmd.results[1] = 0;
+            if (!hetgpu->initialized) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
+                break;
+            }
+            if (!ct2d->gpu_cmd.batch_data ||
+                !cxl_type2_stream_from_wire(ct2d, ct2d->gpu_cmd.params[2],
+                                            &stream)) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                break;
+            }
+            context = (CXLType2BatchHtoDEnqueueContext) {
+                .ct2d = ct2d,
+                .stream = stream,
+            };
+            ct2d->gpu_cmd.cmd_result = cxl_gpu_batch_htod_submit(
+                ct2d->gpu_cmd.batch_data, CXL_GPU_BATCH_DATA_SIZE,
+                range_count, payload_bytes,
+                cxl_type2_batch_htod_enqueue_one, &context,
+                &fail_idx, &enqueued);
+            ct2d->gpu_cmd.results[0] = fail_idx;
+            ct2d->gpu_cmd.results[1] = enqueued;
         }
         break;
 
@@ -6745,6 +6798,17 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
                                         CXL_GPU_DATA_OFFSET,
                                         &ct2d->gpu_data_mem, 2);
 
+    memory_region_init_ram(&ct2d->gpu_batch_data_mem, OBJECT(ct2d),
+                           "cxl-type2-gpu-batch-data",
+                           CXL_GPU_BATCH_DATA_SIZE, &local_err);
+    if (local_err) {
+        error_propagate(errp, local_err);
+        return;
+    }
+    memory_region_add_subregion_overlap(&ct2d->cache_mem,
+                                        CXL_GPU_BATCH_DATA_OFFSET,
+                                        &ct2d->gpu_batch_data_mem, 2);
+
     pci_register_bar(pci_dev, 2,
                     PCI_BASE_ADDRESS_SPACE_MEMORY |
                     PCI_BASE_ADDRESS_MEM_TYPE_64 |
@@ -6790,6 +6854,8 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
 
     ct2d->gpu_cmd.data_size = CXL_GPU_DATA_SIZE;
     ct2d->gpu_cmd.data = memory_region_get_ram_ptr(&ct2d->gpu_data_mem);
+    ct2d->gpu_cmd.batch_data =
+        memory_region_get_ram_ptr(&ct2d->gpu_batch_data_mem);
     ct2d->gpu_cmd.descriptor =
         memory_region_get_ram_ptr(&ct2d->gpu_descriptor_mem);
     memset(ct2d->gpu_cmd.descriptor, 0, CXL_GPU_DESCRIPTOR_WIRE_SIZE);
@@ -6907,6 +6973,7 @@ static void cxl_type2_exit(PCIDevice *pci_dev)
     qemu_mutex_destroy(&ct2d->coherent_pool.lock);
 
     ct2d->gpu_cmd.data = NULL;
+    ct2d->gpu_cmd.batch_data = NULL;
 
     /* Free bulk transfer region if allocated */
     if (ct2d->bulk_transfer_ptr) {
