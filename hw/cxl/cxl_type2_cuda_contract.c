@@ -253,7 +253,6 @@ bool cxl_gpu_source_register_validate(const uint8_t *payload,
     uint64_t runs_bytes;
     uint64_t logical_bytes = 0;
     uint64_t unique_bytes = 0;
-    uint64_t previous_end = 0;
 
     if (!payload || !header_out || !fail_index ||
         payload_bytes < sizeof(header) || payload_bytes > payload_capacity) {
@@ -283,16 +282,37 @@ bool cxl_gpu_source_register_validate(const uint8_t *payload,
 
     for (uint64_t i = 0; i < header.run_count; i++) {
         CXLGPUSourceRunV1 run;
+        bool duplicate = false;
 
         memcpy(&run, run_base + i * sizeof(run), sizeof(run));
-        if (!run.length || run.guest_phys_addr > UINT64_MAX - run.length ||
-            (i && run.guest_phys_addr < previous_end) ||
-            unique_bytes > UINT64_MAX - run.length) {
+        if (!run.length || run.guest_phys_addr > UINT64_MAX - run.length) {
             *fail_index = i;
             return false;
         }
-        previous_end = run.guest_phys_addr + run.length;
-        unique_bytes += run.length;
+        for (uint64_t j = 0; j < i; j++) {
+            CXLGPUSourceRunV1 previous;
+
+            memcpy(&previous, run_base + j * sizeof(previous),
+                   sizeof(previous));
+            if (run.guest_phys_addr == previous.guest_phys_addr &&
+                run.length == previous.length) {
+                duplicate = true;
+                break;
+            }
+            if (run.guest_phys_addr <
+                    previous.guest_phys_addr + previous.length &&
+                previous.guest_phys_addr < run.guest_phys_addr + run.length) {
+                *fail_index = i;
+                return false;
+            }
+        }
+        if (!duplicate) {
+            if (unique_bytes > UINT64_MAX - run.length) {
+                *fail_index = i;
+                return false;
+            }
+            unique_bytes += run.length;
+        }
     }
     if (unique_bytes != header.unique_dmap_bytes) {
         return false;

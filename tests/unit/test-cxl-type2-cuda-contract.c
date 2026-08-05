@@ -396,7 +396,23 @@ static void test_direct_source_wire_validation(void)
     g_assert_cmpuint(parsed.logical_bytes, ==, 228);
     g_assert_cmpuint(fail_index, ==, SIZE_MAX);
 
+    runs[0].guest_phys_addr = 0x20000;
+    runs[1].guest_phys_addr = 0x10000;
+    memcpy(payload + sizeof(header) + sizeof(ranges), runs, sizeof(runs));
+    g_assert_true(cxl_gpu_source_register_validate(
+        payload, sizeof(payload), sizeof(payload), &parsed, &fail_index));
+
+    runs[0].guest_phys_addr = 0x10000;
+    runs[1].guest_phys_addr = 0x10000;
+    header.unique_dmap_bytes = 4096;
+    memcpy(payload, &header, sizeof(header));
+    memcpy(payload + sizeof(header) + sizeof(ranges), runs, sizeof(runs));
+    g_assert_true(cxl_gpu_source_register_validate(
+        payload, sizeof(payload), sizeof(payload), &parsed, &fail_index));
+
     runs[1].guest_phys_addr = 0x10800;
+    header.unique_dmap_bytes = 8192;
+    memcpy(payload, &header, sizeof(header));
     memcpy(payload + sizeof(header) + sizeof(ranges), runs, sizeof(runs));
     g_assert_false(cxl_gpu_source_register_validate(
         payload, sizeof(payload), sizeof(payload), &parsed, &fail_index));

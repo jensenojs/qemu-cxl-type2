@@ -3265,7 +3265,9 @@ typedef struct CXLType2DirectValidatedRun {
 
 static int cxl_type2_direct_source_register(CXLType2State *ct2d,
                                             uint64_t payload_bytes,
-                                            uint64_t *source_id_out)
+                                            uint64_t *source_id_out,
+                                            const char **failure_stage_out,
+                                            uint64_t *failure_index_out)
 {
     CXLGPUSourceRegisterV1 header;
     CXLType2DirectValidatedRun *validated = NULL;
@@ -3277,13 +3279,34 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
     uint64_t fail_index;
     int result = CXL_GPU_ERROR_INVALID_VALUE;
 
-    if (!ct2d->cuda_direct_source || ct2d->direct_source_poisoned ||
-        !ct2d->direct_source_fs || !source_id_out ||
-        !ct2d->paired_case.active_epoch ||
-        !vhost_user_fs_pci_get_dax(ct2d->direct_source_fs, &shmem, &dax_mr) ||
-        !cxl_gpu_source_register_validate(
+    *failure_stage_out = NULL;
+    *failure_index_out = SIZE_MAX;
+    if (!ct2d->cuda_direct_source) {
+        *failure_stage_out = "policy-disabled";
+        return CXL_GPU_ERROR_INVALID_VALUE;
+    }
+    if (ct2d->direct_source_poisoned) {
+        *failure_stage_out = "source-poisoned";
+        return CXL_GPU_ERROR_INVALID_VALUE;
+    }
+    if (!ct2d->direct_source_fs) {
+        *failure_stage_out = "source-fs-missing";
+        return CXL_GPU_ERROR_INVALID_VALUE;
+    }
+    if (!source_id_out || !ct2d->paired_case.active_epoch) {
+        *failure_stage_out = "case-inactive";
+        return CXL_GPU_ERROR_INVALID_VALUE;
+    }
+    if (!vhost_user_fs_pci_get_dax(ct2d->direct_source_fs, &shmem,
+                                   &dax_mr)) {
+        *failure_stage_out = "dax-unavailable";
+        return CXL_GPU_ERROR_INVALID_VALUE;
+    }
+    if (!cxl_gpu_source_register_validate(
             ct2d->gpu_cmd.batch_data, CXL_GPU_BATCH_DATA_SIZE, payload_bytes,
             &header, &fail_index)) {
+        *failure_stage_out = "wire-contract";
+        *failure_index_out = fail_index;
         return CXL_GPU_ERROR_INVALID_VALUE;
     }
     range_base = ct2d->gpu_cmd.batch_data + sizeof(header);
@@ -3305,23 +3328,40 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
             &address_space_memory, validated[i].wire.guest_phys_addr,
             &translated, &translated_len, false, MEMTXATTRS_UNSPECIFIED);
         if (mr != dax_mr || translated_len < validated[i].wire.length) {
+            *failure_stage_out = "address-translate";
+            *failure_index_out = i;
             goto out;
         }
         mapping = virtio_find_shmem_map(
             shmem, translated, validated[i].wire.length);
-        if (!mapping || mapping->revoke_pending ||
-            (cxl_type2_direct_physical_overlaps(
-                 ct2d, mapping, translated, validated[i].wire.length) &&
-             !cxl_type2_direct_physical_find(
-                 ct2d, mapping, mapping->generation, translated,
-                 validated[i].wire.length))) {
+        if (!mapping) {
+            *failure_stage_out = "mapping-lookup";
+            *failure_index_out = i;
+            goto out;
+        }
+        if (mapping->revoke_pending) {
+            *failure_stage_out = "mapping-revoking";
+            *failure_index_out = i;
+            goto out;
+        }
+        if (cxl_type2_direct_physical_overlaps(
+                ct2d, mapping, translated, validated[i].wire.length) &&
+            !cxl_type2_direct_physical_find(
+                ct2d, mapping, mapping->generation, translated,
+                validated[i].wire.length)) {
+            *failure_stage_out = "live-registration-overlap";
+            *failure_index_out = i;
             goto out;
         }
         for (uint32_t j = 0; j < i; j++) {
             if (validated[j].mapping == mapping &&
                 ranges_overlap(validated[j].mapping_offset,
                                validated[j].wire.length, translated,
-                               validated[i].wire.length)) {
+                               validated[i].wire.length) &&
+                (validated[j].mapping_offset != translated ||
+                 validated[j].wire.length != validated[i].wire.length)) {
+                *failure_stage_out = "request-run-overlap";
+                *failure_index_out = i;
                 goto out;
             }
         }
@@ -3350,6 +3390,8 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
         if (physical) {
             if (physical->references == UINT64_MAX) {
                 result = CXL_GPU_ERROR_OUT_OF_MEMORY;
+                *failure_stage_out = "reference-overflow";
+                *failure_index_out = i;
                 goto rollback;
             }
             physical->references++;
@@ -3363,17 +3405,38 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
             if (virtio_shared_memory_pin_range(
                     shmem, validated[i].mapping_offset,
                     validated[i].wire.length, &pinned_mapping,
-                    &pinned_generation, &mapping_host) != 0 ||
-                pinned_mapping != validated[i].mapping ||
+                    &pinned_generation, &mapping_host) != 0) {
+                *failure_stage_out = "mapping-pin";
+                *failure_index_out = i;
+                goto rollback;
+            }
+            if (pinned_mapping != validated[i].mapping ||
                 pinned_generation != validated[i].generation) {
+                *failure_stage_out = "mapping-generation";
+                *failure_index_out = i;
+                virtio_shared_memory_unpin(pinned_mapping);
                 goto rollback;
             }
             mapped_host = address_space_map(
                 &address_space_memory, validated[i].wire.guest_phys_addr,
                 &mapped_length, false, MEMTXATTRS_UNSPECIFIED);
-            if (!mapped_host || mapped_length != validated[i].wire.length ||
-                mapped_host != mapping_host ||
-                (uintptr_t)mapped_host % qemu_real_host_page_size()) {
+            if (!mapped_host) {
+                *failure_stage_out = "host-map";
+                *failure_index_out = i;
+                virtio_shared_memory_unpin(pinned_mapping);
+                goto rollback;
+            }
+            if (mapped_length != validated[i].wire.length) {
+                *failure_stage_out = "host-map-length";
+                *failure_index_out = i;
+            } else if (mapped_host != mapping_host) {
+                *failure_stage_out = "host-map-identity";
+                *failure_index_out = i;
+            } else if ((uintptr_t)mapped_host % qemu_real_host_page_size()) {
+                *failure_stage_out = "host-map-alignment";
+                *failure_index_out = i;
+            }
+            if (*failure_stage_out) {
                 if (mapped_host) {
                     address_space_unmap(&address_space_memory, mapped_host,
                                         mapped_length, false, 0);
@@ -3386,6 +3449,8 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
                 CXL_CUDA_MEMHOSTREGISTER_PORTABLE |
                     CXL_CUDA_MEMHOSTREGISTER_READ_ONLY);
             if (result != CXL_GPU_SUCCESS) {
+                *failure_stage_out = "cuda-host-register";
+                *failure_index_out = i;
                 address_space_unmap(&address_space_memory, mapped_host,
                                     mapped_length, false, 0);
                 virtio_shared_memory_unpin(pinned_mapping);
@@ -3407,6 +3472,7 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
     }
     if (ct2d->next_direct_source_id == UINT64_MAX) {
         result = CXL_GPU_ERROR_OUT_OF_MEMORY;
+        *failure_stage_out = "source-id-overflow";
         goto rollback;
     }
     source->source_id = ++ct2d->next_direct_source_id;
@@ -3424,6 +3490,8 @@ rollback:
             source->runs[i].physical = NULL;
             if (cleanup != CXL_GPU_SUCCESS) {
                 result = cleanup;
+                *failure_stage_out = "rollback-cleanup";
+                *failure_index_out = i;
             }
         }
     }
@@ -6661,12 +6729,31 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
     case CXL_GPU_CMD_SOURCE_REGISTER:
         {
             uint64_t source_id = 0;
+            uint64_t failure_index = SIZE_MAX;
+            const char *failure_stage = NULL;
 
             ct2d->gpu_cmd.cmd_result = cxl_type2_direct_source_register(
-                ct2d, ct2d->gpu_cmd.params[0], &source_id);
+                ct2d, ct2d->gpu_cmd.params[0], &source_id, &failure_stage,
+                &failure_index);
             if (ct2d->gpu_cmd.cmd_result == CXL_GPU_SUCCESS) {
                 ct2d->gpu_cmd.results[0] = source_id;
                 ct2d->paired_case.active_direct_register_calls++;
+            } else {
+                qemu_log(
+                    "KIMI_DIRECT_SOURCE_REGISTER_FAILURE"
+                    " schema=direct-source-register-failure-v1"
+                    " run_binding=%" PRIu64 " case=%s case_epoch=%" PRIu64
+                    " call_id=%" PRIu64 " stage=%s index_valid=%u"
+                    " index=%" PRIu64 " result=%d payload_bytes=%" PRIu64
+                    "\n",
+                    ct2d->paired_case.run_binding,
+                    cxl_type2_paired_case_name(
+                        ct2d->paired_case.active_case),
+                    ct2d->paired_case.active_epoch, ct2d->gpu_cmd.call_id,
+                    failure_stage ? failure_stage : "unknown",
+                    failure_index != SIZE_MAX,
+                    failure_index == SIZE_MAX ? 0 : failure_index,
+                    ct2d->gpu_cmd.cmd_result, ct2d->gpu_cmd.params[0]);
             }
         }
         break;
