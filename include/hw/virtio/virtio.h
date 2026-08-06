@@ -112,7 +112,7 @@ typedef void (*VirtioSharedMemoryPrepareRevokeFn)(
  * @shmid: VIRTIO Shared Memory Region ID
  * @offset: Offset within the VIRTIO Shared Memory Region
  * @len: Size of the mapping
- * @fd: Duplicated file descriptor backing this mapping
+ * @fd: Duplicated file descriptor used while installing this mapping
  * @fd_offset: Offset in @fd backing the shared-memory window range
  * @allow_write: Whether the file mapping is writable
  * @generation: Identity of the installed backing generation

@@ -1821,7 +1821,6 @@ vhost_user_backend_handle_shmem_map(struct vhost_dev *dev,
 {
     VirtioSharedMemory *shmem;
     VhostUserMMap *vu_mmap = &payload->mmap;
-    VirtioSharedMemoryMapping *existing;
     Error *local_err = NULL;
     int ret = 0;
 
@@ -1852,15 +1851,6 @@ vhost_user_backend_handle_shmem_map(struct vhost_dev *dev,
                      vu_mmap->shm_offset, vu_mmap->len);
         ret = -EFAULT;
         goto send_reply;
-    }
-
-    QTAILQ_FOREACH(existing, &shmem->mmaps, link) {
-        if (ranges_overlap(existing->offset, existing->len,
-                           vu_mmap->shm_offset, vu_mmap->len)) {
-            error_report("VIRTIO Shared Memory mapping overlap");
-            ret = -EFAULT;
-            goto send_reply;
-        }
     }
 
     /* Create VirtioSharedMemoryMapping object */

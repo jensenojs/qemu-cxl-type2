@@ -3208,6 +3208,8 @@ int virtio_add_shmem_map(VirtioSharedMemory *shmem,
                      strerror(errno));
         return -1;
     }
+    close(mapping->fd);
+    mapping->fd = -1;
 
     mapping->generation = generation;
     mapping->owner = shmem;
