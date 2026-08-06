@@ -201,7 +201,6 @@ typedef struct CXLType2DirectPhysical {
     VirtioSharedMemoryMapping *mapping;
     uint64_t generation;
     hwaddr mapping_offset;
-    hwaddr guest_phys_addr;
     uint64_t length;
     void *host_address;
     uint64_t references;
@@ -211,6 +210,8 @@ typedef struct CXLType2DirectPhysical {
 
 typedef struct CXLType2DirectRun {
     CXLType2DirectPhysical *physical;
+    uint64_t physical_offset;
+    uint64_t length;
 } CXLType2DirectRun;
 
 typedef struct CXLType2DirectSource {
@@ -357,8 +358,6 @@ typedef struct CXLType2State {
     bool cuda_direct_source;
     Object *direct_source_fs;
     CXLType2DirectPhysical *direct_physicals;
-    GHashTable *direct_physical_by_mapping;
-    GHashTable *direct_physical_by_gpa;
     GTree *direct_physical_ranges;
     CXLType2DirectSource *direct_sources;
     uint64_t next_direct_source_id;
@@ -414,6 +413,10 @@ typedef struct CXLType2State {
         uint64_t active_direct_unregister_release_ns;
         uint64_t active_direct_physical_register_calls;
         uint64_t active_direct_physical_register_ns;
+        uint64_t active_direct_registration_views;
+        uint64_t active_direct_registration_bytes;
+        uint64_t active_direct_coalesced_views;
+        uint64_t active_direct_max_registration_views;
         uint64_t active_direct_physical_unregister_calls;
         uint64_t active_direct_physical_unregister_ns;
         uint64_t active_direct_cache_hits;
