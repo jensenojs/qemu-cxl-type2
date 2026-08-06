@@ -66,6 +66,8 @@ extern int LZ4_decompress_safe(const char *src, char *dst,
 #define CXL_OP_BI_INVALIDATE 16
 #define CXL_OP_BI_WRITEBACK 17
 #define CXL_OP_BI_QUERY     18
+#define CXL_OP_RANGE_READ   19
+#define CXL_OP_RANGE_WRITE  20
 
 /* A CXL.mem response is one fixed-size message. A missing response must
  * release the QEMU device path instead of consuming the outer CNB timeout. */
@@ -108,36 +110,36 @@ static bool cxl_type2_bulk_memsim_access(CXLType2State *ct2d, uint8_t op_type,
                                           uint64_t addr, size_t size,
                                           uint8_t *data)
 {
-    /* The wire protocol carries one cacheline, so a bulk CUDA copy is split
-     * into bounded CXL.mem requests while the GPU transfer remains batched. */
+    uint8_t range_op;
+
     if (ct2d->memsim.use_shm) {
-        /* SHM transport has no TCP request/response to acknowledge here. */
-        return true;
-    }
-    if (!ct2d->memsim.connected) {
+        /* Range authorization is currently owned by the TCP server. */
         return false;
     }
-    while (size > 0) {
-        size_t chunk = MIN(size, sizeof(((CXLMemSimRequest *)0)->data));
-        CXLMemSimResponse response;
-        const uint8_t *request_data = op_type == CXL_OP_WRITE ? data : NULL;
-
-        if (op_type == CXL_OP_READ && !data) {
-            return false;
-        }
-        if (!cxl_type2_memsim_request(ct2d, op_type, addr, chunk,
-                                      request_data, &response)) {
-            return false;
-        }
-        if (op_type == CXL_OP_READ) {
-            memcpy(data, response.data, chunk);
-        }
-        addr += chunk;
-        size -= chunk;
-        if (data)
-            data += chunk;
+    if (!ct2d->memsim.connected || !size || !data) {
+        return false;
     }
-    return true;
+    range_op = op_type == CXL_OP_WRITE ? CXL_OP_RANGE_WRITE :
+                                        CXL_OP_RANGE_READ;
+    return cxl_type2_memsim_request(ct2d, range_op, addr, size, NULL, NULL);
+}
+
+static uint8_t *cxl_type2_bar4_host_ptr(CXLType2State *ct2d, uint64_t offset,
+                                         size_t size)
+{
+    if (offset >= ct2d->coherent_pool.base_offset &&
+        offset - ct2d->coherent_pool.base_offset <= ct2d->coherent_pool.size &&
+        size <= ct2d->coherent_pool.size -
+                    (offset - ct2d->coherent_pool.base_offset)) {
+        uint8_t *pool = memory_region_get_ram_ptr(&ct2d->coherent_pool_mem);
+        return pool ? pool + offset - ct2d->coherent_pool.base_offset : NULL;
+    }
+
+    uint8_t *mem = memory_region_get_ram_ptr(&ct2d->device_mem);
+    return mem && offset <= ct2d->device_mem_size &&
+                   size <= ct2d->device_mem_size - offset
+               ? mem + offset
+               : NULL;
 }
 
 /* ========================================================================
@@ -1472,15 +1474,23 @@ static void cxl_type2_record_memsim_request(CXLType2State *ct2d,
     }
 
     ct2d->paired_case.active_cxl_request_count++;
-    if (op_type == CXL_OP_READ) {
+    if (op_type == CXL_OP_READ || op_type == CXL_OP_RANGE_READ) {
         ct2d->paired_case.active_cxl_read_count++;
     } else if (op_type == CXL_OP_WRITE) {
+        ct2d->paired_case.active_cxl_write_count++;
+    } else if (op_type == CXL_OP_RANGE_WRITE) {
         ct2d->paired_case.active_cxl_write_count++;
     }
     ct2d->paired_case.active_cxl_logical_bytes += logical_bytes;
     ct2d->paired_case.active_cxl_qemu_wall_ns += qemu_wall_ns;
+    ct2d->paired_case.active_cxl_wire_bytes += sizeof(CXLMemSimRequest);
+    if (op_type == CXL_OP_RANGE_READ || op_type == CXL_OP_RANGE_WRITE) {
+        ct2d->paired_case.active_cxl_range_requests++;
+        ct2d->paired_case.active_cxl_range_bytes += logical_bytes;
+    }
     if (response_received && response) {
         ct2d->paired_case.active_cxl_response_count++;
+        ct2d->paired_case.active_cxl_wire_bytes += sizeof(CXLMemSimResponse);
         ct2d->paired_case.active_cxl_server_reported_latency_ns +=
             response->latency_ns;
         if (response->status != 0) {
@@ -2718,6 +2728,9 @@ static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
     ct2d->paired_case.active_cxl_response_count = 0;
     ct2d->paired_case.active_cxl_request_failures = 0;
     ct2d->paired_case.active_cxl_server_reported_latency_ns = 0;
+    ct2d->paired_case.active_cxl_range_requests = 0;
+    ct2d->paired_case.active_cxl_range_bytes = 0;
+    ct2d->paired_case.active_cxl_wire_bytes = 0;
     ct2d->paired_case.active_direct_register_calls = 0;
     ct2d->paired_case.active_direct_unregister_calls = 0;
     ct2d->paired_case.active_direct_register_validate_ns = 0;
@@ -2858,7 +2871,9 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
              " write_count=%" PRIu64 " logical_bytes=%" PRIu64
              " qemu_wall_ns=%" PRIu64 " response_count=%" PRIu64
              " request_failures=%" PRIu64
-             " server_reported_latency_ns=%" PRIu64 "\n",
+             " server_reported_latency_ns=%" PRIu64
+             " range_requests=%" PRIu64 " range_bytes=%" PRIu64
+             " wire_bytes=%" PRIu64 "\n",
              run_binding, cxl_type2_paired_case_name(case_kind), epoch,
              ct2d->paired_case.active_cxl_request_count,
              ct2d->paired_case.active_cxl_read_count,
@@ -2867,7 +2882,10 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
              ct2d->paired_case.active_cxl_qemu_wall_ns,
              ct2d->paired_case.active_cxl_response_count,
              ct2d->paired_case.active_cxl_request_failures,
-             ct2d->paired_case.active_cxl_server_reported_latency_ns);
+             ct2d->paired_case.active_cxl_server_reported_latency_ns,
+             ct2d->paired_case.active_cxl_range_requests,
+             ct2d->paired_case.active_cxl_range_bytes,
+             ct2d->paired_case.active_cxl_wire_bytes);
 
     for (uint32_t command = 0; command < G_N_ELEMENTS(
              ct2d->paired_case.active_command_calls); command++) {
@@ -6959,18 +6977,19 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
 
             if (hetgpu->initialized) {
                 /* Get data from device memory region (BAR4/HDM) */
-                uint8_t *mem = memory_region_get_ram_ptr(&ct2d->device_mem);
-                if (mem && bar4_offset + xfer_size <= ct2d->device_mem_size &&
+                uint8_t *mem = cxl_type2_bar4_host_ptr(
+                    ct2d, bar4_offset, xfer_size);
+                if (mem &&
                     cxl_type2_fabric_access_allowed(ct2d, bar4_offset,
                                                     xfer_size, false, false)) {
                     if (!cxl_type2_bulk_memsim_access(ct2d, CXL_OP_READ,
                                                       bar4_offset, xfer_size,
-                                                      mem + bar4_offset)) {
+                                                      mem)) {
                         ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
                         break;
                     }
                     err = hetgpu_memcpy_htod(hetgpu, dst_dev_ptr,
-                                             mem + bar4_offset, xfer_size);
+                                             mem, xfer_size);
                     if (err != HETGPU_SUCCESS) {
                         ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
                     }
@@ -7015,8 +7034,13 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             latency_before =
                 ct2d->paired_case.active_cxl_server_reported_latency_ns;
             aggregate_begin_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+            mem = cxl_type2_bar4_host_ptr(ct2d, bar4_offset, xfer_size);
+            if (!mem) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                break;
+            }
             access_ok = cxl_type2_bulk_memsim_access(
-                ct2d, CXL_OP_READ, bar4_offset, xfer_size, mem + bar4_offset);
+                ct2d, CXL_OP_READ, bar4_offset, xfer_size, mem);
             aggregate_end_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
             qemu_log("CXL WEIGHT_SOURCE event=access-aggregate"
                      " run_binding=%" PRIu64 " case=%s case_epoch=%" PRIu64
@@ -7046,7 +7070,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 break;
             }
             ct2d->gpu_cmd.cmd_result = cxl_type2_enqueue_htod_from_host(
-                ct2d, dst_dev_ptr, mem + bar4_offset, xfer_size, stream,
+                ct2d, dst_dev_ptr, mem, xfer_size, stream,
                 "cxlmem-bar4");
         }
         break;
@@ -7134,16 +7158,17 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
 
             if (hetgpu->initialized) {
                 /* Write data to device memory region (BAR4/HDM) */
-                uint8_t *mem = memory_region_get_ram_ptr(&ct2d->device_mem);
-                if (mem && bar4_offset + xfer_size <= ct2d->device_mem_size &&
+                uint8_t *mem = cxl_type2_bar4_host_ptr(
+                    ct2d, bar4_offset, xfer_size);
+                if (mem &&
                     cxl_type2_fabric_access_allowed(ct2d, bar4_offset,
                                                     xfer_size, true, false)) {
-                    err = hetgpu_memcpy_dtoh(hetgpu, mem + bar4_offset,
+                    err = hetgpu_memcpy_dtoh(hetgpu, mem,
                                              src_dev_ptr, xfer_size);
                     if (err == HETGPU_SUCCESS) {
                         if (!cxl_type2_bulk_memsim_access(
                                 ct2d, CXL_OP_WRITE, bar4_offset, xfer_size,
-                                mem + bar4_offset)) {
+                                mem)) {
                             ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
                         }
                     }
@@ -8235,6 +8260,17 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
         initial->next = NULL;
         ct2d->coherent_pool.free_list = initial;
         qemu_mutex_init(&ct2d->coherent_pool.lock);
+
+        memory_region_init_ram(&ct2d->coherent_pool_mem, OBJECT(ct2d),
+                               "cxl-type2-coherent-pool", coh_pool_size,
+                               &local_err);
+        if (local_err) {
+            error_propagate(errp, local_err);
+            return;
+        }
+        memory_region_add_subregion_overlap(
+            &ct2d->device_mem, ct2d->coherent_pool.base_offset,
+            &ct2d->coherent_pool_mem, 2);
 
         qemu_log("CXL Type2: Coherent pool initialized: base=0x%lx size=%lu MB\n",
                  (unsigned long)ct2d->coherent_pool.base_offset,

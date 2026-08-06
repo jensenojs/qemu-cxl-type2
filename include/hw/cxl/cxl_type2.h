@@ -286,6 +286,7 @@ typedef struct CXLType2State {
     MemoryRegion gpu_batch_data_mem;   /* RAM-backed BAR2 batch payload */
     MemoryRegion device_mem;           /* Type 3: Device-attached memory */
     MemoryRegion device_mem_io;        /* Device memory interceptor */
+    MemoryRegion coherent_pool_mem;    /* Direct RAM staging inside BAR4 */
 
     /* GPU command state */
     struct {
@@ -401,6 +402,9 @@ typedef struct CXLType2State {
         uint64_t active_cxl_response_count;
         uint64_t active_cxl_request_failures;
         uint64_t active_cxl_server_reported_latency_ns;
+        uint64_t active_cxl_range_requests;
+        uint64_t active_cxl_range_bytes;
+        uint64_t active_cxl_wire_bytes;
         uint64_t active_direct_register_calls;
         uint64_t active_direct_unregister_calls;
         uint64_t active_direct_register_validate_ns;
