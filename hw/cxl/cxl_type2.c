@@ -2700,7 +2700,12 @@ static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
            sizeof(ct2d->paired_case.active_command_calls));
     memset(ct2d->paired_case.active_command_busy_ns_by_command, 0,
            sizeof(ct2d->paired_case.active_command_busy_ns_by_command));
+    memset(ct2d->paired_case.active_driver_calls_by_command, 0,
+           sizeof(ct2d->paired_case.active_driver_calls_by_command));
+    memset(ct2d->paired_case.active_driver_busy_ns_by_command, 0,
+           sizeof(ct2d->paired_case.active_driver_busy_ns_by_command));
     ct2d->paired_case.active_command_sequence = 0;
+    ct2d->paired_case.active_command_code = 0;
     cxl_type2_interval_reset(&ct2d->paired_case.command_intervals,
                              span_begin_ns, begin_identity);
     cxl_type2_interval_reset(&ct2d->paired_case.driver_intervals,
@@ -2715,6 +2720,11 @@ static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
     ct2d->paired_case.active_cxl_server_reported_latency_ns = 0;
     ct2d->paired_case.active_direct_register_calls = 0;
     ct2d->paired_case.active_direct_unregister_calls = 0;
+    ct2d->paired_case.active_direct_register_validate_ns = 0;
+    ct2d->paired_case.active_direct_register_resolve_ns = 0;
+    ct2d->paired_case.active_direct_register_acquire_ns = 0;
+    ct2d->paired_case.active_direct_register_commit_ns = 0;
+    ct2d->paired_case.active_direct_unregister_release_ns = 0;
     ct2d->paired_case.active_direct_logical_ranges = 0;
     ct2d->paired_case.active_direct_fragments = 0;
     ct2d->paired_case.active_direct_bytes = 0;
@@ -2727,6 +2737,7 @@ static void cxl_type2_record_driver_interval(
     int64_t begin_host_ns, int64_t end_host_ns, int result)
 {
     CXLType2State *ct2d = opaque;
+    uint64_t duration_ns;
 
     (void)result;
     if (ct2d->paired_case.active_case == CXL_GPU_CASE_NONE) {
@@ -2742,11 +2753,24 @@ static void cxl_type2_record_driver_interval(
                                 "driver-call-id-mismatch");
         return;
     }
+    if (ct2d->paired_case.active_command_code >= G_N_ELEMENTS(
+            ct2d->paired_case.active_driver_calls_by_command)) {
+        cxl_type2_interval_fail(&ct2d->paired_case.driver_intervals,
+                                "driver-command-out-of-range");
+        return;
+    }
     cxl_type2_interval_record(
         &ct2d->paired_case.driver_intervals, begin_host_ns, end_host_ns,
         cxl_type2_interval_identity(
             ct2d->paired_case.active_command_sequence, "qemu", "driver",
             symbol, occurrence, true));
+    duration_ns = end_host_ns >= begin_host_ns
+                      ? (uint64_t)(end_host_ns - begin_host_ns)
+                      : 0;
+    ct2d->paired_case.active_driver_calls_by_command[
+        ct2d->paired_case.active_command_code]++;
+    ct2d->paired_case.active_driver_busy_ns_by_command[
+        ct2d->paired_case.active_command_code] += duration_ns;
 }
 
 static void cxl_type2_record_case_command(CXLType2State *ct2d,
@@ -2788,6 +2812,10 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
 {
     uint64_t *calls = ct2d->paired_case.active_command_calls;
     uint64_t *busy = ct2d->paired_case.active_command_busy_ns_by_command;
+    uint64_t *driver_calls =
+        ct2d->paired_case.active_driver_calls_by_command;
+    uint64_t *driver_busy =
+        ct2d->paired_case.active_driver_busy_ns_by_command;
     uint64_t host_window_ns =
         ct2d->paired_case.active_last_command_host_ns >=
         ct2d->paired_case.active_first_command_host_ns
@@ -2831,6 +2859,21 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
              ct2d->paired_case.active_cxl_request_failures,
              ct2d->paired_case.active_cxl_server_reported_latency_ns);
 
+    for (uint32_t command = 0; command < G_N_ELEMENTS(
+             ct2d->paired_case.active_command_calls); command++) {
+        if (calls[command] == 0) {
+            continue;
+        }
+        qemu_log(
+            "KIMI_COMMAND_SUMMARY schema=qemu-command-summary-v1"
+            " run_binding=%" PRIu64 " case=%s case_epoch=%" PRIu64
+            " command=0x%x calls=%" PRIu64 " busy_ns=%" PRIu64
+            " driver_calls=%" PRIu64 " driver_busy_ns=%" PRIu64 "\n",
+            run_binding, cxl_type2_paired_case_name(case_kind), epoch,
+            command, calls[command], busy[command], driver_calls[command],
+            driver_busy[command]);
+    }
+
     {
         uint64_t live_sources = 0;
         uint64_t live_physicals = 0;
@@ -2847,10 +2890,22 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             live_physicals++;
         }
         qemu_log(
-            "KIMI_DIRECT_SOURCE_SUMMARY schema=direct-source-summary-v1"
+            "KIMI_DIRECT_SOURCE_SUMMARY schema=direct-source-summary-v2"
             " run_binding=%" PRIu64 " case=%s case_epoch=%" PRIu64
             " policy_enabled=%u register_calls=%" PRIu64
-            " unregister_calls=%" PRIu64 " logical_ranges=%" PRIu64
+            " register_busy_ns=%" PRIu64
+            " unregister_calls=%" PRIu64
+            " unregister_busy_ns=%" PRIu64
+            " driver_register_calls=%" PRIu64
+            " driver_register_ns=%" PRIu64
+            " driver_unregister_calls=%" PRIu64
+            " driver_unregister_ns=%" PRIu64
+            " register_validate_ns=%" PRIu64
+            " register_resolve_ns=%" PRIu64
+            " register_acquire_ns=%" PRIu64
+            " register_commit_ns=%" PRIu64
+            " unregister_release_ns=%" PRIu64
+            " logical_ranges=%" PRIu64
             " driver_fragments=%" PRIu64 " direct_bytes=%" PRIu64
             " payload_batches=%" PRIu64 " payload_source_bytes=%" PRIu64
             " live_sources=%" PRIu64 " live_physicals=%" PRIu64
@@ -2858,7 +2913,18 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             run_binding, cxl_type2_paired_case_name(case_kind), epoch,
             ct2d->cuda_direct_source,
             ct2d->paired_case.active_direct_register_calls,
+            busy[CXL_GPU_CMD_SOURCE_REGISTER],
             ct2d->paired_case.active_direct_unregister_calls,
+            busy[CXL_GPU_CMD_SOURCE_UNREGISTER],
+            driver_calls[CXL_GPU_CMD_SOURCE_REGISTER],
+            driver_busy[CXL_GPU_CMD_SOURCE_REGISTER],
+            driver_calls[CXL_GPU_CMD_SOURCE_UNREGISTER],
+            driver_busy[CXL_GPU_CMD_SOURCE_UNREGISTER],
+            ct2d->paired_case.active_direct_register_validate_ns,
+            ct2d->paired_case.active_direct_register_resolve_ns,
+            ct2d->paired_case.active_direct_register_acquire_ns,
+            ct2d->paired_case.active_direct_register_commit_ns,
+            ct2d->paired_case.active_direct_unregister_release_ns,
             ct2d->paired_case.active_direct_logical_ranges,
             ct2d->paired_case.active_direct_fragments,
             ct2d->paired_case.active_direct_bytes,
@@ -3201,6 +3267,7 @@ static int cxl_type2_direct_source_unregister(CXLType2State *ct2d,
     CXLType2DirectSource **cursor = &ct2d->direct_sources;
     CXLType2DirectSource *source;
     int first_error = CXL_GPU_SUCCESS;
+    int64_t release_begin_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
 
     while (*cursor && (*cursor)->source_id != source_id) {
         cursor = &(*cursor)->next;
@@ -3235,6 +3302,8 @@ static int cxl_type2_direct_source_unregister(CXLType2State *ct2d,
     g_free(source->ranges);
     g_free(source->runs);
     g_free(source);
+    ct2d->paired_case.active_direct_unregister_release_ns +=
+        qemu_clock_get_ns(QEMU_CLOCK_HOST) - release_begin_ns;
     return CXL_GPU_SUCCESS;
 }
 
@@ -3276,6 +3345,7 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
     const uint8_t *run_base;
     uint64_t fail_index;
     int result = CXL_GPU_ERROR_INVALID_VALUE;
+    int64_t phase_begin_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
 
     *failure_stage_out = NULL;
     *failure_index_out = SIZE_MAX;
@@ -3311,6 +3381,9 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
     run_base = range_base +
                (uint64_t)header.range_count * sizeof(CXLGPUSourceRangeV1);
     validated = g_new0(CXLType2DirectValidatedRun, header.run_count);
+    ct2d->paired_case.active_direct_register_validate_ns +=
+        qemu_clock_get_ns(QEMU_CLOCK_HOST) - phase_begin_ns;
+    phase_begin_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
 
     /* This pass has no mapping, CUDA, or table side effects. */
     for (uint32_t i = 0; i < header.run_count; i++) {
@@ -3367,6 +3440,9 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
         validated[i].generation = mapping->generation;
         validated[i].mapping_offset = translated;
     }
+    ct2d->paired_case.active_direct_register_resolve_ns +=
+        qemu_clock_get_ns(QEMU_CLOCK_HOST) - phase_begin_ns;
+    phase_begin_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
 
     source = g_new0(CXLType2DirectSource, 1);
     source->case_epoch = ct2d->paired_case.active_epoch;
@@ -3446,6 +3522,9 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
         }
         source->runs[i].physical = physical;
     }
+    ct2d->paired_case.active_direct_register_acquire_ns +=
+        qemu_clock_get_ns(QEMU_CLOCK_HOST) - phase_begin_ns;
+    phase_begin_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
     if (ct2d->next_direct_source_id == UINT64_MAX) {
         result = CXL_GPU_ERROR_OUT_OF_MEMORY;
         *failure_stage_out = "source-id-overflow";
@@ -3456,6 +3535,8 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
     ct2d->direct_sources = source;
     *source_id_out = source->source_id;
     g_free(validated);
+    ct2d->paired_case.active_direct_register_commit_ns +=
+        qemu_clock_get_ns(QEMU_CLOCK_HOST) - phase_begin_ns;
     return CXL_GPU_SUCCESS;
 
 rollback:
@@ -4622,6 +4703,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
     hetgpu_cuda_trace_set_call_id(ct2d->gpu_cmd.call_id);
     if (ct2d->paired_case.active_case != CXL_GPU_CASE_NONE) {
         ct2d->paired_case.active_command_sequence = trace_sequence;
+        ct2d->paired_case.active_command_code = cmd;
     }
 
     if (ct2d->paired_case.required && ct2d->paired_case.failed) {
@@ -7292,6 +7374,7 @@ complete:
                                       trace_end_ns, ct2d->gpu_cmd.cmd_result);
     }
     ct2d->paired_case.active_command_sequence = 0;
+    ct2d->paired_case.active_command_code = 0;
     if (ct2d->paired_case.qemu_cuda_calls_enabled) qemu_log("CXL TYPE2 TRACE cmd_end seq=%" PRIu64
              " call_id=0x%016" PRIx64
              " cmd=0x%x host_ns=%" PRId64 " result=%u duration_ns=%" PRId64

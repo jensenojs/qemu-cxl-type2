@@ -384,7 +384,10 @@ typedef struct CXLType2State {
         int64_t active_last_command_host_ns;
         uint64_t active_command_calls[256];
         uint64_t active_command_busy_ns_by_command[256];
+        uint64_t active_driver_calls_by_command[256];
+        uint64_t active_driver_busy_ns_by_command[256];
         uint64_t active_command_sequence;
+        uint32_t active_command_code;
         CXLType2IntervalLedger command_intervals;
         CXLType2IntervalLedger driver_intervals;
         uint64_t active_cxl_request_count;
@@ -397,6 +400,11 @@ typedef struct CXLType2State {
         uint64_t active_cxl_server_reported_latency_ns;
         uint64_t active_direct_register_calls;
         uint64_t active_direct_unregister_calls;
+        uint64_t active_direct_register_validate_ns;
+        uint64_t active_direct_register_resolve_ns;
+        uint64_t active_direct_register_acquire_ns;
+        uint64_t active_direct_register_commit_ns;
+        uint64_t active_direct_unregister_release_ns;
         uint64_t active_direct_logical_ranges;
         uint64_t active_direct_fragments;
         uint64_t active_direct_bytes;
