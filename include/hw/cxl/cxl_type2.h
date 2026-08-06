@@ -417,6 +417,9 @@ typedef struct CXLType2State {
         uint64_t active_direct_registration_bytes;
         uint64_t active_direct_coalesced_views;
         uint64_t active_direct_max_registration_views;
+        uint64_t active_direct_physical_boundaries;
+        uint64_t active_direct_host_contiguous_boundaries;
+        uint64_t active_direct_host_contiguous_following_bytes;
         uint64_t active_direct_physical_unregister_calls;
         uint64_t active_direct_physical_unregister_ns;
         uint64_t active_direct_cache_hits;
@@ -430,6 +433,14 @@ typedef struct CXLType2State {
         uint64_t active_direct_bytes;
         uint64_t active_payload_batches;
         uint64_t active_payload_source_bytes;
+        uint64_t active_htod_pool_hits;
+        uint64_t active_htod_pool_misses;
+        uint64_t active_htod_driver_allocations;
+        uint64_t active_htod_driver_frees;
+        uint64_t active_htod_pool_evictions;
+        uint64_t active_htod_staging_pending_bytes;
+        uint64_t active_htod_peak_staging_pending_bytes;
+        uint64_t active_htod_peak_pooled_bytes;
     } paired_case;
 
     /* Bulk transfer region for large memory operations */

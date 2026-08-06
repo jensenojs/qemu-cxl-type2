@@ -2744,6 +2744,9 @@ static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
     ct2d->paired_case.active_direct_registration_bytes = 0;
     ct2d->paired_case.active_direct_coalesced_views = 0;
     ct2d->paired_case.active_direct_max_registration_views = 0;
+    ct2d->paired_case.active_direct_physical_boundaries = 0;
+    ct2d->paired_case.active_direct_host_contiguous_boundaries = 0;
+    ct2d->paired_case.active_direct_host_contiguous_following_bytes = 0;
     ct2d->paired_case.active_direct_physical_unregister_calls = 0;
     ct2d->paired_case.active_direct_physical_unregister_ns = 0;
     ct2d->paired_case.active_direct_cache_hits = 0;
@@ -2757,6 +2760,14 @@ static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
     ct2d->paired_case.active_direct_bytes = 0;
     ct2d->paired_case.active_payload_batches = 0;
     ct2d->paired_case.active_payload_source_bytes = 0;
+    ct2d->paired_case.active_htod_pool_hits = 0;
+    ct2d->paired_case.active_htod_pool_misses = 0;
+    ct2d->paired_case.active_htod_driver_allocations = 0;
+    ct2d->paired_case.active_htod_driver_frees = 0;
+    ct2d->paired_case.active_htod_pool_evictions = 0;
+    ct2d->paired_case.active_htod_staging_pending_bytes = 0;
+    ct2d->paired_case.active_htod_peak_staging_pending_bytes = 0;
+    ct2d->paired_case.active_htod_peak_pooled_bytes = 0;
 }
 
 static void cxl_type2_record_driver_interval(
@@ -2857,7 +2868,14 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
              " htod_async_calls=%" PRIu64 " htod_async_busy_ns=%" PRIu64
              " dtoh_calls=%" PRIu64 " dtoh_busy_ns=%" PRIu64
              " stream_sync_calls=%" PRIu64 " stream_sync_busy_ns=%" PRIu64
-             " htod_pending_copies=%" PRIu64 " htod_pending_bytes=%" PRIu64 "\n",
+             " htod_pending_copies=%" PRIu64 " htod_pending_bytes=%" PRIu64
+             " htod_pool_hits=%" PRIu64 " htod_pool_misses=%" PRIu64
+             " htod_driver_allocations=%" PRIu64
+             " htod_driver_frees=%" PRIu64
+             " htod_pool_evictions=%" PRIu64
+             " htod_staging_pending_bytes=%" PRIu64
+             " htod_peak_staging_pending_bytes=%" PRIu64
+             " htod_peak_pooled_bytes=%" PRIu64 "\n",
              run_binding, cxl_type2_paired_case_name(case_kind), epoch,
              ct2d->paired_case.active_command_count,
              ct2d->paired_case.active_command_failures,
@@ -2867,7 +2885,15 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
              busy[CXL_GPU_CMD_MEM_COPY_HTOD_ASYNC],
              calls[CXL_GPU_CMD_MEM_COPY_DTOH], busy[CXL_GPU_CMD_MEM_COPY_DTOH],
              calls[CXL_GPU_CMD_STREAM_SYNC], busy[CXL_GPU_CMD_STREAM_SYNC],
-             ct2d->htod_pending_copies, ct2d->htod_pending_bytes);
+             ct2d->htod_pending_copies, ct2d->htod_pending_bytes,
+             ct2d->paired_case.active_htod_pool_hits,
+             ct2d->paired_case.active_htod_pool_misses,
+             ct2d->paired_case.active_htod_driver_allocations,
+             ct2d->paired_case.active_htod_driver_frees,
+             ct2d->paired_case.active_htod_pool_evictions,
+             ct2d->paired_case.active_htod_staging_pending_bytes,
+             ct2d->paired_case.active_htod_peak_staging_pending_bytes,
+             ct2d->paired_case.active_htod_peak_pooled_bytes);
 
     qemu_log("KIMI_CXL_REQUEST_SUMMARY run_binding=%" PRIu64
              " case=%s epoch=%" PRIu64
@@ -2922,7 +2948,7 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             live_physicals++;
         }
         qemu_log(
-            "KIMI_DIRECT_SOURCE_SUMMARY schema=direct-source-summary-v3"
+            "KIMI_DIRECT_SOURCE_SUMMARY schema=direct-source-summary-v4"
             " run_binding=%" PRIu64 " case=%s case_epoch=%" PRIu64
             " policy_enabled=%u register_calls=%" PRIu64
             " register_busy_ns=%" PRIu64
@@ -2943,6 +2969,9 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             " registration_bytes=%" PRIu64
             " coalesced_views=%" PRIu64
             " max_registration_views=%" PRIu64
+            " physical_boundaries=%" PRIu64
+            " host_contiguous_boundaries=%" PRIu64
+            " host_contiguous_following_bytes=%" PRIu64
             " physical_unregister_calls=%" PRIu64
             " physical_unregister_ns=%" PRIu64
             " cache_hits=%" PRIu64 " active_hits=%" PRIu64
@@ -2974,6 +3003,9 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             ct2d->paired_case.active_direct_registration_bytes,
             ct2d->paired_case.active_direct_coalesced_views,
             ct2d->paired_case.active_direct_max_registration_views,
+            ct2d->paired_case.active_direct_physical_boundaries,
+            ct2d->paired_case.active_direct_host_contiguous_boundaries,
+            ct2d->paired_case.active_direct_host_contiguous_following_bytes,
             ct2d->paired_case.active_direct_physical_unregister_calls,
             ct2d->paired_case.active_direct_physical_unregister_ns,
             ct2d->paired_case.active_direct_cache_hits,
@@ -3187,6 +3219,9 @@ static int cxl_type2_htod_staging_free(CXLType2State *ct2d, void *data)
 
     if (result == CXL_GPU_SUCCESS) {
         ct2d->htod_driver_frees++;
+        if (ct2d->paired_case.active_case != CXL_GPU_CASE_NONE) {
+            ct2d->paired_case.active_htod_driver_frees++;
+        }
     }
     return result;
 }
@@ -3216,6 +3251,7 @@ static int cxl_type2_htod_staging_acquire(CXLType2State *ct2d,
         ct2d->htod_pooled_buffers--;
         ct2d->htod_pooled_bytes -= buffer->capacity;
         ct2d->htod_pool_hits++;
+        ct2d->paired_case.active_htod_pool_hits++;
         *data = buffer->data;
         *capacity = buffer->capacity;
         *buffer_id = buffer->id;
@@ -3225,12 +3261,14 @@ static int cxl_type2_htod_staging_acquire(CXLType2State *ct2d,
     }
 
     ct2d->htod_pool_misses++;
+    ct2d->paired_case.active_htod_pool_misses++;
     result = hetgpu_cuda_mem_host_alloc(&ct2d->gpu_info.hetgpu_state,
                                         data, request_bytes);
     if (result != CXL_GPU_SUCCESS) {
         return result;
     }
     ct2d->htod_driver_allocations++;
+    ct2d->paired_case.active_htod_driver_allocations++;
     *capacity = request_bytes;
     *buffer_id = ++ct2d->next_htod_staging_id;
     *pool_hit = false;
@@ -3844,6 +3882,35 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
         }
         source->run_count = views->len;
         source->runs = (CXLType2DirectRun *)g_array_free(views, false);
+        for (uint32_t i = 0; i < source->range_count; i++) {
+            const CXLGPUSourceRangeV1 *range = &source->ranges[i];
+
+            for (uint32_t j = 1; j < range->run_count; j++) {
+                CXLType2DirectRun *previous =
+                    &source->runs[range->first_run + j - 1];
+                CXLType2DirectRun *current =
+                    &source->runs[range->first_run + j];
+                uintptr_t previous_address =
+                    (uintptr_t)previous->physical->host_address +
+                    previous->physical_offset;
+                uintptr_t current_address =
+                    (uintptr_t)current->physical->host_address +
+                    current->physical_offset;
+
+                if (previous->physical == current->physical) {
+                    continue;
+                }
+                ct2d->paired_case.active_direct_physical_boundaries++;
+                if (previous_address <= UINTPTR_MAX - previous->length &&
+                    previous_address + previous->length == current_address) {
+                    ct2d->paired_case
+                        .active_direct_host_contiguous_boundaries++;
+                    ct2d->paired_case
+                        .active_direct_host_contiguous_following_bytes +=
+                        current->length;
+                }
+            }
+        }
         g_free(wire_first_view);
         g_free(wire_view_count);
         goto views_done;
@@ -4115,6 +4182,10 @@ static int cxl_type2_enqueue_htod_from_host(CXLType2State *ct2d,
     ct2d->pending_htod = pending;
     ct2d->htod_pending_copies++;
     ct2d->htod_pending_bytes += staging_capacity;
+    ct2d->paired_case.active_htod_staging_pending_bytes += staging_capacity;
+    ct2d->paired_case.active_htod_peak_staging_pending_bytes = MAX(
+        ct2d->paired_case.active_htod_peak_staging_pending_bytes,
+        ct2d->paired_case.active_htod_staging_pending_bytes);
     ct2d->htod_peak_pending_copies = MAX(ct2d->htod_peak_pending_copies,
                                          ct2d->htod_pending_copies);
     ct2d->htod_peak_pending_bytes = MAX(ct2d->htod_peak_pending_bytes,
@@ -4195,12 +4266,16 @@ static int cxl_type2_htod_staging_release(CXLType2State *ct2d,
         ct2d->htod_pooled_bytes += capacity;
         ct2d->htod_peak_pooled_bytes = MAX(ct2d->htod_peak_pooled_bytes,
                                            ct2d->htod_pooled_bytes);
+        ct2d->paired_case.active_htod_peak_pooled_bytes = MAX(
+            ct2d->paired_case.active_htod_peak_pooled_bytes,
+            ct2d->htod_pooled_bytes);
         *pooled = true;
         return CXL_GPU_SUCCESS;
     }
 
     if (ct2d->htod_staging_pool_size) {
         ct2d->htod_pool_evictions++;
+        ct2d->paired_case.active_htod_pool_evictions++;
     }
     *pooled = false;
     return cxl_type2_htod_staging_free(ct2d, data);
@@ -4281,6 +4356,12 @@ static int cxl_type2_release_pending_htod(CXLType2State *ct2d,
         ct2d->htod_pending_bytes -= pending->direct_source
                                         ? pending->size
                                         : pending->staging_capacity;
+        if (!pending->direct_source) {
+            g_assert(ct2d->paired_case.active_htod_staging_pending_bytes >=
+                     pending->staging_capacity);
+            ct2d->paired_case.active_htod_staging_pending_bytes -=
+                pending->staging_capacity;
+        }
         if (ct2d->paired_case.qemu_cuda_calls_enabled) {
             qemu_log("CXL TYPE2 TRACE copy_completion original_call_id=0x%016"
                      PRIx64 " completion_call_id=0x%016" PRIx64
