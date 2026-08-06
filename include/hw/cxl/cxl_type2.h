@@ -356,6 +356,9 @@ typedef struct CXLType2State {
     bool cuda_direct_source;
     Object *direct_source_fs;
     CXLType2DirectPhysical *direct_physicals;
+    GHashTable *direct_physical_by_mapping;
+    GHashTable *direct_physical_by_gpa;
+    GTree *direct_physical_ranges;
     CXLType2DirectSource *direct_sources;
     uint64_t next_direct_source_id;
     bool direct_source_poisoned;

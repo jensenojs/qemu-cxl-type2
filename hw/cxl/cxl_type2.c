@@ -3211,55 +3211,130 @@ static int cxl_type2_htod_staging_release(CXLType2State *ct2d, void *data,
                                            size_t capacity,
                                            uint64_t buffer_id, bool *pooled);
 
+static guint cxl_type2_direct_physical_mapping_hash(gconstpointer key)
+{
+    const CXLType2DirectPhysical *physical = key;
+    guint hash = g_direct_hash(physical->mapping);
+
+    hash = hash * 31 + (guint)(physical->generation ^
+                               (physical->generation >> 32));
+    hash = hash * 31 + (guint)(physical->mapping_offset ^
+                               (physical->mapping_offset >> 32));
+    hash = hash * 31 + (guint)(physical->length ^ (physical->length >> 32));
+    return hash;
+}
+
+static gboolean cxl_type2_direct_physical_mapping_equal(gconstpointer a,
+                                                         gconstpointer b)
+{
+    const CXLType2DirectPhysical *left = a;
+    const CXLType2DirectPhysical *right = b;
+
+    return left->mapping == right->mapping &&
+           left->generation == right->generation &&
+           left->mapping_offset == right->mapping_offset &&
+           left->length == right->length;
+}
+
+static guint cxl_type2_direct_physical_gpa_hash(gconstpointer key)
+{
+    const CXLType2DirectPhysical *physical = key;
+    guint hash = (guint)(physical->guest_phys_addr ^
+                         (physical->guest_phys_addr >> 32));
+
+    return hash * 31 + (guint)(physical->length ^ (physical->length >> 32));
+}
+
+static gboolean cxl_type2_direct_physical_gpa_equal(gconstpointer a,
+                                                     gconstpointer b)
+{
+    const CXLType2DirectPhysical *left = a;
+    const CXLType2DirectPhysical *right = b;
+
+    return left->guest_phys_addr == right->guest_phys_addr &&
+           left->length == right->length;
+}
+
+static gint cxl_type2_direct_physical_range_compare(gconstpointer a,
+                                                     gconstpointer b,
+                                                     gpointer opaque)
+{
+    const CXLType2DirectPhysical *left = a;
+    const CXLType2DirectPhysical *right = b;
+    uintptr_t left_mapping = (uintptr_t)left->mapping;
+    uintptr_t right_mapping = (uintptr_t)right->mapping;
+
+    (void)opaque;
+    if (left_mapping < right_mapping) {
+        return -1;
+    }
+    if (left_mapping > right_mapping) {
+        return 1;
+    }
+    if (left->mapping_offset < right->mapping_offset) {
+        return left->length <= right->mapping_offset - left->mapping_offset
+                   ? -1 : 0;
+    }
+    if (left->mapping_offset > right->mapping_offset) {
+        return right->length <= left->mapping_offset - right->mapping_offset
+                   ? 1 : 0;
+    }
+    return 0;
+}
+
+static void cxl_type2_direct_indexes_ensure(CXLType2State *ct2d)
+{
+    if (ct2d->direct_physical_by_mapping) {
+        return;
+    }
+    ct2d->direct_physical_by_mapping = g_hash_table_new(
+        cxl_type2_direct_physical_mapping_hash,
+        cxl_type2_direct_physical_mapping_equal);
+    ct2d->direct_physical_by_gpa = g_hash_table_new(
+        cxl_type2_direct_physical_gpa_hash,
+        cxl_type2_direct_physical_gpa_equal);
+    ct2d->direct_physical_ranges = g_tree_new_full(
+        cxl_type2_direct_physical_range_compare, NULL, NULL, NULL);
+}
+
 static CXLType2DirectPhysical *cxl_type2_direct_physical_find(
     CXLType2State *ct2d, VirtioSharedMemoryMapping *mapping,
     uint64_t generation, hwaddr mapping_offset, uint64_t length)
 {
-    CXLType2DirectPhysical *physical;
+    CXLType2DirectPhysical key = {
+        .mapping = mapping,
+        .generation = generation,
+        .mapping_offset = mapping_offset,
+        .length = length,
+    };
 
-    for (physical = ct2d->direct_physicals; physical;
-         physical = physical->next) {
-        if (physical->mapping == mapping &&
-            physical->generation == generation &&
-            physical->mapping_offset == mapping_offset &&
-            physical->length == length) {
-            return physical;
-        }
-    }
-    return NULL;
+    return g_hash_table_lookup(ct2d->direct_physical_by_mapping, &key);
 }
 
 static CXLType2DirectPhysical *cxl_type2_direct_physical_find_gpa(
     CXLType2State *ct2d, hwaddr guest_phys_addr, uint64_t length)
 {
-    CXLType2DirectPhysical *physical;
+    CXLType2DirectPhysical key = {
+        .guest_phys_addr = guest_phys_addr,
+        .length = length,
+    };
+    CXLType2DirectPhysical *physical =
+        g_hash_table_lookup(ct2d->direct_physical_by_gpa, &key);
 
-    for (physical = ct2d->direct_physicals; physical;
-         physical = physical->next) {
-        if (physical->guest_phys_addr == guest_phys_addr &&
-            physical->length == length &&
-            !physical->mapping->revoke_pending) {
-            return physical;
-        }
-    }
-    return NULL;
+    return physical && !physical->mapping->revoke_pending ? physical : NULL;
 }
 
 static bool cxl_type2_direct_physical_overlaps(
     CXLType2State *ct2d, VirtioSharedMemoryMapping *mapping,
     hwaddr mapping_offset, uint64_t length)
 {
-    CXLType2DirectPhysical *physical;
+    CXLType2DirectPhysical key = {
+        .mapping = mapping,
+        .mapping_offset = mapping_offset,
+        .length = length,
+    };
 
-    for (physical = ct2d->direct_physicals; physical;
-         physical = physical->next) {
-        if (physical->mapping == mapping &&
-            ranges_overlap(physical->mapping_offset, physical->length,
-                           mapping_offset, length)) {
-            return true;
-        }
-    }
-    return false;
+    return g_tree_lookup(ct2d->direct_physical_ranges, &key) != NULL;
 }
 
 static int cxl_type2_direct_physical_release(CXLType2State *ct2d,
@@ -3282,6 +3357,9 @@ static int cxl_type2_direct_physical_release(CXLType2State *ct2d,
         return result;
     }
     physical->cuda_registered = false;
+    g_assert(g_hash_table_remove(ct2d->direct_physical_by_mapping, physical));
+    g_assert(g_hash_table_remove(ct2d->direct_physical_by_gpa, physical));
+    g_assert(g_tree_remove(ct2d->direct_physical_ranges, physical));
     virtio_shared_memory_unpin(physical->mapping);
     cursor = &ct2d->direct_physicals;
     while (*cursor != physical) {
@@ -3361,6 +3439,14 @@ static int cxl_type2_direct_physicals_cleanup(CXLType2State *ct2d)
     }
     return ct2d->direct_physicals ? CXL_GPU_ERROR_INVALID_VALUE
                                   : CXL_GPU_SUCCESS;
+}
+
+static void cxl_type2_direct_indexes_destroy(CXLType2State *ct2d)
+{
+    g_clear_pointer(&ct2d->direct_physical_by_mapping,
+                    g_hash_table_destroy);
+    g_clear_pointer(&ct2d->direct_physical_by_gpa, g_hash_table_destroy);
+    g_clear_pointer(&ct2d->direct_physical_ranges, g_tree_destroy);
 }
 
 static CXLType2DirectSource *cxl_type2_direct_source_find(
@@ -3489,6 +3575,7 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
         *failure_stage_out = "dax-unavailable";
         return CXL_GPU_ERROR_INVALID_VALUE;
     }
+    cxl_type2_direct_indexes_ensure(ct2d);
     if (!cxl_gpu_source_register_validate(
             ct2d->gpu_cmd.batch_data, CXL_GPU_BATCH_DATA_SIZE, payload_bytes,
             &header, &fail_index)) {
@@ -3656,6 +3743,12 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
             physical->host_address = mapping_host;
             physical->references = 1;
             physical->cuda_registered = true;
+            g_assert(g_hash_table_add(ct2d->direct_physical_by_mapping,
+                                      physical));
+            g_assert(g_hash_table_add(ct2d->direct_physical_by_gpa,
+                                      physical));
+            g_assert(!g_tree_lookup(ct2d->direct_physical_ranges, physical));
+            g_tree_insert(ct2d->direct_physical_ranges, physical, physical);
             physical->next = ct2d->direct_physicals;
             ct2d->direct_physicals = physical;
             ct2d->paired_case.active_direct_cache_misses++;
@@ -8191,6 +8284,7 @@ static void cxl_type2_exit(PCIDevice *pci_dev)
             error_report("CXL Type2 direct source cleanup failed at device exit");
         }
     }
+    cxl_type2_direct_indexes_destroy(ct2d);
 
     (void)cxl_type2_clear_gpu_handles(ct2d, 0, CXL_GPU_CASE_NONE, 0);
 

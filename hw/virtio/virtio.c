@@ -3045,6 +3045,23 @@ int virtio_save(VirtIODevice *vdev, QEMUFile *f)
     return vmstate_save_state(f, &vmstate_virtio, vdev, NULL);
 }
 
+static gint virtio_shmem_mapping_range_compare(gconstpointer a,
+                                                gconstpointer b,
+                                                gpointer opaque)
+{
+    const VirtioSharedMemoryMapping *left = a;
+    const VirtioSharedMemoryMapping *right = b;
+
+    (void)opaque;
+    if (left->offset < right->offset) {
+        return left->len <= right->offset - left->offset ? -1 : 0;
+    }
+    if (left->offset > right->offset) {
+        return right->len <= left->offset - right->offset ? 1 : 0;
+    }
+    return 0;
+}
+
 VirtioSharedMemory *virtio_new_shmem_region(VirtIODevice *vdev, uint8_t shmid,
                                             uint64_t size, Error **errp)
 {
@@ -3069,6 +3086,8 @@ VirtioSharedMemory *virtio_new_shmem_region(VirtIODevice *vdev, uint8_t shmid,
     memory_region_init_ram_device_ptr(&elem->mr, OBJECT(vdev), name, size,
                                       host_addr);
     QTAILQ_INIT(&elem->mmaps);
+    elem->map_index = g_tree_new_full(virtio_shmem_mapping_range_compare,
+                                      NULL, NULL, NULL);
     QSIMPLEQ_INSERT_TAIL(&vdev->shmem_list, elem, entry);
     return elem;
 }
@@ -3169,6 +3188,10 @@ int virtio_add_shmem_map(VirtioSharedMemory *shmem,
         error_report("VIRTIO Shared Memory mapping is not host-page aligned");
         return -1;
     }
+    if (g_tree_lookup(shmem->map_index, mapping)) {
+        error_report("VIRTIO Shared Memory mapping overlaps an installed range");
+        return -EEXIST;
+    }
 
     generation = qatomic_fetch_inc(&next_generation) + 1;
     if (generation == 0) {
@@ -3191,6 +3214,7 @@ int virtio_add_shmem_map(VirtioSharedMemory *shmem,
 
     /* Add to the mapped regions list */
     QTAILQ_INSERT_TAIL(&shmem->mmaps, mapping, link);
+    g_tree_insert(shmem->map_index, mapping, mapping);
 
     return 0;
 }
@@ -3198,15 +3222,12 @@ int virtio_add_shmem_map(VirtioSharedMemory *shmem,
 VirtioSharedMemoryMapping *virtio_find_shmem_map(VirtioSharedMemory *shmem,
                                           hwaddr offset, uint64_t size)
 {
-    VirtioSharedMemoryMapping *mapping;
-    QTAILQ_FOREACH(mapping, &shmem->mmaps, link) {
-        if (size && offset >= mapping->offset &&
-            offset - mapping->offset <= mapping->len &&
-            size <= mapping->len - (offset - mapping->offset)) {
-            return mapping;
-        }
-    }
-    return NULL;
+    VirtioSharedMemoryMapping key = {
+        .offset = offset,
+        .len = size,
+    };
+
+    return size ? g_tree_lookup(shmem->map_index, &key) : NULL;
 }
 
 static int virtio_revoke_shmem_mapping(VirtioSharedMemory *shmem,
@@ -3226,6 +3247,7 @@ static int virtio_revoke_shmem_mapping(VirtioSharedMemory *shmem,
      * Remove from list and unref the mapping which will trigger automatic cleanup
      * when the reference count reaches zero.
      */
+    g_assert(g_tree_remove(shmem->map_index, mapping));
     QTAILQ_REMOVE(&shmem->mmaps, mapping, link);
     mapping->owner = NULL;
     object_unref(OBJECT(mapping));
@@ -4341,6 +4363,7 @@ static void virtio_device_instance_finalize(Object *obj)
             error_report("Unable to release VIRTIO shared-memory window: %s",
                          strerror(errno));
         }
+        g_tree_destroy(shmem->map_index);
         QSIMPLEQ_REMOVE_HEAD(&vdev->shmem_list, entry);
         g_free(shmem);
     }

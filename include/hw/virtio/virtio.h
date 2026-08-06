@@ -149,6 +149,7 @@ struct VirtioSharedMemory {
     void *host_addr;
     uint64_t size;
     QTAILQ_HEAD(, VirtioSharedMemoryMapping) mmaps;
+    GTree *map_index;
     QSIMPLEQ_ENTRY(VirtioSharedMemory) entry;
 };
 
