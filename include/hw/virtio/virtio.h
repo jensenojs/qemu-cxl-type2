@@ -103,6 +103,9 @@ enum virtio_device_endian {
 #define TYPE_VIRTIO_SHARED_MEMORY_MAPPING "virtio-shared-memory-mapping"
 OBJECT_DECLARE_SIMPLE_TYPE(VirtioSharedMemoryMapping, VIRTIO_SHARED_MEMORY_MAPPING)
 
+typedef void (*VirtioSharedMemoryPrepareRevokeFn)(
+    VirtioSharedMemoryMapping *mapping, void *opaque);
+
 /**
  * VirtioSharedMemoryMapping:
  * @parent: Parent QOM object
@@ -134,6 +137,8 @@ struct VirtioSharedMemoryMapping {
     uint64_t generation;
     uint64_t source_pins;
     bool revoke_pending;
+    VirtioSharedMemoryPrepareRevokeFn prepare_revoke;
+    void *prepare_revoke_opaque;
     struct VirtioSharedMemory *owner;
     QTAILQ_ENTRY(VirtioSharedMemoryMapping) link;
 };
@@ -442,7 +447,8 @@ VirtioSharedMemoryMapping *virtio_find_shmem_map(VirtioSharedMemory *shmem,
 int virtio_shared_memory_pin_range(
     VirtioSharedMemory *shmem, hwaddr offset, uint64_t length,
     VirtioSharedMemoryMapping **mapping, uint64_t *generation,
-    void **host_address);
+    void **host_address, VirtioSharedMemoryPrepareRevokeFn prepare_revoke,
+    void *prepare_revoke_opaque);
 void virtio_shared_memory_unpin(VirtioSharedMemoryMapping *mapping);
 
 /**

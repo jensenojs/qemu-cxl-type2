@@ -1954,6 +1954,9 @@ vhost_user_backend_handle_shmem_unmap(struct vhost_dev *dev,
         ret = -EFAULT;
         goto send_reply;
     }
+    if (mmap->source_pins && mmap->prepare_revoke) {
+        mmap->prepare_revoke(mmap, mmap->prepare_revoke_opaque);
+    }
     if (mmap->source_pins) {
         ret = virtio_del_shmem_map(shmem, vu_mmap->shm_offset,
                                    vu_mmap->len);

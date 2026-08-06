@@ -3235,7 +3235,8 @@ static int virtio_revoke_shmem_mapping(VirtioSharedMemory *shmem,
 int virtio_shared_memory_pin_range(
     VirtioSharedMemory *shmem, hwaddr offset, uint64_t length,
     VirtioSharedMemoryMapping **mapping_out, uint64_t *generation,
-    void **host_address)
+    void **host_address, VirtioSharedMemoryPrepareRevokeFn prepare_revoke,
+    void *prepare_revoke_opaque)
 {
     VirtioSharedMemoryMapping *mapping;
 
@@ -3249,7 +3250,14 @@ int virtio_shared_memory_pin_range(
     if (mapping->revoke_pending || mapping->source_pins == UINT64_MAX) {
         return mapping->source_pins == UINT64_MAX ? -EOVERFLOW : -EBUSY;
     }
+    if (mapping->source_pins &&
+        (mapping->prepare_revoke != prepare_revoke ||
+         mapping->prepare_revoke_opaque != prepare_revoke_opaque)) {
+        return -EBUSY;
+    }
     object_ref(OBJECT(mapping));
+    mapping->prepare_revoke = prepare_revoke;
+    mapping->prepare_revoke_opaque = prepare_revoke_opaque;
     mapping->source_pins++;
     *mapping_out = mapping;
     *generation = mapping->generation;
@@ -3265,6 +3273,10 @@ void virtio_shared_memory_unpin(VirtioSharedMemoryMapping *mapping)
     g_assert(mapping && mapping->source_pins > 0);
     owner = mapping->owner;
     mapping->source_pins--;
+    if (mapping->source_pins == 0) {
+        mapping->prepare_revoke = NULL;
+        mapping->prepare_revoke_opaque = NULL;
+    }
     revoke = mapping->source_pins == 0 && mapping->revoke_pending;
     if (revoke) {
         mapping->revoke_pending = false;

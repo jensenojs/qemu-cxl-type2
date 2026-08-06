@@ -405,6 +405,16 @@ typedef struct CXLType2State {
         uint64_t active_direct_register_acquire_ns;
         uint64_t active_direct_register_commit_ns;
         uint64_t active_direct_unregister_release_ns;
+        uint64_t active_direct_physical_register_calls;
+        uint64_t active_direct_physical_register_ns;
+        uint64_t active_direct_physical_unregister_calls;
+        uint64_t active_direct_physical_unregister_ns;
+        uint64_t active_direct_cache_hits;
+        uint64_t active_direct_active_hits;
+        uint64_t active_direct_cache_misses;
+        uint64_t active_direct_revoke_releases;
+        uint64_t active_direct_retained_physicals;
+        uint64_t active_direct_peak_retained_physicals;
         uint64_t active_direct_logical_ranges;
         uint64_t active_direct_fragments;
         uint64_t active_direct_bytes;
