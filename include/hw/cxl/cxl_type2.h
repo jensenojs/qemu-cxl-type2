@@ -441,6 +441,9 @@ typedef struct CXLType2State {
         uint64_t active_htod_staging_pending_bytes;
         uint64_t active_htod_peak_staging_pending_bytes;
         uint64_t active_htod_peak_pooled_bytes;
+        uint64_t active_elided_stream_syncs;
+        uint64_t last_successful_stream_sync_wire;
+        bool last_command_was_successful_stream_sync;
     } paired_case;
 
     /* Bulk transfer region for large memory operations */

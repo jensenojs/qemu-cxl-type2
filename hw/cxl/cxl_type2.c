@@ -2768,6 +2768,9 @@ static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
     ct2d->paired_case.active_htod_staging_pending_bytes = 0;
     ct2d->paired_case.active_htod_peak_staging_pending_bytes = 0;
     ct2d->paired_case.active_htod_peak_pooled_bytes = 0;
+    ct2d->paired_case.active_elided_stream_syncs = 0;
+    ct2d->paired_case.last_successful_stream_sync_wire = 0;
+    ct2d->paired_case.last_command_was_successful_stream_sync = false;
 }
 
 static void cxl_type2_record_driver_interval(
@@ -2875,7 +2878,8 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
              " htod_pool_evictions=%" PRIu64
              " htod_staging_pending_bytes=%" PRIu64
              " htod_peak_staging_pending_bytes=%" PRIu64
-             " htod_peak_pooled_bytes=%" PRIu64 "\n",
+             " htod_peak_pooled_bytes=%" PRIu64
+             " elided_stream_syncs=%" PRIu64 "\n",
              run_binding, cxl_type2_paired_case_name(case_kind), epoch,
              ct2d->paired_case.active_command_count,
              ct2d->paired_case.active_command_failures,
@@ -2893,7 +2897,8 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
              ct2d->paired_case.active_htod_pool_evictions,
              ct2d->paired_case.active_htod_staging_pending_bytes,
              ct2d->paired_case.active_htod_peak_staging_pending_bytes,
-             ct2d->paired_case.active_htod_peak_pooled_bytes);
+             ct2d->paired_case.active_htod_peak_pooled_bytes,
+             ct2d->paired_case.active_elided_stream_syncs);
 
     qemu_log("KIMI_CXL_REQUEST_SUMMARY run_binding=%" PRIu64
              " case=%s epoch=%" PRIu64
@@ -5109,6 +5114,13 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
     size_t size;
     uint64_t trace_sequence = ++ct2d->gpu_cmd.trace_sequence;
     int64_t trace_start_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+    bool elide_stream_sync =
+        cmd == CXL_GPU_CMD_STREAM_SYNC &&
+        ct2d->paired_case.last_command_was_successful_stream_sync &&
+        ct2d->paired_case.last_successful_stream_sync_wire ==
+            ct2d->gpu_cmd.params[0];
+
+    ct2d->paired_case.last_command_was_successful_stream_sync = false;
 
     if (ct2d->paired_case.qemu_cuda_calls_enabled) qemu_log("CXL TYPE2 TRACE cmd_begin seq=%" PRIu64
              " call_id=0x%016" PRIx64
@@ -6817,6 +6829,11 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
 
     case CXL_GPU_CMD_STREAM_SYNC:
         {
+            if (elide_stream_sync) {
+                ct2d->paired_case.active_elided_stream_syncs++;
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+                break;
+            }
             void *stream = NULL;
             if (!cxl_type2_stream_from_wire(ct2d, ct2d->gpu_cmd.params[0],
                                             &stream)) {
@@ -7795,6 +7812,12 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
     }
 
 complete:
+    if (cmd == CXL_GPU_CMD_STREAM_SYNC &&
+        ct2d->gpu_cmd.cmd_result == CXL_GPU_SUCCESS) {
+        ct2d->paired_case.last_command_was_successful_stream_sync = true;
+        ct2d->paired_case.last_successful_stream_sync_wire =
+            ct2d->gpu_cmd.params[0];
+    }
     hetgpu_cuda_trace_set_call_id(0);
     ct2d->gpu_cmd.cmd_status = CXL_GPU_CMD_STATUS_COMPLETE;
     int64_t trace_end_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
