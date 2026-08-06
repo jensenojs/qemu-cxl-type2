@@ -62,6 +62,7 @@ typedef int (*cuMemFreeHost_fn)(void *);
 typedef int (*cuMemHostRegister_fn)(void *, size_t, unsigned int);
 typedef int (*cuMemHostUnregister_fn)(void *);
 typedef int (*cuMemcpyDtoD_fn)(uint64_t, uint64_t, size_t);
+typedef int (*cuMemcpyDtoDAsync_fn)(uint64_t, uint64_t, size_t, void *);
 typedef struct CudaMemcpy2D {
     size_t src_x_bytes;
     size_t src_y;
@@ -282,6 +283,7 @@ static struct {
     cuMemHostRegister_fn cuMemHostRegister;
     cuMemHostUnregister_fn cuMemHostUnregister;
     cuMemcpyDtoD_fn cuMemcpyDtoD;
+    cuMemcpyDtoDAsync_fn cuMemcpyDtoDAsync;
     cuMemcpy2D_fn cuMemcpy2D;
     cuPointerGetAttribute_fn cuPointerGetAttribute;
     cuModuleLoadData_fn cuModuleLoadData;
@@ -458,6 +460,8 @@ static HetGPUError hetgpu_init_internal(HetGPUState *state,
             g_cuda_funcs.cuMemHostUnregister =
                 dlsym(g_cuda_lib_handle, "cuMemHostUnregister");
             g_cuda_funcs.cuMemcpyDtoD = dlsym(g_cuda_lib_handle, "cuMemcpyDtoD_v2");
+            g_cuda_funcs.cuMemcpyDtoDAsync =
+                dlsym(g_cuda_lib_handle, "cuMemcpyDtoDAsync_v2");
             g_cuda_funcs.cuMemcpy2D = dlsym(g_cuda_lib_handle, "cuMemcpy2D_v2");
             g_cuda_funcs.cuPointerGetAttribute = dlsym(g_cuda_lib_handle, "cuPointerGetAttribute");
             g_cuda_funcs.cuModuleLoadData = dlsym(g_cuda_lib_handle, "cuModuleLoadData");
@@ -1655,6 +1659,28 @@ HetGPUError hetgpu_memcpy_dtod(HetGPUState *state, HetGPUDevicePtr dst,
     }
 
     return HETGPU_SUCCESS;
+}
+
+int hetgpu_cuda_memcpy_dtod_async(HetGPUState *state, HetGPUDevicePtr dst,
+                                  HetGPUDevicePtr src, size_t size,
+                                  HetGPUStream stream)
+{
+    if (!state || !state->initialized) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if (state->backend == HETGPU_BACKEND_SIMULATION) {
+        return hetgpu_memcpy_dtod(state, dst, src, size);
+    }
+    if (!g_cuda_funcs.cuMemcpyDtoDAsync) {
+        return CUDA_ERROR_NOT_SUPPORTED;
+    }
+    if (!cuda_lock(state)) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    state->memory_ops++;
+    int result = HETGPU_CUDA_CALL(cuMemcpyDtoDAsync, dst, src, size, stream);
+    cuda_unlock(state);
+    return result;
 }
 
 HetGPUError hetgpu_memcpy2d_dtod(HetGPUState *state, HetGPUDevicePtr dst,

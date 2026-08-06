@@ -477,6 +477,9 @@ HetGPUError hetgpu_memcpy_dtoh(HetGPUState *state, void *dst,
  */
 HetGPUError hetgpu_memcpy_dtod(HetGPUState *state, HetGPUDevicePtr dst,
                                HetGPUDevicePtr src, size_t size);
+int hetgpu_cuda_memcpy_dtod_async(HetGPUState *state, HetGPUDevicePtr dst,
+                                  HetGPUDevicePtr src, size_t size,
+                                  HetGPUStream stream);
 
 HetGPUError hetgpu_memcpy2d_dtod(HetGPUState *state, HetGPUDevicePtr dst,
                                  size_t dst_pitch, HetGPUDevicePtr src,

@@ -5112,6 +5112,30 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         }
         break;
 
+    case CXL_GPU_CMD_MEM_COPY_DTOD_ASYNC:
+        {
+            uint64_t dst_dev_ptr = ct2d->gpu_cmd.params[0];
+            uint64_t src_dev_ptr = ct2d->gpu_cmd.params[1];
+            size_t xfer_size = ct2d->gpu_cmd.params[2];
+            void *stream = NULL;
+
+            if (!cxl_type2_stream_from_wire(ct2d, ct2d->gpu_cmd.params[3],
+                                            &stream)) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+                break;
+            }
+            ct2d->gpu_cmd.cmd_result = hetgpu_cuda_memcpy_dtod_async(
+                hetgpu, dst_dev_ptr, src_dev_ptr, xfer_size, stream);
+            if (ct2d->paired_case.qemu_cuda_calls_enabled) {
+                qemu_log("CXL TYPE2 TRACE copy_driver call_id=0x%016" PRIx64
+                         " direction=dtod bytes=%zu backend_result=%u "
+                         "implementation=async-direct stream_forwarded=1\n",
+                         ct2d->gpu_cmd.call_id, xfer_size,
+                         ct2d->gpu_cmd.cmd_result);
+            }
+        }
+        break;
+
     case CXL_GPU_CMD_MEM_COPY_2D_DTOD:
         {
             uint64_t dst_dev_ptr = ct2d->gpu_cmd.params[0];

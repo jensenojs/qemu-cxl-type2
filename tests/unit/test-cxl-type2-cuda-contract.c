@@ -280,7 +280,8 @@ static void test_batch_wire_layout_and_validation(void)
     uint8_t *payload = valid_batch_payload(&payload_bytes);
     CXLGPUBatchHtoDRange range;
 
-    g_assert_cmphex(CXL_GPU_VERSION, ==, UINT64_C(0x00011000));
+    g_assert_cmphex(CXL_GPU_VERSION, ==, UINT64_C(0x00011100));
+    g_assert_cmphex(CXL_GPU_CMD_MEM_COPY_DTOD_ASYNC, ==, 0x2f);
     g_assert_cmpuint(CXL_GPU_DESCRIPTOR_PROTOCOL_VERSION, ==, 1);
     g_assert_cmpuint(CXL_GPU_CASE_PROTOCOL_VERSION, ==, 1);
     g_assert_cmphex(CXL_GPU_BATCH_DATA_OFFSET, ==, UINT64_C(0x802000));

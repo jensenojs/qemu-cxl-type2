@@ -202,7 +202,7 @@ _Static_assert(CXL_GPU_BATCH_DATA_OFFSET >=
 
 /* Magic number */
 #define CXL_GPU_MAGIC               0x43584C32  /* "CXL2" */
-#define CXL_GPU_VERSION             0x00011000  /* v1.16.0: direct source */
+#define CXL_GPU_VERSION             0x00011100  /* v1.17.0: stream-aware DtoD async */
 
 #define CXL_GPU_STREAM_WIRE_NULL       0xffffffffffffffffULL
 #define CXL_GPU_STREAM_WIRE_LEGACY     0xfffffffffffffffeULL
@@ -266,6 +266,7 @@ typedef enum {
     CXL_GPU_CMD_SOURCE_REGISTER = 0x2C,
     CXL_GPU_CMD_SOURCE_UNREGISTER = 0x2D,
     CXL_GPU_CMD_BATCH_HTOD_DIRECT_ASYNC = 0x2E,
+    CXL_GPU_CMD_MEM_COPY_DTOD_ASYNC = 0x2F,
 
     CXL_GPU_CMD_MODULE_LOAD_PTX = 0x30,
     CXL_GPU_CMD_MODULE_UNLOAD   = 0x31,
