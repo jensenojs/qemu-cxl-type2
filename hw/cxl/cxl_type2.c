@@ -3123,6 +3123,7 @@ static bool cxl_type2_command_requires_formal_case(uint32_t cmd)
     case CXL_GPU_CMD_GET_DEVICE_ATTRIBUTE:
     case CXL_GPU_CMD_GET_ERROR_NAME:
     case CXL_GPU_CMD_GET_ERROR_STRING:
+    case CXL_GPU_CMD_OBSERVATION_ANCHOR:
     case CXL_GPU_CMD_MODULE_GET_LOADING_MODE:
     case CXL_GPU_CMD_CASE_BEGIN:
     case CXL_GPU_CMD_CASE_END:
@@ -5357,6 +5358,53 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
 
     switch (cmd) {
     case CXL_GPU_CMD_NOP:
+        break;
+
+    case CXL_GPU_CMD_OBSERVATION_ANCHOR:
+        if (ct2d->gpu_cmd.params[0] !=
+                CXL_GPU_OBSERVATION_ANCHOR_VERSION ||
+            (ct2d->gpu_cmd.params[1] !=
+                 CXL_GPU_OBSERVATION_ANCHOR_DECODE_BEGIN &&
+             ct2d->gpu_cmd.params[1] !=
+                 CXL_GPU_OBSERVATION_ANCHOR_DECODE_END) ||
+            (ct2d->paired_case.required &&
+             (ct2d->paired_case.active_case == CXL_GPU_CASE_NONE ||
+              ct2d->gpu_cmd.params[2] != ct2d->paired_case.active_epoch))) {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            break;
+        }
+        {
+            struct timespec monotonic_before;
+            struct timespec realtime;
+            struct timespec monotonic_after;
+
+            if (clock_gettime(CLOCK_MONOTONIC, &monotonic_before) != 0 ||
+                clock_gettime(CLOCK_REALTIME, &realtime) != 0 ||
+                clock_gettime(CLOCK_MONOTONIC, &monotonic_after) != 0) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_UNKNOWN;
+                break;
+            }
+            int64_t host_before_ns =
+                monotonic_before.tv_sec * NANOSECONDS_PER_SECOND +
+                monotonic_before.tv_nsec;
+            int64_t host_realtime_ns =
+                realtime.tv_sec * NANOSECONDS_PER_SECOND + realtime.tv_nsec;
+            int64_t host_after_ns =
+                monotonic_after.tv_sec * NANOSECONDS_PER_SECOND +
+                monotonic_after.tv_nsec;
+
+            if (host_before_ns <= 0 || host_realtime_ns <= 0 ||
+                host_after_ns < host_before_ns) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_UNKNOWN;
+                break;
+            }
+            ct2d->gpu_cmd.results[0] =
+                host_before_ns + (host_after_ns - host_before_ns) / 2;
+            ct2d->gpu_cmd.results[1] = host_realtime_ns;
+            ct2d->gpu_cmd.results[2] =
+                (host_after_ns - host_before_ns + 1) / 2;
+            ct2d->gpu_cmd.results[3] = CXL_GPU_OBSERVATION_ANCHOR_VERSION;
+        }
         break;
 
     case CXL_GPU_CMD_INIT:
@@ -8024,7 +8072,8 @@ complete:
     ct2d->gpu_cmd.cmd_status = CXL_GPU_CMD_STATUS_COMPLETE;
     int64_t trace_end_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
     int64_t trace_duration_ns = trace_end_ns - trace_start_ns;
-    if (cmd != CXL_GPU_CMD_CASE_BEGIN && cmd != CXL_GPU_CMD_CASE_END) {
+    if (cmd != CXL_GPU_CMD_CASE_BEGIN && cmd != CXL_GPU_CMD_CASE_END &&
+        cmd != CXL_GPU_CMD_OBSERVATION_ANCHOR) {
         cxl_type2_record_case_command(ct2d, cmd, trace_sequence, trace_start_ns,
                                       trace_end_ns, ct2d->gpu_cmd.cmd_result);
     }

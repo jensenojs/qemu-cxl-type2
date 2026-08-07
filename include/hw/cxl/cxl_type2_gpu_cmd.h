@@ -202,13 +202,19 @@ _Static_assert(CXL_GPU_BATCH_DATA_OFFSET >=
 
 /* Magic number */
 #define CXL_GPU_MAGIC               0x43584C32  /* "CXL2" */
-#define CXL_GPU_VERSION             0x00011100  /* v1.17.0: stream-aware DtoD async */
+#define CXL_GPU_VERSION             0x00011200  /* v1.18.0: cross-clock observation anchors */
 
 #define CXL_GPU_STREAM_WIRE_NULL       0xffffffffffffffffULL
 #define CXL_GPU_STREAM_WIRE_LEGACY     0xfffffffffffffffeULL
 #define CXL_GPU_STREAM_WIRE_PER_THREAD 0xfffffffffffffffdULL
 
 #define CXL_GPU_CASE_PROTOCOL_VERSION 1U
+#define CXL_GPU_OBSERVATION_ANCHOR_VERSION 1U
+
+typedef enum {
+    CXL_GPU_OBSERVATION_ANCHOR_DECODE_BEGIN = 1,
+    CXL_GPU_OBSERVATION_ANCHOR_DECODE_END = 2,
+} CXLGPUObservationAnchorPhase;
 
 typedef enum {
     CXL_GPU_CASE_NONE = 0,
@@ -242,6 +248,7 @@ typedef enum {
     CXL_GPU_CMD_CASE_BEGIN      = 0x08,
     CXL_GPU_CMD_CASE_END        = 0x09,
     CXL_GPU_CMD_GET_ERROR_NAME  = 0x0A,
+    CXL_GPU_CMD_OBSERVATION_ANCHOR = 0x0B,
 
     CXL_GPU_CMD_CTX_CREATE      = 0x10,
     CXL_GPU_CMD_CTX_DESTROY     = 0x11,
