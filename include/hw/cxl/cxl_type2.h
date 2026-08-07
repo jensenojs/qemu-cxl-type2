@@ -240,6 +240,7 @@ typedef struct CXLType2DirectSource {
     uint32_t range_count;
     uint32_t run_count;
     uint64_t pending_refcount;
+    bool auto_unregister;
     struct CXLType2DirectSource *next;
 } CXLType2DirectSource;
 
@@ -436,6 +437,13 @@ typedef struct CXLType2State {
         uint64_t active_direct_registration_views;
         uint64_t active_direct_registration_bytes;
         uint64_t active_direct_registration_padding_bytes;
+        uint64_t active_direct_registration_min_bytes;
+        uint64_t active_direct_registration_max_bytes;
+        uint64_t active_direct_registration_le_2m_calls;
+        uint64_t active_direct_registration_2m_4m_calls;
+        uint64_t active_direct_registration_4m_16m_calls;
+        uint64_t active_direct_registration_16m_64m_calls;
+        uint64_t active_direct_registration_gt_64m_calls;
         uint64_t active_direct_registration_groups;
         uint64_t active_direct_group_members;
         uint64_t active_direct_max_group_members;

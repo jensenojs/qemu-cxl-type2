@@ -2743,6 +2743,13 @@ static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
     ct2d->paired_case.active_direct_registration_views = 0;
     ct2d->paired_case.active_direct_registration_bytes = 0;
     ct2d->paired_case.active_direct_registration_padding_bytes = 0;
+    ct2d->paired_case.active_direct_registration_min_bytes = 0;
+    ct2d->paired_case.active_direct_registration_max_bytes = 0;
+    ct2d->paired_case.active_direct_registration_le_2m_calls = 0;
+    ct2d->paired_case.active_direct_registration_2m_4m_calls = 0;
+    ct2d->paired_case.active_direct_registration_4m_16m_calls = 0;
+    ct2d->paired_case.active_direct_registration_16m_64m_calls = 0;
+    ct2d->paired_case.active_direct_registration_gt_64m_calls = 0;
     ct2d->paired_case.active_direct_registration_groups = 0;
     ct2d->paired_case.active_direct_group_members = 0;
     ct2d->paired_case.active_direct_max_group_members = 0;
@@ -2965,12 +2972,18 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             live_registration_groups++;
         }
         qemu_log(
-            "KIMI_DIRECT_SOURCE_SUMMARY schema=direct-source-summary-v5"
+            "KIMI_DIRECT_SOURCE_SUMMARY schema=direct-source-summary-v6"
             " run_binding=%" PRIu64 " case=%s case_epoch=%" PRIu64
             " policy_enabled=%u register_calls=%" PRIu64
             " register_busy_ns=%" PRIu64
+            " legacy_register_calls=%" PRIu64
+            " legacy_register_busy_ns=%" PRIu64
+            " fused_register_batch_calls=%" PRIu64
+            " fused_register_batch_busy_ns=%" PRIu64
             " unregister_calls=%" PRIu64
             " unregister_busy_ns=%" PRIu64
+            " direct_batch_calls=%" PRIu64
+            " direct_batch_busy_ns=%" PRIu64
             " driver_register_calls=%" PRIu64
             " driver_register_ns=%" PRIu64
             " driver_unregister_calls=%" PRIu64
@@ -2985,6 +2998,13 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             " registration_views=%" PRIu64
             " registration_bytes=%" PRIu64
             " registration_padding_bytes=%" PRIu64
+            " registration_min_bytes=%" PRIu64
+            " registration_max_bytes=%" PRIu64
+            " registration_le_2m_calls=%" PRIu64
+            " registration_2m_4m_calls=%" PRIu64
+            " registration_4m_16m_calls=%" PRIu64
+            " registration_16m_64m_calls=%" PRIu64
+            " registration_gt_64m_calls=%" PRIu64
             " registration_tile_size=%" PRIu64
             " registration_padding_limit=%" PRIu64
             " retained_registration_padding_bytes=%" PRIu64
@@ -3011,9 +3031,16 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             run_binding, cxl_type2_paired_case_name(case_kind), epoch,
             ct2d->cuda_direct_source,
             ct2d->paired_case.active_direct_register_calls,
+            busy[CXL_GPU_CMD_SOURCE_REGISTER] +
+                busy[CXL_GPU_CMD_SOURCE_REGISTER_BATCH_HTOD_DIRECT_ASYNC],
+            calls[CXL_GPU_CMD_SOURCE_REGISTER],
             busy[CXL_GPU_CMD_SOURCE_REGISTER],
+            calls[CXL_GPU_CMD_SOURCE_REGISTER_BATCH_HTOD_DIRECT_ASYNC],
+            busy[CXL_GPU_CMD_SOURCE_REGISTER_BATCH_HTOD_DIRECT_ASYNC],
             ct2d->paired_case.active_direct_unregister_calls,
             busy[CXL_GPU_CMD_SOURCE_UNREGISTER],
+            calls[CXL_GPU_CMD_BATCH_HTOD_DIRECT_ASYNC],
+            busy[CXL_GPU_CMD_BATCH_HTOD_DIRECT_ASYNC],
             driver_calls[CXL_GPU_CMD_SOURCE_REGISTER],
             driver_busy[CXL_GPU_CMD_SOURCE_REGISTER],
             driver_calls[CXL_GPU_CMD_SOURCE_UNREGISTER],
@@ -3028,6 +3055,13 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             ct2d->paired_case.active_direct_registration_views,
             ct2d->paired_case.active_direct_registration_bytes,
             ct2d->paired_case.active_direct_registration_padding_bytes,
+            ct2d->paired_case.active_direct_registration_min_bytes,
+            ct2d->paired_case.active_direct_registration_max_bytes,
+            ct2d->paired_case.active_direct_registration_le_2m_calls,
+            ct2d->paired_case.active_direct_registration_2m_4m_calls,
+            ct2d->paired_case.active_direct_registration_4m_16m_calls,
+            ct2d->paired_case.active_direct_registration_16m_64m_calls,
+            ct2d->paired_case.active_direct_registration_gt_64m_calls,
             ct2d->direct_registration_tile_size,
             ct2d->direct_registration_padding_limit,
             ct2d->direct_registration_padding_bytes,
@@ -3499,6 +3533,26 @@ static int cxl_type2_direct_registration_ensure(
             registration->length;
         ct2d->paired_case.active_direct_registration_padding_bytes +=
             registration->padding_bytes;
+        if (!ct2d->paired_case.active_direct_registration_min_bytes ||
+            registration->length <
+                ct2d->paired_case.active_direct_registration_min_bytes) {
+            ct2d->paired_case.active_direct_registration_min_bytes =
+                registration->length;
+        }
+        ct2d->paired_case.active_direct_registration_max_bytes = MAX(
+            ct2d->paired_case.active_direct_registration_max_bytes,
+            registration->length);
+        if (registration->length <= 2 * MiB) {
+            ct2d->paired_case.active_direct_registration_le_2m_calls++;
+        } else if (registration->length <= 4 * MiB) {
+            ct2d->paired_case.active_direct_registration_2m_4m_calls++;
+        } else if (registration->length <= 16 * MiB) {
+            ct2d->paired_case.active_direct_registration_4m_16m_calls++;
+        } else if (registration->length <= 64 * MiB) {
+            ct2d->paired_case.active_direct_registration_16m_64m_calls++;
+        } else {
+            ct2d->paired_case.active_direct_registration_gt_64m_calls++;
+        }
         ct2d->paired_case.active_direct_registration_groups++;
         ct2d->paired_case.active_direct_group_members +=
             registration->member_count;
@@ -4318,15 +4372,17 @@ static int cxl_type2_direct_span_submit(
 
 static bool cxl_type2_direct_range_is_valid(
     CXLType2State *ct2d, const CXLGPUDirectRangeV1 *wire,
+    CXLType2DirectSource *source_override,
     CXLType2DirectSource **source_out)
 {
-    CXLType2DirectSource *source = cxl_type2_direct_source_find(
-        ct2d, wire->source_id);
+    CXLType2DirectSource *source = source_override ? source_override :
+        cxl_type2_direct_source_find(ct2d, wire->source_id);
     CXLGPUSourceRangeV1 *range;
     uint64_t skip;
     uint64_t remaining;
 
-    if (!source || source->case_epoch != ct2d->paired_case.active_epoch ||
+    if ((source_override && wire->source_id) || !source ||
+        source->case_epoch != ct2d->paired_case.active_epoch ||
         wire->source_range >= source->range_count) {
         return false;
     }
@@ -4361,10 +4417,13 @@ static bool cxl_type2_direct_range_is_valid(
 }
 
 static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
-                                         uint64_t range_count,
-                                         uint64_t payload_bytes,
-                                         void *stream,
-                                         uint64_t *fail_index,
+                                          const uint8_t *payload,
+                                          uint64_t payload_capacity,
+                                          uint64_t range_count,
+                                          uint64_t payload_bytes,
+                                          void *stream,
+                                          CXLType2DirectSource *source_override,
+                                          uint64_t *fail_index,
                                          uint64_t *logical_enqueued,
                                          uint64_t *fragments_enqueued)
 {
@@ -4373,7 +4432,6 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
         CXLType2DirectSource *source;
     } CXLType2DirectResolvedRange;
 
-    const uint8_t *payload = ct2d->gpu_cmd.batch_data;
     CXLType2DirectResolvedRange *resolved = NULL;
     int result = CXL_GPU_SUCCESS;
 
@@ -4381,7 +4439,7 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
     *fragments_enqueued = 0;
     if (!ct2d->cuda_direct_source || ct2d->direct_source_poisoned ||
         !cxl_gpu_direct_batch_validate(
-            payload, CXL_GPU_BATCH_DATA_SIZE, range_count, payload_bytes,
+            payload, payload_capacity, range_count, payload_bytes,
             fail_index)) {
         return CXL_GPU_ERROR_INVALID_VALUE;
     }
@@ -4396,7 +4454,8 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
                payload + i * sizeof(resolved[i].wire),
                sizeof(resolved[i].wire));
         if (!cxl_type2_direct_range_is_valid(
-                ct2d, &resolved[i].wire, &resolved[i].source)) {
+                ct2d, &resolved[i].wire, source_override,
+                &resolved[i].source)) {
             *fail_index = i;
             result = CXL_GPU_ERROR_INVALID_VALUE;
             goto out;
@@ -4693,9 +4752,15 @@ static int cxl_type2_release_pending_htod(CXLType2State *ct2d,
         int result;
 
         if (pending->direct_source) {
+            CXLType2DirectSource *source = pending->source;
+
             g_assert(pending->source && pending->source->pending_refcount > 0);
-            pending->source->pending_refcount--;
+            source->pending_refcount--;
             result = CXL_GPU_SUCCESS;
+            if (!source->pending_refcount && source->auto_unregister) {
+                result = cxl_type2_direct_source_unregister(
+                    ct2d, source->source_id);
+            }
         } else {
             result = cxl_type2_htod_staging_release(
                 ct2d, pending->staging, pending->staging_capacity,
@@ -7688,6 +7753,66 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         }
         break;
 
+    case CXL_GPU_CMD_SOURCE_REGISTER_BATCH_HTOD_DIRECT_ASYNC:
+        {
+            uint64_t register_bytes = ct2d->gpu_cmd.params[0];
+            uint64_t range_count = ct2d->gpu_cmd.params[1];
+            uint64_t direct_bytes;
+            uint64_t source_id = 0;
+            uint64_t fail_idx = SIZE_MAX;
+            uint64_t logical_enqueued = 0;
+            uint64_t fragments_enqueued = 0;
+            const char *failure_stage = NULL;
+            void *stream = NULL;
+
+            ct2d->gpu_cmd.results[0] = SIZE_MAX;
+            if (!hetgpu->initialized || !ct2d->gpu_cmd.batch_data ||
+                range_count > UINT64_MAX / sizeof(CXLGPUDirectRangeV1) ||
+                register_bytes > CXL_GPU_BATCH_DATA_SIZE ||
+                !cxl_type2_stream_from_wire(ct2d, ct2d->gpu_cmd.params[2],
+                                            &stream)) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                break;
+            }
+            direct_bytes = range_count * sizeof(CXLGPUDirectRangeV1);
+            if (direct_bytes > CXL_GPU_BATCH_DATA_SIZE - register_bytes) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                break;
+            }
+            ct2d->gpu_cmd.cmd_result = cxl_type2_direct_source_register(
+                ct2d, register_bytes, &source_id, &failure_stage, &fail_idx);
+            if (ct2d->gpu_cmd.cmd_result != CXL_GPU_SUCCESS) {
+                ct2d->gpu_cmd.results[0] = fail_idx;
+                break;
+            }
+            CXLType2DirectSource *source = cxl_type2_direct_source_find(
+                ct2d, source_id);
+
+            g_assert(source);
+            source->auto_unregister = true;
+            ct2d->paired_case.active_direct_register_calls++;
+            ct2d->gpu_cmd.cmd_result = cxl_type2_direct_batch_submit(
+                ct2d, ct2d->gpu_cmd.batch_data + register_bytes,
+                CXL_GPU_BATCH_DATA_SIZE - register_bytes, range_count,
+                direct_bytes, stream, source, &fail_idx, &logical_enqueued,
+                &fragments_enqueued);
+            ct2d->gpu_cmd.results[0] = fail_idx;
+            ct2d->gpu_cmd.results[1] = logical_enqueued;
+            ct2d->gpu_cmd.results[2] = fragments_enqueued;
+            ct2d->paired_case.active_direct_logical_ranges +=
+                logical_enqueued;
+            if (!source->pending_refcount) {
+                int cleanup = cxl_type2_direct_source_unregister(
+                    ct2d, source_id);
+
+                if (ct2d->gpu_cmd.cmd_result == CXL_GPU_SUCCESS &&
+                    cleanup != CXL_GPU_SUCCESS) {
+                    ct2d->gpu_cmd.cmd_result = cleanup;
+                }
+            }
+        }
+        break;
+
     case CXL_GPU_CMD_BATCH_HTOD_DIRECT_ASYNC:
         {
             uint64_t fail_idx = SIZE_MAX;
@@ -7707,8 +7832,9 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 break;
             }
             ct2d->gpu_cmd.cmd_result = cxl_type2_direct_batch_submit(
-                ct2d, ct2d->gpu_cmd.params[0], ct2d->gpu_cmd.params[1],
-                stream, &fail_idx, &logical_enqueued, &fragments_enqueued);
+                ct2d, ct2d->gpu_cmd.batch_data, CXL_GPU_BATCH_DATA_SIZE,
+                ct2d->gpu_cmd.params[0], ct2d->gpu_cmd.params[1], stream,
+                NULL, &fail_idx, &logical_enqueued, &fragments_enqueued);
             ct2d->gpu_cmd.results[0] = fail_idx;
             ct2d->gpu_cmd.results[1] = logical_enqueued;
             ct2d->gpu_cmd.results[2] = fragments_enqueued;
