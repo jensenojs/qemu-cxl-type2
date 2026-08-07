@@ -3723,6 +3723,18 @@ static CXLType2DirectPhysical *cxl_type2_direct_pending_find_at_or_after(
     return candidate;
 }
 
+static gint cxl_type2_direct_physical_host_compare(gconstpointer a,
+                                                    gconstpointer b)
+{
+    const CXLType2DirectPhysical *left =
+        *(CXLType2DirectPhysical * const *)a;
+    const CXLType2DirectPhysical *right =
+        *(CXLType2DirectPhysical * const *)b;
+
+    return cxl_gpu_direct_host_address_order(
+        (uintptr_t)left->host_address, (uintptr_t)right->host_address);
+}
+
 static int cxl_type2_direct_source_register(CXLType2State *ct2d,
                                             uint64_t payload_bytes,
                                             uint64_t *source_id_out,
@@ -3937,6 +3949,9 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
             i = group_end;
         }
 
+        /* Logical range order does not define the host DAX layout. */
+        g_ptr_array_sort(pending, cxl_type2_direct_physical_host_compare);
+
         /* Adjacent pinned mappings share one lazy Driver registration. */
         for (guint first = 0; first < pending->len;) {
             CXLType2DirectPhysical *member = g_ptr_array_index(pending, first);
@@ -3949,10 +3964,9 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
                 CXLType2DirectPhysical *next =
                     g_ptr_array_index(pending, end);
 
-                if (registration_length > UINTPTR_MAX - base ||
-                    (uintptr_t)next->host_address !=
-                        base + registration_length ||
-                    next->length > UINT64_MAX - registration_length) {
+                if (!cxl_gpu_direct_host_range_follows(
+                        base, registration_length,
+                        (uintptr_t)next->host_address, next->length)) {
                     break;
                 }
                 registration_length += next->length;

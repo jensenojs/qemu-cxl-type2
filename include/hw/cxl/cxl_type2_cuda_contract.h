@@ -71,5 +71,8 @@ bool cxl_gpu_direct_batch_validate(const uint8_t *payload,
                                    uint64_t range_count,
                                    uint64_t payload_bytes,
                                    uint64_t *fail_index);
+int cxl_gpu_direct_host_address_order(uintptr_t left, uintptr_t right);
+bool cxl_gpu_direct_host_range_follows(uintptr_t base, uint64_t length,
+                                       uintptr_t next, uint64_t next_length);
 
 #endif

@@ -441,6 +441,22 @@ static void test_direct_batch_wire_validation(void)
     g_assert_cmpuint(fail_index, ==, 1);
 }
 
+static void test_direct_host_range_order_and_adjacency(void)
+{
+    g_assert_cmpint(cxl_gpu_direct_host_address_order(0x2000, 0x1000), >, 0);
+    g_assert_cmpint(cxl_gpu_direct_host_address_order(0x1000, 0x2000), <, 0);
+    g_assert_cmpint(cxl_gpu_direct_host_address_order(0x1000, 0x1000), ==, 0);
+
+    g_assert_true(cxl_gpu_direct_host_range_follows(
+        0x1000, 0x1000, 0x2000, 0x800));
+    g_assert_false(cxl_gpu_direct_host_range_follows(
+        0x1000, 0x1000, 0x3000, 0x800));
+    g_assert_false(cxl_gpu_direct_host_range_follows(
+        UINTPTR_MAX - 0x7ff, 0x1000, 0x800, 0x800));
+    g_assert_false(cxl_gpu_direct_host_range_follows(
+        0x1000, 0x1000, 0x2000, UINT64_MAX));
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -472,5 +488,7 @@ int main(int argc, char **argv)
                     test_direct_source_wire_validation);
     g_test_add_func("/cxl/type2/direct/batch-wire",
                     test_direct_batch_wire_validation);
+    g_test_add_func("/cxl/type2/direct/host-range-layout",
+                    test_direct_host_range_order_and_adjacency);
     return g_test_run();
 }

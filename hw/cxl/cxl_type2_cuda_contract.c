@@ -98,6 +98,18 @@ bool cxl_type2_cuda_attribute_wire_is_valid(uint64_t wire_value)
     return cxl_type2_cuda_decode_attribute(wire_value, &attribute);
 }
 
+int cxl_gpu_direct_host_address_order(uintptr_t left, uintptr_t right)
+{
+    return left < right ? -1 : left > right;
+}
+
+bool cxl_gpu_direct_host_range_follows(uintptr_t base, uint64_t length,
+                                       uintptr_t next, uint64_t next_length)
+{
+    return length <= UINTPTR_MAX - base && next == base + length &&
+           next_length <= UINT64_MAX - length;
+}
+
 bool cxl_type2_cuda_mem_info_is_allowed(bool active_case, bool live_context,
                                         uint64_t token, uint64_t active_epoch)
 {
