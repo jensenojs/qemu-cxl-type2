@@ -508,7 +508,7 @@ bool cxl_gpu_direct_batch_validate(const uint8_t *payload,
         CXLGPUDirectRangeV1 range;
 
         memcpy(&range, payload + i * sizeof(range), sizeof(range));
-        if (!range.size || !range.source_id || range.reserved0 ||
+        if (!range.size || range.reserved0 ||
             range.destination > UINT64_MAX - range.size ||
             range.source_offset > UINT64_MAX - range.size) {
             *fail_index = i;

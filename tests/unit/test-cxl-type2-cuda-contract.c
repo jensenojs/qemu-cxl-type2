@@ -436,6 +436,12 @@ static void test_direct_batch_wire_validation(void)
         (const uint8_t *)ranges, sizeof(ranges), G_N_ELEMENTS(ranges),
         sizeof(ranges), &fail_index));
     g_assert_cmpuint(fail_index, ==, SIZE_MAX);
+    ranges[0].source_id = 0;
+    g_assert_true(cxl_gpu_direct_batch_validate(
+        (const uint8_t *)ranges, sizeof(ranges), G_N_ELEMENTS(ranges),
+        sizeof(ranges), &fail_index));
+    g_assert_cmpuint(fail_index, ==, SIZE_MAX);
+    ranges[0].source_id = 3;
     ranges[1].reserved0 = 1;
     g_assert_false(cxl_gpu_direct_batch_validate(
         (const uint8_t *)ranges, sizeof(ranges), G_N_ELEMENTS(ranges),
