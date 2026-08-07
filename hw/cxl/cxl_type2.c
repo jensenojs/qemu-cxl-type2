@@ -3343,11 +3343,14 @@ static gint cxl_type2_direct_physical_range_compare(gconstpointer a,
 
 static void cxl_type2_direct_indexes_ensure(CXLType2State *ct2d)
 {
-    if (ct2d->direct_physical_ranges) {
-        return;
+    if (!ct2d->direct_physical_ranges) {
+        ct2d->direct_physical_ranges = g_tree_new_full(
+            cxl_type2_direct_physical_range_compare, NULL, NULL, NULL);
     }
-    ct2d->direct_physical_ranges = g_tree_new_full(
-        cxl_type2_direct_physical_range_compare, NULL, NULL, NULL);
+    if (!ct2d->direct_source_ids) {
+        ct2d->direct_source_ids = g_hash_table_new(
+            g_int64_hash, g_int64_equal);
+    }
 }
 
 typedef struct CXLType2DirectPhysicalSearch {
@@ -3601,19 +3604,15 @@ static int cxl_type2_direct_physicals_cleanup(CXLType2State *ct2d)
 static void cxl_type2_direct_indexes_destroy(CXLType2State *ct2d)
 {
     g_clear_pointer(&ct2d->direct_physical_ranges, g_tree_destroy);
+    g_clear_pointer(&ct2d->direct_source_ids, g_hash_table_destroy);
 }
 
 static CXLType2DirectSource *cxl_type2_direct_source_find(
     CXLType2State *ct2d, uint64_t source_id)
 {
-    CXLType2DirectSource *source;
-
-    for (source = ct2d->direct_sources; source; source = source->next) {
-        if (source->source_id == source_id) {
-            return source;
-        }
-    }
-    return NULL;
+    return ct2d->direct_source_ids
+               ? g_hash_table_lookup(ct2d->direct_source_ids, &source_id)
+               : NULL;
 }
 
 static int cxl_type2_direct_source_unregister(CXLType2State *ct2d,
@@ -3653,6 +3652,11 @@ static int cxl_type2_direct_source_unregister(CXLType2State *ct2d,
     if (first_error != CXL_GPU_SUCCESS) {
         return first_error;
     }
+    bool removed = g_hash_table_remove(ct2d->direct_source_ids,
+                                       &source->source_id);
+
+    g_assert(removed);
+    (void)removed;
     *cursor = source->next;
     g_free(source->ranges);
     g_free(source->runs);
@@ -4220,6 +4224,11 @@ views_done:
     source->source_id = ++ct2d->next_direct_source_id;
     source->next = ct2d->direct_sources;
     ct2d->direct_sources = source;
+    bool inserted = g_hash_table_insert(ct2d->direct_source_ids,
+                                        &source->source_id, source);
+
+    g_assert(inserted);
+    (void)inserted;
     *source_id_out = source->source_id;
     g_free(validated);
     ct2d->paired_case.active_direct_register_commit_ns +=
@@ -4345,7 +4354,14 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
                                          uint64_t *logical_enqueued,
                                          uint64_t *fragments_enqueued)
 {
+    typedef struct CXLType2DirectResolvedRange {
+        CXLGPUDirectRangeV1 wire;
+        CXLType2DirectSource *source;
+    } CXLType2DirectResolvedRange;
+
     const uint8_t *payload = ct2d->gpu_cmd.batch_data;
+    CXLType2DirectResolvedRange *resolved = NULL;
+    int result = CXL_GPU_SUCCESS;
 
     *logical_enqueued = 0;
     *fragments_enqueued = 0;
@@ -4355,37 +4371,40 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
             fail_index)) {
         return CXL_GPU_ERROR_INVALID_VALUE;
     }
+    resolved = g_try_new(CXLType2DirectResolvedRange, range_count);
+    if (!resolved) {
+        result = CXL_GPU_ERROR_OUT_OF_MEMORY;
+        goto out;
+    }
     /* Resolve every source and range before the first Driver enqueue. */
     for (uint64_t i = 0; i < range_count; i++) {
-        CXLGPUDirectRangeV1 wire;
-        CXLType2DirectSource *source;
-
-        memcpy(&wire, payload + i * sizeof(wire), sizeof(wire));
-        if (!cxl_type2_direct_range_is_valid(ct2d, &wire, &source)) {
+        memcpy(&resolved[i].wire,
+               payload + i * sizeof(resolved[i].wire),
+               sizeof(resolved[i].wire));
+        if (!cxl_type2_direct_range_is_valid(
+                ct2d, &resolved[i].wire, &resolved[i].source)) {
             *fail_index = i;
-            return CXL_GPU_ERROR_INVALID_VALUE;
+            result = CXL_GPU_ERROR_INVALID_VALUE;
+            goto out;
         }
     }
 
     for (uint64_t i = 0; i < range_count; i++) {
-        CXLGPUDirectRangeV1 wire;
-        CXLType2DirectSource *source;
+        CXLGPUDirectRangeV1 *wire = &resolved[i].wire;
+        CXLType2DirectSource *source = resolved[i].source;
         CXLGPUSourceRangeV1 *range;
         uint64_t skip;
         uint64_t remaining;
         uint64_t copied = 0;
 
-        memcpy(&wire, payload + i * sizeof(wire), sizeof(wire));
-        g_assert(cxl_type2_direct_range_is_valid(ct2d, &wire, &source));
-        range = &source->ranges[wire.source_range];
-        skip = range->first_run_byte_offset + wire.source_offset;
-        remaining = wire.size;
+        range = &source->ranges[wire->source_range];
+        skip = range->first_run_byte_offset + wire->source_offset;
+        remaining = wire->size;
         for (uint32_t j = 0; j < range->run_count && remaining; j++) {
             CXLType2DirectRun *run =
                 &source->runs[range->first_run + j];
             CXLType2DirectPhysical *physical = run->physical;
             uint64_t chunk;
-            int result;
 
             if (skip >= run->length) {
                 skip -= run->length;
@@ -4396,17 +4415,17 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
                 ct2d, physical->registration);
             if (result != CXL_GPU_SUCCESS) {
                 *fail_index = i;
-                return result;
+                goto out;
             }
             result = cxl_type2_enqueue_htod_direct(
-                ct2d, wire.destination + copied,
+                ct2d, wire->destination + copied,
                 (const uint8_t *)physical->host_address +
                     run->physical_offset + skip,
                 chunk,
                 stream, source);
             if (result != CXL_GPU_SUCCESS) {
                 *fail_index = i;
-                return result;
+                goto out;
             }
             (*fragments_enqueued)++;
             copied += chunk;
@@ -4416,7 +4435,9 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
         (*logical_enqueued)++;
     }
     *fail_index = SIZE_MAX;
-    return CXL_GPU_SUCCESS;
+out:
+    g_free(resolved);
+    return result;
 }
 
 static int cxl_type2_enqueue_htod_from_host(CXLType2State *ct2d,

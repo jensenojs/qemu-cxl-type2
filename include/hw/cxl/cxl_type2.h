@@ -379,6 +379,7 @@ typedef struct CXLType2State {
     CXLType2DirectRegistration *direct_registrations;
     GTree *direct_physical_ranges;
     CXLType2DirectSource *direct_sources;
+    GHashTable *direct_source_ids;
     uint64_t next_direct_source_id;
     bool direct_source_poisoned;
 
