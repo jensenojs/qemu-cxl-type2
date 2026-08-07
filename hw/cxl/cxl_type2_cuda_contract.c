@@ -98,6 +98,55 @@ bool cxl_type2_cuda_attribute_wire_is_valid(uint64_t wire_value)
     return cxl_type2_cuda_decode_attribute(wire_value, &attribute);
 }
 
+bool cxl_type2_cuda_stream_progress_wire(uint32_t command,
+                                         const uint64_t params[8],
+                                         uint64_t *stream_wire)
+{
+    unsigned int parameter;
+
+    if (!params || !stream_wire) {
+        return false;
+    }
+    switch (command) {
+    case CXL_GPU_CMD_MEM_COPY_HTOD_ASYNC:
+    case CXL_GPU_CMD_BATCH_HTOD_ASYNC:
+    case CXL_GPU_CMD_BATCH_HTOD_DIRECT_ASYNC:
+    case CXL_GPU_CMD_SOURCE_REGISTER_BATCH_HTOD_DIRECT_ASYNC:
+        parameter = 2;
+        break;
+    case CXL_GPU_CMD_MEM_COPY_DTOD_ASYNC:
+    case CXL_GPU_CMD_MEM_PREFETCH_ASYNC:
+    case CXL_GPU_CMD_BULK_HTOD_ASYNC:
+        parameter = 3;
+        break;
+    case CXL_GPU_CMD_GRAPH_LAUNCH:
+    case CXL_GPU_CMD_EVENT_RECORD:
+        parameter = 1;
+        break;
+    case CXL_GPU_CMD_LAUNCH_KERNEL:
+        parameter = 6;
+        break;
+    case CXL_GPU_CMD_STREAM_WAIT_EVENT:
+    case CXL_GPU_CMD_STREAM_WAIT_VALUE32:
+    case CXL_GPU_CMD_STREAM_BATCH_MEM_OP:
+    case CXL_GPU_CMD_STREAM_BEGIN_CAPTURE:
+    case CXL_GPU_CMD_STREAM_END_CAPTURE:
+        parameter = 0;
+        break;
+    default:
+        return false;
+    }
+    *stream_wire = params[parameter];
+    return true;
+}
+
+bool cxl_type2_cuda_stream_sync_can_elide(bool has_successful_sync,
+                                          uint64_t work_generation,
+                                          uint64_t synced_generation)
+{
+    return has_successful_sync && work_generation == synced_generation;
+}
+
 int cxl_gpu_direct_host_address_order(uintptr_t left, uintptr_t right)
 {
     return left < right ? -1 : left > right;

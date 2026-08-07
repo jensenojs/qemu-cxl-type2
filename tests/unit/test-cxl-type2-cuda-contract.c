@@ -528,6 +528,39 @@ static void test_direct_registration_tile_end(void)
                      ==, UINT64_MAX);
 }
 
+static void test_stream_progress_classification(void)
+{
+    uint64_t params[8] = { 11, 12, 13, 14, 15, 16, 17, 18 };
+    uint64_t stream_wire = 0;
+
+    g_assert_true(cxl_type2_cuda_stream_progress_wire(
+        CXL_GPU_CMD_MEM_COPY_HTOD_ASYNC, params, &stream_wire));
+    g_assert_cmpuint(stream_wire, ==, 13);
+    g_assert_true(cxl_type2_cuda_stream_progress_wire(
+        CXL_GPU_CMD_MEM_COPY_DTOD_ASYNC, params, &stream_wire));
+    g_assert_cmpuint(stream_wire, ==, 14);
+    g_assert_true(cxl_type2_cuda_stream_progress_wire(
+        CXL_GPU_CMD_GRAPH_LAUNCH, params, &stream_wire));
+    g_assert_cmpuint(stream_wire, ==, 12);
+    g_assert_true(cxl_type2_cuda_stream_progress_wire(
+        CXL_GPU_CMD_LAUNCH_KERNEL, params, &stream_wire));
+    g_assert_cmpuint(stream_wire, ==, 17);
+    g_assert_true(cxl_type2_cuda_stream_progress_wire(
+        CXL_GPU_CMD_STREAM_WAIT_EVENT, params, &stream_wire));
+    g_assert_cmpuint(stream_wire, ==, 11);
+    g_assert_false(cxl_type2_cuda_stream_progress_wire(
+        CXL_GPU_CMD_MEM_ALLOC, params, &stream_wire));
+    g_assert_false(cxl_type2_cuda_stream_progress_wire(
+        CXL_GPU_CMD_MEM_COPY_HTOD_ASYNC, NULL, &stream_wire));
+}
+
+static void test_stream_sync_requires_unchanged_work_generation(void)
+{
+    g_assert_false(cxl_type2_cuda_stream_sync_can_elide(false, 0, 0));
+    g_assert_true(cxl_type2_cuda_stream_sync_can_elide(true, 7, 7));
+    g_assert_false(cxl_type2_cuda_stream_sync_can_elide(true, 8, 7));
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -567,5 +600,9 @@ int main(int argc, char **argv)
                     test_direct_registration_tile_bounds);
     g_test_add_func("/cxl/type2/direct/registration-tile-end",
                     test_direct_registration_tile_end);
+    g_test_add_func("/cxl/type2/stream/progress-classification",
+                    test_stream_progress_classification);
+    g_test_add_func("/cxl/type2/stream/sync-generation",
+                    test_stream_sync_requires_unchanged_work_generation);
     return g_test_run();
 }
