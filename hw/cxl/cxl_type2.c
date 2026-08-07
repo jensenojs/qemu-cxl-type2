@@ -3419,17 +3419,19 @@ static int cxl_type2_direct_registration_release(
     int result;
 
     g_assert(registration && registration->references == 0);
-    begin_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
-    result = hetgpu_cuda_mem_host_unregister(hetgpu,
-                                              registration->host_address);
-    ct2d->paired_case.active_direct_physical_unregister_calls++;
-    ct2d->paired_case.active_direct_physical_unregister_ns +=
-        qemu_clock_get_ns(QEMU_CLOCK_HOST) - begin_ns;
-    if (result != CXL_GPU_SUCCESS) {
-        ct2d->direct_source_poisoned = true;
-        return result;
+    if (registration->cuda_registered) {
+        begin_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+        result = hetgpu_cuda_mem_host_unregister(
+            hetgpu, registration->host_address);
+        ct2d->paired_case.active_direct_physical_unregister_calls++;
+        ct2d->paired_case.active_direct_physical_unregister_ns +=
+            qemu_clock_get_ns(QEMU_CLOCK_HOST) - begin_ns;
+        if (result != CXL_GPU_SUCCESS) {
+            ct2d->direct_source_poisoned = true;
+            return result;
+        }
+        registration->cuda_registered = false;
     }
-    registration->cuda_registered = false;
     physical = registration->members;
     while (physical) {
         CXLType2DirectPhysical *next = physical->group_next;
@@ -3451,6 +3453,50 @@ static int cxl_type2_direct_registration_release(
     }
     g_free(registration);
     return CXL_GPU_SUCCESS;
+}
+
+static int cxl_type2_direct_registration_ensure(
+    CXLType2State *ct2d, CXLType2DirectRegistration *registration)
+{
+    int64_t begin_ns;
+    int result;
+
+    if (registration->cuda_registered) {
+        return CXL_GPU_SUCCESS;
+    }
+    if (registration->revoke_pending || ct2d->direct_source_poisoned) {
+        return CXL_GPU_ERROR_INVALID_VALUE;
+    }
+    begin_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+    result = hetgpu_cuda_mem_host_register(
+        &ct2d->gpu_info.hetgpu_state, registration->host_address,
+        registration->length,
+        CXL_CUDA_MEMHOSTREGISTER_PORTABLE |
+            CXL_CUDA_MEMHOSTREGISTER_READ_ONLY);
+    ct2d->paired_case.active_direct_physical_register_calls++;
+    ct2d->paired_case.active_direct_physical_register_ns +=
+        qemu_clock_get_ns(QEMU_CLOCK_HOST) - begin_ns;
+    if (result == CXL_GPU_SUCCESS) {
+        registration->cuda_registered = true;
+        ct2d->paired_case.active_direct_registration_views +=
+            registration->view_count;
+        ct2d->paired_case.active_direct_registration_bytes +=
+            registration->length;
+        ct2d->paired_case.active_direct_registration_groups++;
+        ct2d->paired_case.active_direct_group_members +=
+            registration->member_count;
+        ct2d->paired_case.active_direct_max_group_members = MAX(
+            ct2d->paired_case.active_direct_max_group_members,
+            registration->member_count);
+        if (registration->view_count) {
+            ct2d->paired_case.active_direct_coalesced_views +=
+                registration->view_count - 1;
+        }
+        ct2d->paired_case.active_direct_max_registration_views = MAX(
+            ct2d->paired_case.active_direct_max_registration_views,
+            registration->view_count);
+    }
+    return result;
 }
 
 static int cxl_type2_direct_physical_put(CXLType2State *ct2d,
@@ -3891,14 +3937,13 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
             i = group_end;
         }
 
-        /* Adjacent pinned mappings share one real Driver registration. */
+        /* Adjacent pinned mappings share one lazy Driver registration. */
         for (guint first = 0; first < pending->len;) {
             CXLType2DirectPhysical *member = g_ptr_array_index(pending, first);
             CXLType2DirectRegistration *registration;
             uintptr_t base = (uintptr_t)member->host_address;
             uint64_t registration_length = member->length;
             guint end = first + 1;
-            int64_t register_begin_ns;
 
             while (end < pending->len) {
                 CXLType2DirectPhysical *next =
@@ -3913,48 +3958,17 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
                 registration_length += next->length;
                 end++;
             }
-            register_begin_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
-            result = hetgpu_cuda_mem_host_register(
-                &ct2d->gpu_info.hetgpu_state, member->host_address,
-                registration_length,
-                CXL_CUDA_MEMHOSTREGISTER_PORTABLE |
-                    CXL_CUDA_MEMHOSTREGISTER_READ_ONLY);
-            ct2d->paired_case.active_direct_physical_register_calls++;
-            ct2d->paired_case.active_direct_physical_register_ns +=
-                qemu_clock_get_ns(QEMU_CLOCK_HOST) - register_begin_ns;
-            if (result != CXL_GPU_SUCCESS) {
-                *failure_stage_out = "cuda-host-register";
-                *failure_index_out = first;
-                for (guint j = first; j < pending->len; j++) {
-                    CXLType2DirectPhysical *unregistered =
-                        g_ptr_array_index(pending, j);
-
-                    virtio_shared_memory_unpin(unregistered->mapping);
-                    g_free(unregistered);
-                    g_ptr_array_index(pending, j) = NULL;
-                }
-                goto view_rollback;
-            }
             registration = g_new0(CXLType2DirectRegistration, 1);
             registration->host_address = member->host_address;
             registration->length = registration_length;
             registration->member_count = end - first;
-            registration->cuda_registered = true;
             registration->next = ct2d->direct_registrations;
             ct2d->direct_registrations = registration;
             g_ptr_array_add(new_groups, registration);
-            ct2d->paired_case.active_direct_registration_groups++;
-            ct2d->paired_case.active_direct_group_members += end - first;
-            ct2d->paired_case.active_direct_max_group_members = MAX(
-                ct2d->paired_case.active_direct_max_group_members,
-                end - first);
             ct2d->paired_case.active_direct_retained_groups++;
             ct2d->paired_case.active_direct_peak_retained_groups = MAX(
                 ct2d->paired_case.active_direct_peak_retained_groups,
                 ct2d->paired_case.active_direct_retained_groups);
-            ct2d->paired_case.active_direct_registration_bytes +=
-                registration_length;
-
             for (guint j = first; j < end; j++) {
                 CXLType2DirectPhysical *physical =
                     g_ptr_array_index(pending, j);
@@ -4042,15 +4056,7 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
                     registration_views++;
                 }
             }
-            ct2d->paired_case.active_direct_registration_views +=
-                registration_views;
-            if (registration_views) {
-                ct2d->paired_case.active_direct_coalesced_views +=
-                    registration_views - 1;
-            }
-            ct2d->paired_case.active_direct_max_registration_views = MAX(
-                ct2d->paired_case.active_direct_max_registration_views,
-                registration_views);
+            registration->view_count = registration_views;
         }
         g_ptr_array_free(pending, true);
         pending = NULL;
@@ -4314,6 +4320,12 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
                 continue;
             }
             chunk = MIN(remaining, run->length - skip);
+            result = cxl_type2_direct_registration_ensure(
+                ct2d, physical->registration);
+            if (result != CXL_GPU_SUCCESS) {
+                *fail_index = i;
+                return result;
+            }
             result = cxl_type2_enqueue_htod_direct(
                 ct2d, wire.destination + copied,
                 (const uint8_t *)physical->host_address +

@@ -201,6 +201,7 @@ typedef struct CXLType2DirectRegistration {
     void *host_address;
     uint64_t length;
     uint64_t references;
+    uint64_t view_count;
     uint32_t member_count;
     bool cuda_registered;
     bool revoke_pending;
