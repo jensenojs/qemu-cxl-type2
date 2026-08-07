@@ -2750,6 +2750,13 @@ static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
     ct2d->paired_case.active_direct_registration_4m_16m_calls = 0;
     ct2d->paired_case.active_direct_registration_16m_64m_calls = 0;
     ct2d->paired_case.active_direct_registration_gt_64m_calls = 0;
+    ct2d->paired_case.active_direct_tile_extension_mappings = 0;
+    ct2d->paired_case.active_direct_tile_extension_bytes = 0;
+    ct2d->paired_case.active_direct_tile_unavailable_stops = 0;
+    ct2d->paired_case.active_direct_tile_conflict_stops = 0;
+    ct2d->paired_case.active_direct_tile_pin_failures = 0;
+    ct2d->paired_case.active_direct_cross_mapping_groups = 0;
+    ct2d->paired_case.active_direct_cross_mapping_members = 0;
     ct2d->paired_case.active_direct_registration_groups = 0;
     ct2d->paired_case.active_direct_group_members = 0;
     ct2d->paired_case.active_direct_max_group_members = 0;
@@ -2972,7 +2979,7 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             live_registration_groups++;
         }
         qemu_log(
-            "KIMI_DIRECT_SOURCE_SUMMARY schema=direct-source-summary-v6"
+            "KIMI_DIRECT_SOURCE_SUMMARY schema=direct-source-summary-v7"
             " run_binding=%" PRIu64 " case=%s case_epoch=%" PRIu64
             " policy_enabled=%u register_calls=%" PRIu64
             " register_busy_ns=%" PRIu64
@@ -3005,6 +3012,13 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             " registration_4m_16m_calls=%" PRIu64
             " registration_16m_64m_calls=%" PRIu64
             " registration_gt_64m_calls=%" PRIu64
+            " tile_extension_mappings=%" PRIu64
+            " tile_extension_bytes=%" PRIu64
+            " tile_unavailable_stops=%" PRIu64
+            " tile_conflict_stops=%" PRIu64
+            " tile_pin_failures=%" PRIu64
+            " cross_mapping_groups=%" PRIu64
+            " cross_mapping_members=%" PRIu64
             " registration_tile_size=%" PRIu64
             " registration_padding_limit=%" PRIu64
             " retained_registration_padding_bytes=%" PRIu64
@@ -3062,6 +3076,13 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             ct2d->paired_case.active_direct_registration_4m_16m_calls,
             ct2d->paired_case.active_direct_registration_16m_64m_calls,
             ct2d->paired_case.active_direct_registration_gt_64m_calls,
+            ct2d->paired_case.active_direct_tile_extension_mappings,
+            ct2d->paired_case.active_direct_tile_extension_bytes,
+            ct2d->paired_case.active_direct_tile_unavailable_stops,
+            ct2d->paired_case.active_direct_tile_conflict_stops,
+            ct2d->paired_case.active_direct_tile_pin_failures,
+            ct2d->paired_case.active_direct_cross_mapping_groups,
+            ct2d->paired_case.active_direct_cross_mapping_members,
             ct2d->direct_registration_tile_size,
             ct2d->direct_registration_padding_limit,
             ct2d->direct_registration_padding_bytes,
@@ -3795,6 +3816,99 @@ static CXLType2DirectPhysical *cxl_type2_direct_pending_find_at_or_after(
     return candidate;
 }
 
+static void cxl_type2_direct_extend_pending_tile(
+    CXLType2State *ct2d, VirtioSharedMemory *shmem,
+    CXLType2DirectPhysical *first, GPtrArray *pending,
+    uint64_t *pending_padding_bytes)
+{
+    uint64_t tile_size = ct2d->direct_registration_tile_size;
+    uint64_t padding_limit = ct2d->direct_registration_padding_limit;
+    uint64_t mapping_end;
+    uint64_t tile_end;
+    uint64_t next_offset;
+    uintptr_t expected_host;
+
+    if (!tile_size || !padding_limit ||
+        first->mapping_offset > UINT64_MAX - first->length ||
+        first->mapping->offset > UINT64_MAX - first->mapping->len) {
+        return;
+    }
+    mapping_end = first->mapping->offset + first->mapping->len;
+    next_offset = first->mapping_offset + first->length;
+    if (next_offset != mapping_end ||
+        first->length > UINTPTR_MAX - (uintptr_t)first->host_address) {
+        return;
+    }
+    tile_end = cxl_gpu_direct_registration_tile_end(
+        next_offset, shmem->size, tile_size);
+    if (!tile_end) {
+        return;
+    }
+    expected_host = (uintptr_t)first->host_address + first->length;
+
+    while (next_offset < tile_end) {
+        VirtioSharedMemoryMapping *mapping;
+        VirtioSharedMemoryMapping *pinned_mapping;
+        CXLType2DirectPhysical *physical;
+        uint64_t generation;
+        uint64_t available_padding;
+        uint64_t length;
+        void *host_address;
+
+        if (ct2d->direct_registration_padding_bytes >= padding_limit ||
+            *pending_padding_bytes >=
+                padding_limit - ct2d->direct_registration_padding_bytes) {
+            break;
+        }
+        available_padding = padding_limit -
+            ct2d->direct_registration_padding_bytes - *pending_padding_bytes;
+        mapping = virtio_find_shmem_map(shmem, next_offset, 1);
+        if (!mapping || mapping->offset != next_offset ||
+            mapping->revoke_pending || !mapping->len) {
+            ct2d->paired_case.active_direct_tile_unavailable_stops++;
+            break;
+        }
+        if (cxl_type2_direct_physical_find_at_or_after(
+                ct2d, mapping, mapping->offset) ||
+            cxl_type2_direct_pending_find_at_or_after(
+                pending, mapping, mapping->offset)) {
+            ct2d->paired_case.active_direct_tile_conflict_stops++;
+            break;
+        }
+        length = MIN(mapping->len, tile_end - next_offset);
+        length = MIN(length, available_padding);
+        if (!length || virtio_shared_memory_pin_range(
+                shmem, next_offset, length, &pinned_mapping, &generation,
+                &host_address, cxl_type2_direct_mapping_prepare_revoke,
+                ct2d) != 0) {
+            ct2d->paired_case.active_direct_tile_pin_failures++;
+            break;
+        }
+        if (pinned_mapping != mapping || generation != mapping->generation ||
+            (uintptr_t)host_address != expected_host) {
+            virtio_shared_memory_unpin(pinned_mapping);
+            ct2d->paired_case.active_direct_tile_pin_failures++;
+            break;
+        }
+        physical = g_new0(CXLType2DirectPhysical, 1);
+        physical->mapping = pinned_mapping;
+        physical->generation = generation;
+        physical->mapping_offset = next_offset;
+        physical->length = length;
+        physical->padding_bytes = length;
+        physical->host_address = host_address;
+        g_ptr_array_add(pending, physical);
+        *pending_padding_bytes += length;
+        ct2d->paired_case.active_direct_tile_extension_mappings++;
+        ct2d->paired_case.active_direct_tile_extension_bytes += length;
+        next_offset += length;
+        expected_host += length;
+        if (length != mapping->len) {
+            break;
+        }
+    }
+}
+
 static gint cxl_type2_direct_physical_host_compare(gconstpointer a,
                                                     gconstpointer b)
 {
@@ -4053,6 +4167,9 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
                     physical->host_address = mapping_host;
                     pending_padding_bytes += physical->padding_bytes;
                     g_ptr_array_add(pending, physical);
+                    cxl_type2_direct_extend_pending_tile(
+                        ct2d, shmem, physical, pending,
+                        &pending_padding_bytes);
                 }
                 cursor += segment_length;
                 group_length -= segment_length;
@@ -4070,6 +4187,8 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
             uintptr_t base = (uintptr_t)member->host_address;
             uint64_t registration_length = member->length;
             uint64_t registration_padding = member->padding_bytes;
+            uint64_t mapping_count = 1;
+            VirtioSharedMemoryMapping *last_mapping = member->mapping;
             guint end = first + 1;
 
             while (end < pending->len) {
@@ -4083,6 +4202,10 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
                 }
                 registration_length += next->length;
                 registration_padding += next->padding_bytes;
+                if (next->mapping != last_mapping) {
+                    mapping_count++;
+                    last_mapping = next->mapping;
+                }
                 end++;
             }
             registration = g_new0(CXLType2DirectRegistration, 1);
@@ -4094,6 +4217,11 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
             ct2d->direct_registrations = registration;
             g_ptr_array_add(new_groups, registration);
             ct2d->paired_case.active_direct_retained_groups++;
+            if (mapping_count > 1) {
+                ct2d->paired_case.active_direct_cross_mapping_groups++;
+                ct2d->paired_case.active_direct_cross_mapping_members +=
+                    mapping_count;
+            }
             ct2d->paired_case.active_direct_peak_retained_groups = MAX(
                 ct2d->paired_case.active_direct_peak_retained_groups,
                 ct2d->paired_case.active_direct_retained_groups);

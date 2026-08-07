@@ -169,6 +169,23 @@ uint64_t cxl_gpu_direct_registration_length(
     return tile_end - request_offset;
 }
 
+uint64_t cxl_gpu_direct_registration_tile_end(
+    uint64_t offset, uint64_t window_size, uint64_t tile_size)
+{
+    uint64_t remainder;
+    uint64_t advance;
+
+    if (!tile_size || offset > window_size) {
+        return 0;
+    }
+    remainder = offset % tile_size;
+    if (!remainder || offset == window_size) {
+        return offset;
+    }
+    advance = tile_size - remainder;
+    return advance > window_size - offset ? window_size : offset + advance;
+}
+
 bool cxl_type2_cuda_mem_info_is_allowed(bool active_case, bool live_context,
                                         uint64_t token, uint64_t active_epoch)
 {

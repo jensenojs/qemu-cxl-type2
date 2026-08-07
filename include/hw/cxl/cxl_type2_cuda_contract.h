@@ -84,5 +84,7 @@ uint64_t cxl_gpu_direct_registration_length(
     uint64_t request_offset, uint64_t request_length,
     uint64_t following_offset, uint64_t tile_size,
     uint64_t padding_budget);
+uint64_t cxl_gpu_direct_registration_tile_end(
+    uint64_t offset, uint64_t window_size, uint64_t tile_size);
 
 #endif

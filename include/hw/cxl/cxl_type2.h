@@ -444,6 +444,13 @@ typedef struct CXLType2State {
         uint64_t active_direct_registration_4m_16m_calls;
         uint64_t active_direct_registration_16m_64m_calls;
         uint64_t active_direct_registration_gt_64m_calls;
+        uint64_t active_direct_tile_extension_mappings;
+        uint64_t active_direct_tile_extension_bytes;
+        uint64_t active_direct_tile_unavailable_stops;
+        uint64_t active_direct_tile_conflict_stops;
+        uint64_t active_direct_tile_pin_failures;
+        uint64_t active_direct_cross_mapping_groups;
+        uint64_t active_direct_cross_mapping_members;
         uint64_t active_direct_registration_groups;
         uint64_t active_direct_group_members;
         uint64_t active_direct_max_group_members;
