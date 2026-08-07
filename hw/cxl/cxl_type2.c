@@ -4302,6 +4302,20 @@ static int cxl_type2_enqueue_htod_direct(CXLType2State *ct2d,
     return CXL_GPU_SUCCESS;
 }
 
+static int cxl_type2_direct_span_submit(
+    CXLType2State *ct2d, uint64_t destination, const void *host,
+    uint64_t length, void *stream, CXLType2DirectSource *source,
+    CXLType2DirectRegistration *registration)
+{
+    int result = cxl_type2_direct_registration_ensure(ct2d, registration);
+
+    if (result != CXL_GPU_SUCCESS) {
+        return result;
+    }
+    return cxl_type2_enqueue_htod_direct(
+        ct2d, destination, host, length, stream, source);
+}
+
 static bool cxl_type2_direct_range_is_valid(
     CXLType2State *ct2d, const CXLGPUDirectRangeV1 *wire,
     CXLType2DirectSource **source_out)
@@ -4396,6 +4410,10 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
         uint64_t skip;
         uint64_t remaining;
         uint64_t copied = 0;
+        CXLType2DirectRegistration *span_registration = NULL;
+        const void *span_host = NULL;
+        uint64_t span_destination = 0;
+        uint64_t span_length = 0;
 
         range = &source->ranges[wire->source_range];
         skip = range->first_run_byte_offset + wire->source_offset;
@@ -4404,6 +4422,8 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
             CXLType2DirectRun *run =
                 &source->runs[range->first_run + j];
             CXLType2DirectPhysical *physical = run->physical;
+            const void *host;
+            uint64_t destination;
             uint64_t chunk;
 
             if (skip >= run->length) {
@@ -4411,26 +4431,45 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
                 continue;
             }
             chunk = MIN(remaining, run->length - skip);
-            result = cxl_type2_direct_registration_ensure(
-                ct2d, physical->registration);
-            if (result != CXL_GPU_SUCCESS) {
-                *fail_index = i;
-                goto out;
+            host = (const uint8_t *)physical->host_address +
+                   run->physical_offset + skip;
+            destination = wire->destination + copied;
+            if (span_length && !cxl_gpu_direct_copy_span_follows(
+                                   (uintptr_t)source,
+                                   (uintptr_t)span_registration,
+                                   (uintptr_t)span_host, span_destination,
+                                   span_length, (uintptr_t)source,
+                                   (uintptr_t)physical->registration,
+                                   (uintptr_t)host, destination, chunk)) {
+                result = cxl_type2_direct_span_submit(
+                    ct2d, span_destination, span_host, span_length, stream,
+                    source, span_registration);
+                if (result != CXL_GPU_SUCCESS) {
+                    *fail_index = i;
+                    goto out;
+                }
+                (*fragments_enqueued)++;
+                span_length = 0;
             }
-            result = cxl_type2_enqueue_htod_direct(
-                ct2d, wire->destination + copied,
-                (const uint8_t *)physical->host_address +
-                    run->physical_offset + skip,
-                chunk,
-                stream, source);
+            if (!span_length) {
+                span_registration = physical->registration;
+                span_host = host;
+                span_destination = destination;
+            }
+            span_length += chunk;
+            copied += chunk;
+            remaining -= chunk;
+            skip = 0;
+        }
+        if (span_length) {
+            result = cxl_type2_direct_span_submit(
+                ct2d, span_destination, span_host, span_length, stream,
+                source, span_registration);
             if (result != CXL_GPU_SUCCESS) {
                 *fail_index = i;
                 goto out;
             }
             (*fragments_enqueued)++;
-            copied += chunk;
-            remaining -= chunk;
-            skip = 0;
         }
         (*logical_enqueued)++;
     }

@@ -457,6 +457,28 @@ static void test_direct_host_range_order_and_adjacency(void)
         0x1000, 0x1000, 0x2000, UINT64_MAX));
 }
 
+static void test_direct_copy_span_adjacency(void)
+{
+    g_assert_true(cxl_gpu_direct_copy_span_follows(
+        1, 2, 0x1000, 0x4000, 0x1000,
+        1, 2, 0x2000, 0x5000, 0x800));
+    g_assert_false(cxl_gpu_direct_copy_span_follows(
+        1, 2, 0x1000, 0x4000, 0x1000,
+        1, 2, 0x2000, 0x6000, 0x800));
+    g_assert_false(cxl_gpu_direct_copy_span_follows(
+        1, 2, 0x1000, 0x4000, 0x1000,
+        1, 3, 0x2000, 0x5000, 0x800));
+    g_assert_false(cxl_gpu_direct_copy_span_follows(
+        1, 2, 0x1000, 0x4000, 0x1000,
+        4, 2, 0x2000, 0x5000, 0x800));
+    g_assert_false(cxl_gpu_direct_copy_span_follows(
+        1, 2, UINTPTR_MAX - 0x7ff, 0x4000, 0x1000,
+        1, 2, 0x800, 0x5000, 0x800));
+    g_assert_false(cxl_gpu_direct_copy_span_follows(
+        1, 2, 0x1000, UINT64_MAX - 0x7ff, 0x1000,
+        1, 2, 0x2000, 0x800, 0x800));
+}
+
 static void test_direct_registration_tile_bounds(void)
 {
     const uint64_t mib = 1024 * 1024;
@@ -516,6 +538,8 @@ int main(int argc, char **argv)
                     test_direct_batch_wire_validation);
     g_test_add_func("/cxl/type2/direct/host-range-layout",
                     test_direct_host_range_order_and_adjacency);
+    g_test_add_func("/cxl/type2/direct/copy-span-layout",
+                    test_direct_copy_span_adjacency);
     g_test_add_func("/cxl/type2/direct/registration-tile-bounds",
                     test_direct_registration_tile_bounds);
     return g_test_run();

@@ -110,6 +110,19 @@ bool cxl_gpu_direct_host_range_follows(uintptr_t base, uint64_t length,
            next_length <= UINT64_MAX - length;
 }
 
+bool cxl_gpu_direct_copy_span_follows(
+    uintptr_t source, uintptr_t registration, uintptr_t host,
+    uint64_t destination, uint64_t length, uintptr_t next_source,
+    uintptr_t next_registration, uintptr_t next_host,
+    uint64_t next_destination, uint64_t next_length)
+{
+    return source == next_source && registration == next_registration &&
+           cxl_gpu_direct_host_range_follows(
+               host, length, next_host, next_length) &&
+           length <= UINT64_MAX - destination &&
+           next_destination == destination + length;
+}
+
 uint64_t cxl_gpu_direct_registration_length(
     uint64_t mapping_offset, uint64_t mapping_length,
     uint64_t request_offset, uint64_t request_length,
