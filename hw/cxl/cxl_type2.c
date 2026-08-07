@@ -2742,6 +2742,11 @@ static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
     ct2d->paired_case.active_direct_physical_register_ns = 0;
     ct2d->paired_case.active_direct_registration_views = 0;
     ct2d->paired_case.active_direct_registration_bytes = 0;
+    ct2d->paired_case.active_direct_registration_groups = 0;
+    ct2d->paired_case.active_direct_group_members = 0;
+    ct2d->paired_case.active_direct_max_group_members = 0;
+    ct2d->paired_case.active_direct_retained_groups = 0;
+    ct2d->paired_case.active_direct_peak_retained_groups = 0;
     ct2d->paired_case.active_direct_coalesced_views = 0;
     ct2d->paired_case.active_direct_max_registration_views = 0;
     ct2d->paired_case.active_direct_physical_boundaries = 0;
@@ -2940,9 +2945,11 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
     {
         uint64_t live_sources = 0;
         uint64_t live_physicals = 0;
+        uint64_t live_registration_groups = 0;
         uint64_t source_pending_refs = 0;
         CXLType2DirectSource *source;
         CXLType2DirectPhysical *physical;
+        CXLType2DirectRegistration *registration;
 
         for (source = ct2d->direct_sources; source; source = source->next) {
             live_sources++;
@@ -2952,8 +2959,12 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
              physical = physical->next) {
             live_physicals++;
         }
+        for (registration = ct2d->direct_registrations; registration;
+             registration = registration->next) {
+            live_registration_groups++;
+        }
         qemu_log(
-            "KIMI_DIRECT_SOURCE_SUMMARY schema=direct-source-summary-v4"
+            "KIMI_DIRECT_SOURCE_SUMMARY schema=direct-source-summary-v5"
             " run_binding=%" PRIu64 " case=%s case_epoch=%" PRIu64
             " policy_enabled=%u register_calls=%" PRIu64
             " register_busy_ns=%" PRIu64
@@ -2972,6 +2983,10 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             " physical_register_ns=%" PRIu64
             " registration_views=%" PRIu64
             " registration_bytes=%" PRIu64
+            " registration_groups=%" PRIu64
+            " group_members=%" PRIu64
+            " max_group_members=%" PRIu64
+            " peak_retained_groups=%" PRIu64
             " coalesced_views=%" PRIu64
             " max_registration_views=%" PRIu64
             " physical_boundaries=%" PRIu64
@@ -2986,6 +3001,7 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             " driver_fragments=%" PRIu64 " direct_bytes=%" PRIu64
             " payload_batches=%" PRIu64 " payload_source_bytes=%" PRIu64
             " live_sources=%" PRIu64 " live_physicals=%" PRIu64
+            " live_registration_groups=%" PRIu64
             " pending_source_refs=%" PRIu64 " poisoned=%u\n",
             run_binding, cxl_type2_paired_case_name(case_kind), epoch,
             ct2d->cuda_direct_source,
@@ -3006,6 +3022,10 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             ct2d->paired_case.active_direct_physical_register_ns,
             ct2d->paired_case.active_direct_registration_views,
             ct2d->paired_case.active_direct_registration_bytes,
+            ct2d->paired_case.active_direct_registration_groups,
+            ct2d->paired_case.active_direct_group_members,
+            ct2d->paired_case.active_direct_max_group_members,
+            ct2d->paired_case.active_direct_peak_retained_groups,
             ct2d->paired_case.active_direct_coalesced_views,
             ct2d->paired_case.active_direct_max_registration_views,
             ct2d->paired_case.active_direct_physical_boundaries,
@@ -3023,7 +3043,7 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             ct2d->paired_case.active_direct_bytes,
             ct2d->paired_case.active_payload_batches,
             ct2d->paired_case.active_payload_source_bytes, live_sources,
-            live_physicals, source_pending_refs,
+            live_physicals, live_registration_groups, source_pending_refs,
             ct2d->direct_source_poisoned);
     }
 
@@ -3356,7 +3376,7 @@ static gint cxl_type2_direct_physical_search(gconstpointer key,
 
 static CXLType2DirectPhysical *cxl_type2_direct_physical_find_at_or_after(
     CXLType2State *ct2d, VirtioSharedMemoryMapping *mapping,
-    uint64_t generation, hwaddr mapping_offset)
+    hwaddr mapping_offset)
 {
     CXLType2DirectPhysicalSearch search = {
         .mapping = mapping,
@@ -3367,33 +3387,14 @@ static CXLType2DirectPhysical *cxl_type2_direct_physical_find_at_or_after(
         cxl_type2_direct_physical_search, &search);
 
     physical = physical ? physical : search.candidate;
-    return physical && physical->mapping == mapping &&
-                   physical->generation == generation &&
-                   !physical->mapping->revoke_pending
-               ? physical
-               : NULL;
+    return physical && physical->mapping == mapping ? physical : NULL;
 }
 
-static int cxl_type2_direct_physical_release(CXLType2State *ct2d,
-                                             CXLType2DirectPhysical *physical,
-                                             bool revoke)
+static void cxl_type2_direct_physical_unlink(CXLType2State *ct2d,
+                                             CXLType2DirectPhysical *physical)
 {
     CXLType2DirectPhysical **cursor;
-    HetGPUState *hetgpu = &ct2d->gpu_info.hetgpu_state;
-    int64_t begin_ns;
-    int result;
 
-    g_assert(physical && physical->references == 0);
-    begin_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
-    result = hetgpu_cuda_mem_host_unregister(hetgpu, physical->host_address);
-    ct2d->paired_case.active_direct_physical_unregister_calls++;
-    ct2d->paired_case.active_direct_physical_unregister_ns +=
-        qemu_clock_get_ns(QEMU_CLOCK_HOST) - begin_ns;
-    if (result != CXL_GPU_SUCCESS) {
-        ct2d->direct_source_poisoned = true;
-        return result;
-    }
-    physical->cuda_registered = false;
     g_assert(g_tree_remove(ct2d->direct_physical_ranges, physical));
     virtio_shared_memory_unpin(physical->mapping);
     cursor = &ct2d->direct_physicals;
@@ -3403,10 +3404,51 @@ static int cxl_type2_direct_physical_release(CXLType2State *ct2d,
     *cursor = physical->next;
     g_assert(ct2d->paired_case.active_direct_retained_physicals > 0);
     ct2d->paired_case.active_direct_retained_physicals--;
-    if (revoke) {
-        ct2d->paired_case.active_direct_revoke_releases++;
-    }
     g_free(physical);
+}
+
+static int cxl_type2_direct_registration_release(
+    CXLType2State *ct2d, CXLType2DirectRegistration *registration,
+    bool revoke)
+{
+    CXLType2DirectRegistration **cursor;
+    CXLType2DirectPhysical *physical;
+    HetGPUState *hetgpu = &ct2d->gpu_info.hetgpu_state;
+    int64_t begin_ns;
+    int result;
+
+    g_assert(registration && registration->references == 0);
+    begin_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+    result = hetgpu_cuda_mem_host_unregister(hetgpu,
+                                              registration->host_address);
+    ct2d->paired_case.active_direct_physical_unregister_calls++;
+    ct2d->paired_case.active_direct_physical_unregister_ns +=
+        qemu_clock_get_ns(QEMU_CLOCK_HOST) - begin_ns;
+    if (result != CXL_GPU_SUCCESS) {
+        ct2d->direct_source_poisoned = true;
+        return result;
+    }
+    registration->cuda_registered = false;
+    physical = registration->members;
+    while (physical) {
+        CXLType2DirectPhysical *next = physical->group_next;
+
+        g_assert(physical->references == 0);
+        cxl_type2_direct_physical_unlink(ct2d, physical);
+        physical = next;
+    }
+    cursor = &ct2d->direct_registrations;
+    while (*cursor != registration) {
+        cursor = &(*cursor)->next;
+    }
+    *cursor = registration->next;
+    g_assert(ct2d->paired_case.active_direct_retained_groups > 0);
+    ct2d->paired_case.active_direct_retained_groups--;
+    if (revoke) {
+        ct2d->paired_case.active_direct_revoke_releases +=
+            registration->member_count;
+    }
+    g_free(registration);
     return CXL_GPU_SUCCESS;
 }
 
@@ -3414,13 +3456,18 @@ static int cxl_type2_direct_physical_put(CXLType2State *ct2d,
                                          CXLType2DirectPhysical *physical)
 {
     g_assert(physical && physical->references > 0);
+    g_assert(physical->registration &&
+             physical->registration->references > 0);
     physical->references--;
-    if (physical->references == 0 && physical->mapping->revoke_pending) {
-        int result = cxl_type2_direct_physical_release(
-            ct2d, physical, true);
+    physical->registration->references--;
+    if (physical->registration->references == 0 &&
+        physical->registration->revoke_pending) {
+        int result = cxl_type2_direct_registration_release(
+            ct2d, physical->registration, true);
 
         if (result != CXL_GPU_SUCCESS) {
             physical->references++;
+            physical->registration->references++;
         }
         return result;
     }
@@ -3431,36 +3478,49 @@ static void cxl_type2_direct_mapping_prepare_revoke(
     VirtioSharedMemoryMapping *mapping, void *opaque)
 {
     CXLType2State *ct2d = opaque;
-    CXLType2DirectPhysical *physical = ct2d->direct_physicals;
+    CXLType2DirectRegistration *registration;
 
-    while (physical) {
-        CXLType2DirectPhysical *next = physical->next;
+    for (registration = ct2d->direct_registrations; registration;
+         registration = registration->next) {
+        CXLType2DirectPhysical *physical;
 
-        if (physical->mapping == mapping && physical->references == 0 &&
-            cxl_type2_direct_physical_release(ct2d, physical, true) !=
-                CXL_GPU_SUCCESS) {
+        for (physical = registration->members; physical;
+             physical = physical->group_next) {
+            if (physical->mapping == mapping) {
+                registration->revoke_pending = true;
+                break;
+            }
+        }
+    }
+    registration = ct2d->direct_registrations;
+    while (registration) {
+        CXLType2DirectRegistration *next = registration->next;
+
+        if (registration->revoke_pending && registration->references == 0 &&
+            cxl_type2_direct_registration_release(
+                ct2d, registration, true) != CXL_GPU_SUCCESS) {
             return;
         }
-        physical = next;
+        registration = next;
     }
 }
 
 static int cxl_type2_direct_idle_cleanup(CXLType2State *ct2d)
 {
-    CXLType2DirectPhysical *physical = ct2d->direct_physicals;
+    CXLType2DirectRegistration *registration = ct2d->direct_registrations;
 
-    while (physical) {
-        CXLType2DirectPhysical *next = physical->next;
+    while (registration) {
+        CXLType2DirectRegistration *next = registration->next;
 
-        if (physical->references == 0) {
-            int result = cxl_type2_direct_physical_release(
-                ct2d, physical, false);
+        if (registration->references == 0) {
+            int result = cxl_type2_direct_registration_release(
+                ct2d, registration, false);
 
             if (result != CXL_GPU_SUCCESS) {
                 return result;
             }
         }
-        physical = next;
+        registration = next;
     }
     return CXL_GPU_SUCCESS;
 }
@@ -3472,8 +3532,9 @@ static int cxl_type2_direct_physicals_cleanup(CXLType2State *ct2d)
     if (result != CXL_GPU_SUCCESS) {
         return result;
     }
-    return ct2d->direct_physicals ? CXL_GPU_ERROR_INVALID_VALUE
-                                  : CXL_GPU_SUCCESS;
+    return ct2d->direct_physicals || ct2d->direct_registrations
+               ? CXL_GPU_ERROR_INVALID_VALUE
+               : CXL_GPU_SUCCESS;
 }
 
 static void cxl_type2_direct_indexes_destroy(CXLType2State *ct2d)
@@ -3590,6 +3651,29 @@ static uint32_t cxl_type2_direct_contiguous_run_end(
         end++;
     }
     return end;
+}
+
+static CXLType2DirectPhysical *cxl_type2_direct_pending_find_at_or_after(
+    GPtrArray *pending, VirtioSharedMemoryMapping *mapping,
+    hwaddr mapping_offset)
+{
+    CXLType2DirectPhysical *candidate = NULL;
+
+    for (guint i = 0; i < pending->len; i++) {
+        CXLType2DirectPhysical *physical = g_ptr_array_index(pending, i);
+
+        if (!physical || physical->mapping != mapping ||
+            (physical->mapping_offset <= mapping_offset &&
+             physical->length <=
+                 mapping_offset - physical->mapping_offset)) {
+            continue;
+        }
+        if (!candidate ||
+            physical->mapping_offset < candidate->mapping_offset) {
+            candidate = physical;
+        }
+    }
+    return candidate;
 }
 
 static int cxl_type2_direct_source_register(CXLType2State *ct2d,
@@ -3709,9 +3793,12 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
            (uint64_t)header.range_count * sizeof(*source->ranges));
     {
         GArray *views = g_array_new(false, false, sizeof(CXLType2DirectRun));
+        GPtrArray *pending = g_ptr_array_new();
+        GPtrArray *new_groups = g_ptr_array_new();
         uint32_t *wire_first_view = g_new(uint32_t, header.run_count);
         uint32_t *wire_view_count = g_new0(uint32_t, header.run_count);
 
+        /* Pin every missing mapping segment before choosing CUDA ranges. */
         for (uint32_t i = 0; i < header.run_count;) {
             uint32_t group_end = cxl_type2_direct_contiguous_run_end(
                 validated, header.run_count, i);
@@ -3724,26 +3811,43 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
             while (group_length) {
                 CXLType2DirectPhysical *physical =
                     cxl_type2_direct_physical_find_at_or_after(
-                        ct2d, validated[i].mapping,
-                        validated[i].generation, cursor);
+                        ct2d, validated[i].mapping, cursor);
+                CXLType2DirectPhysical *pending_physical =
+                    cxl_type2_direct_pending_find_at_or_after(
+                        pending, validated[i].mapping, cursor);
                 uint64_t segment_length;
-                bool created = false;
+
+                if (pending_physical &&
+                    (!physical || pending_physical->mapping_offset <
+                                      physical->mapping_offset)) {
+                    physical = pending_physical;
+                }
 
                 if (physical && physical->mapping_offset <= cursor) {
+                    if (physical->generation != validated[i].generation ||
+                        physical->mapping->revoke_pending ||
+                        (physical->registration &&
+                         physical->registration->revoke_pending)) {
+                        result = CXL_GPU_ERROR_INVALID_VALUE;
+                        *failure_stage_out = "registration-revoking";
+                        *failure_index_out = i;
+                        goto view_rollback;
+                    }
                     segment_length = MIN(
                         group_length,
                         physical->length -
                             (cursor - physical->mapping_offset));
-                    if (physical->references == 0) {
-                        ct2d->paired_case.active_direct_cache_hits++;
-                    } else {
-                        ct2d->paired_case.active_direct_active_hits++;
+                    if (physical->registration) {
+                        if (physical->references == 0) {
+                            ct2d->paired_case.active_direct_cache_hits++;
+                        } else {
+                            ct2d->paired_case.active_direct_active_hits++;
+                        }
                     }
                 } else {
                     VirtioSharedMemoryMapping *pinned_mapping;
                     uint64_t pinned_generation;
                     void *mapping_host;
-                    int64_t register_begin_ns;
 
                     segment_length = physical
                                          ? MIN(group_length,
@@ -3772,102 +3876,185 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
                         virtio_shared_memory_unpin(pinned_mapping);
                         goto view_rollback;
                     }
-                    register_begin_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
-                    result = hetgpu_cuda_mem_host_register(
-                        &ct2d->gpu_info.hetgpu_state, mapping_host,
-                        segment_length,
-                        CXL_CUDA_MEMHOSTREGISTER_PORTABLE |
-                            CXL_CUDA_MEMHOSTREGISTER_READ_ONLY);
-                    ct2d->paired_case.active_direct_physical_register_calls++;
-                    ct2d->paired_case.active_direct_physical_register_ns +=
-                        qemu_clock_get_ns(QEMU_CLOCK_HOST) - register_begin_ns;
-                    if (result != CXL_GPU_SUCCESS) {
-                        *failure_stage_out = "cuda-host-register";
-                        *failure_index_out = i;
-                        virtio_shared_memory_unpin(pinned_mapping);
-                        goto view_rollback;
-                    }
                     physical = g_new0(CXLType2DirectPhysical, 1);
                     physical->mapping = pinned_mapping;
                     physical->generation = pinned_generation;
                     physical->mapping_offset = cursor;
                     physical->length = segment_length;
                     physical->host_address = mapping_host;
-                    physical->cuda_registered = true;
-                    g_assert(!g_tree_lookup(
-                        ct2d->direct_physical_ranges, physical));
-                    g_tree_insert(ct2d->direct_physical_ranges,
-                                  physical, physical);
-                    physical->next = ct2d->direct_physicals;
-                    ct2d->direct_physicals = physical;
-                    ct2d->paired_case.active_direct_cache_misses++;
-                    ct2d->paired_case.active_direct_retained_physicals++;
-                    ct2d->paired_case.active_direct_peak_retained_physicals =
-                        MAX(ct2d->paired_case
-                                .active_direct_peak_retained_physicals,
-                            ct2d->paired_case
-                                .active_direct_retained_physicals);
-                    ct2d->paired_case.active_direct_registration_bytes +=
-                        segment_length;
-                    created = true;
+                    g_ptr_array_add(pending, physical);
                 }
-
-                uint64_t segment_remaining = segment_length;
-                uint32_t wire = i;
-                while (wire + 1 < group_end &&
-                       cursor >= validated[wire].mapping_offset +
-                                     validated[wire].wire.length) {
-                    wire++;
-                }
-                uint32_t created_views = 0;
-                while (segment_remaining) {
-                    uint64_t wire_offset =
-                        cursor - validated[wire].mapping_offset;
-                    uint64_t view_length = MIN(
-                        segment_remaining,
-                        validated[wire].wire.length - wire_offset);
-                    CXLType2DirectRun view = {
-                        .physical = physical,
-                        .physical_offset =
-                            cursor - physical->mapping_offset,
-                        .length = view_length,
-                    };
-
-                    if (physical->references == UINT64_MAX) {
-                        result = CXL_GPU_ERROR_OUT_OF_MEMORY;
-                        *failure_stage_out = "reference-overflow";
-                        *failure_index_out = wire;
-                        goto view_rollback;
-                    }
-                    physical->references++;
-                    if (wire_view_count[wire] == 0) {
-                        wire_first_view[wire] = views->len;
-                    }
-                    g_array_append_val(views, view);
-                    wire_view_count[wire]++;
-                    created_views++;
-                    cursor += view_length;
-                    group_length -= view_length;
-                    segment_remaining -= view_length;
-                    if (wire_offset + view_length ==
-                            validated[wire].wire.length &&
-                        wire + 1 < group_end) {
-                        wire++;
-                    }
-                }
-                if (created) {
-                    ct2d->paired_case.active_direct_registration_views +=
-                        created_views;
-                    ct2d->paired_case.active_direct_coalesced_views +=
-                        created_views - 1;
-                    ct2d->paired_case.active_direct_max_registration_views =
-                        MAX(ct2d->paired_case
-                                .active_direct_max_registration_views,
-                            created_views);
-                }
+                cursor += segment_length;
+                group_length -= segment_length;
             }
             i = group_end;
         }
+
+        /* Adjacent pinned mappings share one real Driver registration. */
+        for (guint first = 0; first < pending->len;) {
+            CXLType2DirectPhysical *member = g_ptr_array_index(pending, first);
+            CXLType2DirectRegistration *registration;
+            uintptr_t base = (uintptr_t)member->host_address;
+            uint64_t registration_length = member->length;
+            guint end = first + 1;
+            int64_t register_begin_ns;
+
+            while (end < pending->len) {
+                CXLType2DirectPhysical *next =
+                    g_ptr_array_index(pending, end);
+
+                if (registration_length > UINTPTR_MAX - base ||
+                    (uintptr_t)next->host_address !=
+                        base + registration_length ||
+                    next->length > UINT64_MAX - registration_length) {
+                    break;
+                }
+                registration_length += next->length;
+                end++;
+            }
+            register_begin_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+            result = hetgpu_cuda_mem_host_register(
+                &ct2d->gpu_info.hetgpu_state, member->host_address,
+                registration_length,
+                CXL_CUDA_MEMHOSTREGISTER_PORTABLE |
+                    CXL_CUDA_MEMHOSTREGISTER_READ_ONLY);
+            ct2d->paired_case.active_direct_physical_register_calls++;
+            ct2d->paired_case.active_direct_physical_register_ns +=
+                qemu_clock_get_ns(QEMU_CLOCK_HOST) - register_begin_ns;
+            if (result != CXL_GPU_SUCCESS) {
+                *failure_stage_out = "cuda-host-register";
+                *failure_index_out = first;
+                for (guint j = first; j < pending->len; j++) {
+                    CXLType2DirectPhysical *unregistered =
+                        g_ptr_array_index(pending, j);
+
+                    virtio_shared_memory_unpin(unregistered->mapping);
+                    g_free(unregistered);
+                    g_ptr_array_index(pending, j) = NULL;
+                }
+                goto view_rollback;
+            }
+            registration = g_new0(CXLType2DirectRegistration, 1);
+            registration->host_address = member->host_address;
+            registration->length = registration_length;
+            registration->member_count = end - first;
+            registration->cuda_registered = true;
+            registration->next = ct2d->direct_registrations;
+            ct2d->direct_registrations = registration;
+            g_ptr_array_add(new_groups, registration);
+            ct2d->paired_case.active_direct_registration_groups++;
+            ct2d->paired_case.active_direct_group_members += end - first;
+            ct2d->paired_case.active_direct_max_group_members = MAX(
+                ct2d->paired_case.active_direct_max_group_members,
+                end - first);
+            ct2d->paired_case.active_direct_retained_groups++;
+            ct2d->paired_case.active_direct_peak_retained_groups = MAX(
+                ct2d->paired_case.active_direct_peak_retained_groups,
+                ct2d->paired_case.active_direct_retained_groups);
+            ct2d->paired_case.active_direct_registration_bytes +=
+                registration_length;
+
+            for (guint j = first; j < end; j++) {
+                CXLType2DirectPhysical *physical =
+                    g_ptr_array_index(pending, j);
+
+                physical->registration = registration;
+                physical->group_next = registration->members;
+                registration->members = physical;
+                g_assert(!g_tree_lookup(
+                    ct2d->direct_physical_ranges, physical));
+                g_tree_insert(ct2d->direct_physical_ranges,
+                              physical, physical);
+                physical->next = ct2d->direct_physicals;
+                ct2d->direct_physicals = physical;
+                ct2d->paired_case.active_direct_cache_misses++;
+                ct2d->paired_case.active_direct_retained_physicals++;
+                ct2d->paired_case.active_direct_peak_retained_physicals =
+                    MAX(ct2d->paired_case
+                            .active_direct_peak_retained_physicals,
+                        ct2d->paired_case
+                            .active_direct_retained_physicals);
+                g_ptr_array_index(pending, j) = NULL;
+            }
+            first = end;
+        }
+
+        for (uint32_t wire = 0; wire < header.run_count; wire++) {
+            hwaddr cursor = validated[wire].mapping_offset;
+            uint64_t remaining = validated[wire].wire.length;
+
+            wire_first_view[wire] = views->len;
+            while (remaining) {
+                CXLType2DirectPhysical *physical =
+                    cxl_type2_direct_physical_find_at_or_after(
+                        ct2d, validated[wire].mapping, cursor);
+                CXLType2DirectRegistration *registration;
+                uint64_t view_length;
+                CXLType2DirectRun view;
+
+                if (!physical || physical->mapping_offset > cursor ||
+                    physical->generation != validated[wire].generation ||
+                    physical->mapping->revoke_pending ||
+                    !physical->registration ||
+                    physical->registration->revoke_pending) {
+                    result = CXL_GPU_ERROR_INVALID_VALUE;
+                    *failure_stage_out = "physical-coverage";
+                    *failure_index_out = wire;
+                    goto view_rollback;
+                }
+                registration = physical->registration;
+                if (physical->references == UINT64_MAX ||
+                    registration->references == UINT64_MAX) {
+                    result = CXL_GPU_ERROR_OUT_OF_MEMORY;
+                    *failure_stage_out = "reference-overflow";
+                    *failure_index_out = wire;
+                    goto view_rollback;
+                }
+                view_length = MIN(
+                    remaining,
+                    physical->length -
+                        (cursor - physical->mapping_offset));
+                view = (CXLType2DirectRun) {
+                    .physical = physical,
+                    .physical_offset = cursor - physical->mapping_offset,
+                    .length = view_length,
+                };
+                physical->references++;
+                registration->references++;
+                g_array_append_val(views, view);
+                wire_view_count[wire]++;
+                cursor += view_length;
+                remaining -= view_length;
+            }
+        }
+
+        for (guint i = 0; i < new_groups->len; i++) {
+            CXLType2DirectRegistration *registration =
+                g_ptr_array_index(new_groups, i);
+            uint64_t registration_views = 0;
+
+            for (guint j = 0; j < views->len; j++) {
+                CXLType2DirectRun *view = &g_array_index(
+                    views, CXLType2DirectRun, j);
+
+                if (view->physical->registration == registration) {
+                    registration_views++;
+                }
+            }
+            ct2d->paired_case.active_direct_registration_views +=
+                registration_views;
+            if (registration_views) {
+                ct2d->paired_case.active_direct_coalesced_views +=
+                    registration_views - 1;
+            }
+            ct2d->paired_case.active_direct_max_registration_views = MAX(
+                ct2d->paired_case.active_direct_max_registration_views,
+                registration_views);
+        }
+        g_ptr_array_free(pending, true);
+        pending = NULL;
+        g_ptr_array_free(new_groups, true);
+        new_groups = NULL;
         for (uint32_t i = 0; i < header.range_count; i++) {
             uint32_t old_first = source->ranges[i].first_run;
             uint32_t old_count = source->ranges[i].run_count;
@@ -3923,6 +4110,21 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
 view_rollback:
         source->run_count = views->len;
         source->runs = (CXLType2DirectRun *)g_array_free(views, false);
+        if (pending) {
+            for (guint i = 0; i < pending->len; i++) {
+                CXLType2DirectPhysical *unregistered =
+                    g_ptr_array_index(pending, i);
+
+                if (unregistered) {
+                    virtio_shared_memory_unpin(unregistered->mapping);
+                    g_free(unregistered);
+                }
+            }
+            g_ptr_array_free(pending, true);
+        }
+        if (new_groups) {
+            g_ptr_array_free(new_groups, true);
+        }
         g_free(wire_first_view);
         g_free(wire_view_count);
         goto rollback;
@@ -8155,7 +8357,8 @@ static void cxl_type2_reset(DeviceState *dev)
     cxl_cstate->bi_control_opaque = ct2d;
     ct2d->bi_enabled = false;
 
-    if (ct2d->direct_sources || ct2d->direct_physicals) {
+    if (ct2d->direct_sources || ct2d->direct_physicals ||
+        ct2d->direct_registrations) {
         int result = HETGPU_ERROR_UNKNOWN;
 
         if (ct2d->gpu_info.hetgpu_state.initialized &&

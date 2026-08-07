@@ -197,6 +197,17 @@ typedef struct CXLType2PendingHtoD {
     struct CXLType2PendingHtoD *next;
 } CXLType2PendingHtoD;
 
+typedef struct CXLType2DirectRegistration {
+    void *host_address;
+    uint64_t length;
+    uint64_t references;
+    uint32_t member_count;
+    bool cuda_registered;
+    bool revoke_pending;
+    struct CXLType2DirectPhysical *members;
+    struct CXLType2DirectRegistration *next;
+} CXLType2DirectRegistration;
+
 typedef struct CXLType2DirectPhysical {
     VirtioSharedMemoryMapping *mapping;
     uint64_t generation;
@@ -204,7 +215,8 @@ typedef struct CXLType2DirectPhysical {
     uint64_t length;
     void *host_address;
     uint64_t references;
-    bool cuda_registered;
+    CXLType2DirectRegistration *registration;
+    struct CXLType2DirectPhysical *group_next;
     struct CXLType2DirectPhysical *next;
 } CXLType2DirectPhysical;
 
@@ -358,6 +370,7 @@ typedef struct CXLType2State {
     bool cuda_direct_source;
     Object *direct_source_fs;
     CXLType2DirectPhysical *direct_physicals;
+    CXLType2DirectRegistration *direct_registrations;
     GTree *direct_physical_ranges;
     CXLType2DirectSource *direct_sources;
     uint64_t next_direct_source_id;
@@ -415,6 +428,11 @@ typedef struct CXLType2State {
         uint64_t active_direct_physical_register_ns;
         uint64_t active_direct_registration_views;
         uint64_t active_direct_registration_bytes;
+        uint64_t active_direct_registration_groups;
+        uint64_t active_direct_group_members;
+        uint64_t active_direct_max_group_members;
+        uint64_t active_direct_retained_groups;
+        uint64_t active_direct_peak_retained_groups;
         uint64_t active_direct_coalesced_views;
         uint64_t active_direct_max_registration_views;
         uint64_t active_direct_physical_boundaries;
