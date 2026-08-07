@@ -2742,6 +2742,7 @@ static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
     ct2d->paired_case.active_direct_physical_register_ns = 0;
     ct2d->paired_case.active_direct_registration_views = 0;
     ct2d->paired_case.active_direct_registration_bytes = 0;
+    ct2d->paired_case.active_direct_registration_padding_bytes = 0;
     ct2d->paired_case.active_direct_registration_groups = 0;
     ct2d->paired_case.active_direct_group_members = 0;
     ct2d->paired_case.active_direct_max_group_members = 0;
@@ -2983,6 +2984,10 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             " physical_register_ns=%" PRIu64
             " registration_views=%" PRIu64
             " registration_bytes=%" PRIu64
+            " registration_padding_bytes=%" PRIu64
+            " registration_tile_size=%" PRIu64
+            " registration_padding_limit=%" PRIu64
+            " retained_registration_padding_bytes=%" PRIu64
             " registration_groups=%" PRIu64
             " group_members=%" PRIu64
             " max_group_members=%" PRIu64
@@ -3022,6 +3027,10 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             ct2d->paired_case.active_direct_physical_register_ns,
             ct2d->paired_case.active_direct_registration_views,
             ct2d->paired_case.active_direct_registration_bytes,
+            ct2d->paired_case.active_direct_registration_padding_bytes,
+            ct2d->direct_registration_tile_size,
+            ct2d->direct_registration_padding_limit,
+            ct2d->direct_registration_padding_bytes,
             ct2d->paired_case.active_direct_registration_groups,
             ct2d->paired_case.active_direct_group_members,
             ct2d->paired_case.active_direct_max_group_members,
@@ -3403,6 +3412,9 @@ static void cxl_type2_direct_physical_unlink(CXLType2State *ct2d,
         cursor = &(*cursor)->next;
     }
     *cursor = physical->next;
+    g_assert(ct2d->direct_registration_padding_bytes >=
+             physical->padding_bytes);
+    ct2d->direct_registration_padding_bytes -= physical->padding_bytes;
     g_assert(ct2d->paired_case.active_direct_retained_physicals > 0);
     ct2d->paired_case.active_direct_retained_physicals--;
     g_free(physical);
@@ -3482,6 +3494,8 @@ static int cxl_type2_direct_registration_ensure(
             registration->view_count;
         ct2d->paired_case.active_direct_registration_bytes +=
             registration->length;
+        ct2d->paired_case.active_direct_registration_padding_bytes +=
+            registration->padding_bytes;
         ct2d->paired_case.active_direct_registration_groups++;
         ct2d->paired_case.active_direct_group_members +=
             registration->member_count;
@@ -3856,6 +3870,7 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
         GPtrArray *new_groups = g_ptr_array_new();
         uint32_t *wire_first_view = g_new(uint32_t, header.run_count);
         uint32_t *wire_view_count = g_new0(uint32_t, header.run_count);
+        uint64_t pending_padding_bytes = 0;
 
         /* Pin every missing mapping segment before choosing CUDA ranges. */
         for (uint32_t i = 0; i < header.run_count;) {
@@ -3906,14 +3921,50 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
                 } else {
                     VirtioSharedMemoryMapping *pinned_mapping;
                     uint64_t pinned_generation;
+                    uint64_t following_offset;
+                    uint64_t padding_budget = 0;
+                    uint64_t pin_length;
                     void *mapping_host;
 
                     segment_length = physical
                                          ? MIN(group_length,
                                                physical->mapping_offset - cursor)
                                          : group_length;
+                    if (validated[i].mapping->offset >
+                        UINT64_MAX - validated[i].mapping->len) {
+                        result = CXL_GPU_ERROR_INVALID_VALUE;
+                        *failure_stage_out = "mapping-bounds";
+                        *failure_index_out = i;
+                        goto view_rollback;
+                    }
+                    following_offset = physical
+                                           ? physical->mapping_offset
+                                           : validated[i].mapping->offset +
+                                                 validated[i].mapping->len;
+                    if (ct2d->direct_registration_padding_bytes <
+                            ct2d->direct_registration_padding_limit &&
+                        pending_padding_bytes <
+                            ct2d->direct_registration_padding_limit -
+                                ct2d->direct_registration_padding_bytes) {
+                        padding_budget =
+                            ct2d->direct_registration_padding_limit -
+                            ct2d->direct_registration_padding_bytes -
+                            pending_padding_bytes;
+                    }
+                    pin_length = cxl_gpu_direct_registration_length(
+                        validated[i].mapping->offset,
+                        validated[i].mapping->len, cursor, segment_length,
+                        following_offset,
+                        ct2d->direct_registration_tile_size,
+                        padding_budget);
+                    if (!pin_length) {
+                        result = CXL_GPU_ERROR_INVALID_VALUE;
+                        *failure_stage_out = "registration-tile";
+                        *failure_index_out = i;
+                        goto view_rollback;
+                    }
                     if (virtio_shared_memory_pin_range(
-                            shmem, cursor, segment_length, &pinned_mapping,
+                            shmem, cursor, pin_length, &pinned_mapping,
                             &pinned_generation, &mapping_host,
                             cxl_type2_direct_mapping_prepare_revoke,
                             ct2d) != 0) {
@@ -3939,8 +3990,10 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
                     physical->mapping = pinned_mapping;
                     physical->generation = pinned_generation;
                     physical->mapping_offset = cursor;
-                    physical->length = segment_length;
+                    physical->length = pin_length;
+                    physical->padding_bytes = pin_length - segment_length;
                     physical->host_address = mapping_host;
+                    pending_padding_bytes += physical->padding_bytes;
                     g_ptr_array_add(pending, physical);
                 }
                 cursor += segment_length;
@@ -3958,6 +4011,7 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
             CXLType2DirectRegistration *registration;
             uintptr_t base = (uintptr_t)member->host_address;
             uint64_t registration_length = member->length;
+            uint64_t registration_padding = member->padding_bytes;
             guint end = first + 1;
 
             while (end < pending->len) {
@@ -3970,11 +4024,13 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
                     break;
                 }
                 registration_length += next->length;
+                registration_padding += next->padding_bytes;
                 end++;
             }
             registration = g_new0(CXLType2DirectRegistration, 1);
             registration->host_address = member->host_address;
             registration->length = registration_length;
+            registration->padding_bytes = registration_padding;
             registration->member_count = end - first;
             registration->next = ct2d->direct_registrations;
             ct2d->direct_registrations = registration;
@@ -3996,6 +4052,8 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
                               physical, physical);
                 physical->next = ct2d->direct_physicals;
                 ct2d->direct_physicals = physical;
+                ct2d->direct_registration_padding_bytes +=
+                    physical->padding_bytes;
                 ct2d->paired_case.active_direct_cache_misses++;
                 ct2d->paired_case.active_direct_retained_physicals++;
                 ct2d->paired_case.active_direct_peak_retained_physicals =
@@ -8533,15 +8591,35 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
         ct2d->paired_case.active_case = CXL_GPU_CASE_NONE;
     }
 
+    if ((ct2d->direct_registration_tile_size ||
+         ct2d->direct_registration_padding_limit) &&
+        !ct2d->cuda_direct_source) {
+        error_setg(errp, "direct registration tiling requires "
+                   "cuda-direct-source=on");
+        return;
+    }
     if (ct2d->cuda_direct_source) {
         VirtioSharedMemory *source_shmem;
         MemoryRegion *source_mr;
+        size_t host_page_size = qemu_real_host_page_size();
 
         if (!ct2d->direct_source_fs ||
             !vhost_user_fs_pci_get_dax(ct2d->direct_source_fs,
                                        &source_shmem, &source_mr)) {
             error_setg(errp, "cuda-direct-source requires direct-source-fs "
                        "to reference a realized vhost-user-fs-pci DAX device");
+            return;
+        }
+        if (!!ct2d->direct_registration_tile_size !=
+            !!ct2d->direct_registration_padding_limit) {
+            error_setg(errp, "direct registration tile and padding limit "
+                       "must both be zero or both be nonzero");
+            return;
+        }
+        if ((ct2d->direct_registration_tile_size % host_page_size) ||
+            (ct2d->direct_registration_padding_limit % host_page_size)) {
+            error_setg(errp, "direct registration tile and padding limit "
+                       "must be host-page aligned");
             return;
         }
     }
@@ -8838,6 +8916,10 @@ static const Property cxl_type2_props[] = {
                      htod_staging_pool_size, 0),
     DEFINE_PROP_BOOL("cuda-direct-source", CXLType2State,
                      cuda_direct_source, false),
+    DEFINE_PROP_SIZE("cuda-direct-registration-tile-size", CXLType2State,
+                     direct_registration_tile_size, 0),
+    DEFINE_PROP_SIZE("cuda-direct-registration-padding-size", CXLType2State,
+                     direct_registration_padding_limit, 0),
     DEFINE_PROP_LINK("direct-source-fs", CXLType2State, direct_source_fs,
                      TYPE_VHOST_USER_FS_PCI, Object *),
     DEFINE_PROP_UINT64("sn", CXLType2State, sn, 0),

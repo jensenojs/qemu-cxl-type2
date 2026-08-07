@@ -457,6 +457,32 @@ static void test_direct_host_range_order_and_adjacency(void)
         0x1000, 0x1000, 0x2000, UINT64_MAX));
 }
 
+static void test_direct_registration_tile_bounds(void)
+{
+    const uint64_t mib = 1024 * 1024;
+
+    g_assert_cmpuint(cxl_gpu_direct_registration_length(
+                         64 * mib, 128 * mib, 80 * mib, 4 * mib,
+                         192 * mib, 64 * mib, 32 * mib),
+                     ==, 36 * mib);
+    g_assert_cmpuint(cxl_gpu_direct_registration_length(
+                         64 * mib, 128 * mib, 80 * mib, 4 * mib,
+                         96 * mib, 64 * mib, 32 * mib),
+                     ==, 16 * mib);
+    g_assert_cmpuint(cxl_gpu_direct_registration_length(
+                         64 * mib, 128 * mib, 80 * mib, 4 * mib,
+                         192 * mib, 64 * mib, 8 * mib),
+                     ==, 12 * mib);
+    g_assert_cmpuint(cxl_gpu_direct_registration_length(
+                         64 * mib, 128 * mib, 80 * mib, 4 * mib,
+                         192 * mib, 0, 32 * mib),
+                     ==, 4 * mib);
+    g_assert_cmpuint(cxl_gpu_direct_registration_length(
+                         64 * mib, 128 * mib, 60 * mib, 4 * mib,
+                         192 * mib, 64 * mib, 32 * mib),
+                     ==, 0);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -490,5 +516,7 @@ int main(int argc, char **argv)
                     test_direct_batch_wire_validation);
     g_test_add_func("/cxl/type2/direct/host-range-layout",
                     test_direct_host_range_order_and_adjacency);
+    g_test_add_func("/cxl/type2/direct/registration-tile-bounds",
+                    test_direct_registration_tile_bounds);
     return g_test_run();
 }

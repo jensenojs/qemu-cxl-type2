@@ -200,6 +200,7 @@ typedef struct CXLType2PendingHtoD {
 typedef struct CXLType2DirectRegistration {
     void *host_address;
     uint64_t length;
+    uint64_t padding_bytes;
     uint64_t references;
     uint64_t view_count;
     uint32_t member_count;
@@ -214,6 +215,7 @@ typedef struct CXLType2DirectPhysical {
     uint64_t generation;
     hwaddr mapping_offset;
     uint64_t length;
+    uint64_t padding_bytes;
     void *host_address;
     uint64_t references;
     CXLType2DirectRegistration *registration;
@@ -369,6 +371,9 @@ typedef struct CXLType2State {
     uint64_t htod_driver_frees;
     uint64_t htod_pool_evictions;
     bool cuda_direct_source;
+    uint64_t direct_registration_tile_size;
+    uint64_t direct_registration_padding_limit;
+    uint64_t direct_registration_padding_bytes;
     Object *direct_source_fs;
     CXLType2DirectPhysical *direct_physicals;
     CXLType2DirectRegistration *direct_registrations;
@@ -429,6 +434,7 @@ typedef struct CXLType2State {
         uint64_t active_direct_physical_register_ns;
         uint64_t active_direct_registration_views;
         uint64_t active_direct_registration_bytes;
+        uint64_t active_direct_registration_padding_bytes;
         uint64_t active_direct_registration_groups;
         uint64_t active_direct_group_members;
         uint64_t active_direct_max_group_members;

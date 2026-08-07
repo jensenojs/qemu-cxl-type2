@@ -74,5 +74,10 @@ bool cxl_gpu_direct_batch_validate(const uint8_t *payload,
 int cxl_gpu_direct_host_address_order(uintptr_t left, uintptr_t right);
 bool cxl_gpu_direct_host_range_follows(uintptr_t base, uint64_t length,
                                        uintptr_t next, uint64_t next_length);
+uint64_t cxl_gpu_direct_registration_length(
+    uint64_t mapping_offset, uint64_t mapping_length,
+    uint64_t request_offset, uint64_t request_length,
+    uint64_t following_offset, uint64_t tile_size,
+    uint64_t padding_budget);
 
 #endif
