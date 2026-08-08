@@ -41,6 +41,9 @@ typedef struct {
     int trans_count;
     unsigned long insns;
     uint64_t scope_start_count;
+    char *disassembly;
+    bool disassembly_truncated;
+    bool disassembly_ambiguous;
 } ExecCount;
 
 typedef struct {
@@ -86,6 +89,29 @@ static void exec_count_free(gpointer key, gpointer value, gpointer user_data)
 {
     ExecCount *cnt = value;
     qemu_plugin_scoreboard_free(cnt->exec_count);
+    g_free(cnt->disassembly);
+}
+
+static char *tb_disassembly(const struct qemu_plugin_tb *tb, size_t insns,
+                            bool *truncated)
+{
+    g_autoptr(GString) text = g_string_new(NULL);
+
+    *truncated = false;
+    for (size_t i = 0; i < insns; i++) {
+        struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
+        g_autofree char *disas = qemu_plugin_insn_disas(insn);
+        g_autofree char *entry = g_strdup_printf(
+            "%s0x%016" PRIx64 ":%s", i ? " | " : "",
+            qemu_plugin_insn_vaddr(insn), disas);
+
+        if (text->len + strlen(entry) > 512) {
+            *truncated = true;
+            break;
+        }
+        g_string_append(text, entry);
+    }
+    return g_string_free(g_steal_pointer(&text), false);
 }
 
 static void plugin_exit(qemu_plugin_id_t id, void *p)
@@ -215,13 +241,18 @@ static void scope_event(qemu_plugin_id_t id, const char *scope,
     for (guint i = 0; i < rows; i++) {
         ScopedCount *scoped = g_ptr_array_index(counts, i);
         ExecCount *cnt = scoped->count;
+        g_autofree char *disassembly_b64 = g_base64_encode(
+            (const guchar *)cnt->disassembly, strlen(cnt->disassembly));
 
         g_string_append_printf(
             report,
             "TCG_HOTBLOCK scope=%s %s rank=%u pc=0x%016" PRIx64
-            " instructions=%lu translations=%d executions=%" PRIu64 "\n",
+            " instructions=%lu translations=%d executions=%" PRIu64
+            " disassembly_b64=%s disassembly_truncated=%u"
+            " disassembly_ambiguous=%u\n",
             scope, identity, i + 1, cnt->start_addr, cnt->insns,
-            cnt->trans_count, scoped->executions);
+            cnt->trans_count, scoped->executions, disassembly_b64,
+            cnt->disassembly_truncated, cnt->disassembly_ambiguous);
     }
     qemu_plugin_outs(report->str);
     g_clear_pointer(&active_identity, g_free);
@@ -251,6 +282,9 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     ExecCount *cnt;
     uint64_t pc = qemu_plugin_tb_vaddr(tb);
     size_t insns = qemu_plugin_tb_n_insns(tb);
+    bool disassembly_truncated;
+    g_autofree char *disassembly = tb_disassembly(
+        tb, insns, &disassembly_truncated);
 
     g_mutex_lock(&lock);
     {
@@ -262,11 +296,17 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 
     if (cnt) {
         cnt->trans_count++;
+        if (g_strcmp0(cnt->disassembly, disassembly) != 0 ||
+            cnt->disassembly_truncated != disassembly_truncated) {
+            cnt->disassembly_ambiguous = true;
+        }
     } else {
         cnt = g_new0(ExecCount, 1);
         cnt->start_addr = pc;
         cnt->trans_count = 1;
         cnt->insns = insns;
+        cnt->disassembly = g_steal_pointer(&disassembly);
+        cnt->disassembly_truncated = disassembly_truncated;
         cnt->exec_count = qemu_plugin_scoreboard_new(sizeof(uint64_t));
         g_hash_table_insert(hotblocks, cnt, cnt);
     }
