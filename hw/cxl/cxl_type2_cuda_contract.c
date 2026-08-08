@@ -149,6 +149,28 @@ bool cxl_type2_cuda_adjacent_stream_sync_can_elide(
            previous_stream_wire == current_stream_wire;
 }
 
+bool cxl_type2_cuda_special_stream_from_wire(uint64_t wire,
+                                              void *per_thread_stream,
+                                              void **stream)
+{
+    if (!stream) {
+        return false;
+    }
+    if (wire == CXL_GPU_STREAM_WIRE_NULL) {
+        *stream = NULL;
+        return true;
+    }
+    if (wire == CXL_GPU_STREAM_WIRE_LEGACY) {
+        *stream = (void *)(uintptr_t)1;
+        return true;
+    }
+    if (wire == CXL_GPU_STREAM_WIRE_PER_THREAD && per_thread_stream) {
+        *stream = per_thread_stream;
+        return true;
+    }
+    return false;
+}
+
 int cxl_gpu_direct_host_address_order(uintptr_t left, uintptr_t right)
 {
     return left < right ? -1 : left > right;

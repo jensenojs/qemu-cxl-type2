@@ -562,6 +562,24 @@ static void test_stream_sync_requires_unchanged_work_generation(void)
         true, 8, 7));
 }
 
+static void test_per_thread_stream_uses_stable_qemu_handle(void)
+{
+    void *const qemu_stream = (void *)(uintptr_t)0x1234;
+    void *stream = NULL;
+
+    g_assert_true(cxl_type2_cuda_special_stream_from_wire(
+        CXL_GPU_STREAM_WIRE_PER_THREAD, qemu_stream, &stream));
+    g_assert_true(stream == qemu_stream);
+    g_assert_true(stream != (void *)(uintptr_t)2);
+
+    stream = NULL;
+    g_assert_true(cxl_type2_cuda_special_stream_from_wire(
+        CXL_GPU_STREAM_WIRE_PER_THREAD, qemu_stream, &stream));
+    g_assert_true(stream == qemu_stream);
+    g_assert_false(cxl_type2_cuda_special_stream_from_wire(
+        CXL_GPU_STREAM_WIRE_PER_THREAD, NULL, &stream));
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -605,5 +623,7 @@ int main(int argc, char **argv)
                     test_stream_progress_classification);
     g_test_add_func("/cxl/type2/stream/sync-generation",
                     test_stream_sync_requires_unchanged_work_generation);
+    g_test_add_func("/cxl/type2/stream/per-thread-stable-handle",
+                    test_per_thread_stream_uses_stable_qemu_handle);
     return g_test_run();
 }

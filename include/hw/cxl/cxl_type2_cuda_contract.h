@@ -33,6 +33,9 @@ bool cxl_type2_cuda_adjacent_stream_sync_can_elide(
     bool previous_command_was_successful_sync,
     uint64_t previous_stream_wire,
     uint64_t current_stream_wire);
+bool cxl_type2_cuda_special_stream_from_wire(uint64_t wire,
+                                              void *per_thread_stream,
+                                              void **stream);
 bool cxl_type2_cuda_mem_info_is_allowed(bool active_case, bool live_context,
                                         uint64_t token, uint64_t active_epoch);
 

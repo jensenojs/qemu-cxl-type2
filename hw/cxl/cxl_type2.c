@@ -3472,17 +3472,11 @@ static bool cxl_type2_stream_from_wire(CXLType2State *ct2d, uint64_t wire,
     if (!stream) {
         return false;
     }
-    if (wire == CXL_GPU_STREAM_WIRE_NULL) {
-        *stream = NULL;
-        return true;
-    }
-    if (wire == CXL_GPU_STREAM_WIRE_LEGACY) {
-        *stream = (void *)(uintptr_t)1;
-        return true;
-    }
-    if (wire == CXL_GPU_STREAM_WIRE_PER_THREAD) {
-        *stream = (void *)(uintptr_t)2;
-        return true;
+    if (wire == CXL_GPU_STREAM_WIRE_NULL ||
+        wire == CXL_GPU_STREAM_WIRE_LEGACY ||
+        wire == CXL_GPU_STREAM_WIRE_PER_THREAD) {
+        return cxl_type2_cuda_special_stream_from_wire(
+            wire, ct2d->gpu_cmd.per_thread_stream, stream);
     }
     if (wire > UINT32_MAX || wire >= ct2d->gpu_cmd.num_streams ||
         !ct2d->gpu_cmd.streams[wire]) {
@@ -5244,11 +5238,25 @@ static int cxl_type2_clear_gpu_handles(CXLType2State *ct2d,
         category_error = 0;
         completed = 0;
         total = cxl_type2_count_live_handles(ct2d->gpu_cmd.streams,
-                                             ct2d->gpu_cmd.num_streams);
+                                             ct2d->gpu_cmd.num_streams) +
+                (ct2d->gpu_cmd.per_thread_stream != NULL);
         if (log_stages) {
             cxl_type2_log_kimi_cleanup_progress(run_binding, case_kind, epoch,
                                                 operations[1], "begin",
                                                 completed, total, 0, false);
+        }
+        if (ct2d->gpu_cmd.per_thread_stream) {
+            int error = hetgpu_cuda_stream_destroy(
+                hetgpu, ct2d->gpu_cmd.per_thread_stream);
+
+            if (category_error == 0 && error != 0) {
+                category_error = error;
+            }
+            if (first_error == 0 && error != 0) {
+                first_error = error;
+            }
+            ct2d->gpu_cmd.per_thread_stream = NULL;
+            completed++;
         }
         for (uint32_t i = 0; i < ct2d->gpu_cmd.num_streams; i++) {
             if (ct2d->gpu_cmd.streams[i]) {
@@ -5365,6 +5373,7 @@ static int cxl_type2_clear_gpu_handles(CXLType2State *ct2d,
     ct2d->gpu_cmd.link_states = NULL;
     ct2d->gpu_cmd.streams = NULL;
     ct2d->gpu_cmd.events = NULL;
+    ct2d->gpu_cmd.per_thread_stream = NULL;
     ct2d->gpu_cmd.modules_capacity = 0;
     ct2d->gpu_cmd.functions_capacity = 0;
     ct2d->gpu_cmd.graphs_capacity = 0;
@@ -6084,6 +6093,19 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
     case CXL_GPU_CMD_CTX_CREATE:
         if (hetgpu->initialized) {
             err = hetgpu_create_context(hetgpu);
+            if (err == HETGPU_SUCCESS &&
+                !ct2d->gpu_cmd.per_thread_stream) {
+                void *stream = NULL;
+                int stream_result =
+                    hetgpu_cuda_stream_create(hetgpu, 1U, &stream);
+
+                if (stream_result == CXL_GPU_SUCCESS) {
+                    ct2d->gpu_cmd.per_thread_stream = stream;
+                } else {
+                    ct2d->gpu_cmd.cmd_result = stream_result;
+                    break;
+                }
+            }
             if (err == HETGPU_SUCCESS && ct2d->paired_case.active_epoch != 0) {
                 ct2d->gpu_cmd.results[0] = ct2d->paired_case.active_epoch;
             } else {

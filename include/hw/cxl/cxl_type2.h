@@ -356,6 +356,9 @@ typedef struct CXLType2State {
         void    **link_states;         /* CUDA JIT link state handles */
         void    **streams;             /* CUDA stream handles */
         void    **events;              /* CUDA event handles */
+        /* knockout: one stable stream serializes PTDS across guest threads;
+         * restore thread-local concurrency when the wire carries guest TID. */
+        void     *per_thread_stream;
         size_t   modules_capacity;
         size_t   functions_capacity;
         size_t   graphs_capacity;
