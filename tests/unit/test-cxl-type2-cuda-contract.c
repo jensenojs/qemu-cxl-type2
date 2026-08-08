@@ -465,6 +465,19 @@ static void test_direct_host_range_order_and_adjacency(void)
         0x1000, 0x1000, 0x2000, UINT64_MAX));
 }
 
+static void test_direct_registration_mapping_owner(void)
+{
+    g_assert_true(cxl_gpu_direct_registration_group_follows(
+        1, 0x1000, 0x1000, 1, 0x2000, 0x1000));
+
+    g_assert_false(cxl_gpu_direct_registration_group_follows(
+        1, 0x1000, 0x1000, 2, 0x1000, 0x1000));
+    g_assert_false(cxl_gpu_direct_registration_group_follows(
+        1, 0x1000, 0x1000, 2, 0x1800, 0x1000));
+    g_assert_false(cxl_gpu_direct_registration_group_follows(
+        1, 0x1000, 0x1000, 2, 0x2000, 0x1000));
+}
+
 static void test_direct_copy_span_adjacency(void)
 {
     g_assert_true(cxl_gpu_direct_copy_span_follows(
@@ -511,27 +524,6 @@ static void test_direct_registration_tile_bounds(void)
                          64 * mib, 128 * mib, 60 * mib, 4 * mib,
                          192 * mib, 64 * mib, 32 * mib),
                      ==, 0);
-}
-
-static void test_direct_registration_tile_end(void)
-{
-    const uint64_t mib = 1024 * 1024;
-
-    g_assert_cmpuint(cxl_gpu_direct_registration_tile_end(
-                         2 * mib, 256 * mib, 64 * mib),
-                     ==, 64 * mib);
-    g_assert_cmpuint(cxl_gpu_direct_registration_tile_end(
-                         64 * mib, 256 * mib, 64 * mib),
-                     ==, 64 * mib);
-    g_assert_cmpuint(cxl_gpu_direct_registration_tile_end(
-                         250 * mib, 256 * mib, 64 * mib),
-                     ==, 256 * mib);
-    g_assert_cmpuint(cxl_gpu_direct_registration_tile_end(
-                         257 * mib, 256 * mib, 64 * mib),
-                     ==, 0);
-    g_assert_cmpuint(cxl_gpu_direct_registration_tile_end(
-                         UINT64_MAX - 1, UINT64_MAX, 64),
-                     ==, UINT64_MAX);
 }
 
 static void test_stream_progress_classification(void)
@@ -600,12 +592,12 @@ int main(int argc, char **argv)
                     test_direct_batch_wire_validation);
     g_test_add_func("/cxl/type2/direct/host-range-layout",
                     test_direct_host_range_order_and_adjacency);
+    g_test_add_func("/cxl/type2/direct/registration-mapping-owner",
+                    test_direct_registration_mapping_owner);
     g_test_add_func("/cxl/type2/direct/copy-span-layout",
                     test_direct_copy_span_adjacency);
     g_test_add_func("/cxl/type2/direct/registration-tile-bounds",
                     test_direct_registration_tile_bounds);
-    g_test_add_func("/cxl/type2/direct/registration-tile-end",
-                    test_direct_registration_tile_end);
     g_test_add_func("/cxl/type2/stream/progress-classification",
                     test_stream_progress_classification);
     g_test_add_func("/cxl/type2/stream/sync-generation",

@@ -159,6 +159,15 @@ bool cxl_gpu_direct_host_range_follows(uintptr_t base, uint64_t length,
            next_length <= UINT64_MAX - length;
 }
 
+bool cxl_gpu_direct_registration_group_follows(
+    uintptr_t mapping, uintptr_t base, uint64_t length,
+    uintptr_t next_mapping, uintptr_t next, uint64_t next_length)
+{
+    return mapping == next_mapping &&
+           cxl_gpu_direct_host_range_follows(
+               base, length, next, next_length);
+}
+
 bool cxl_gpu_direct_copy_span_follows(
     uintptr_t source, uintptr_t registration, uintptr_t host,
     uint64_t destination, uint64_t length, uintptr_t next_source,
@@ -216,23 +225,6 @@ uint64_t cxl_gpu_direct_registration_length(
                 : request_end + padding_budget;
     tile_end = MIN(tile_end, limit);
     return tile_end - request_offset;
-}
-
-uint64_t cxl_gpu_direct_registration_tile_end(
-    uint64_t offset, uint64_t window_size, uint64_t tile_size)
-{
-    uint64_t remainder;
-    uint64_t advance;
-
-    if (!tile_size || offset > window_size) {
-        return 0;
-    }
-    remainder = offset % tile_size;
-    if (!remainder || offset == window_size) {
-        return offset;
-    }
-    advance = tile_size - remainder;
-    return advance > window_size - offset ? window_size : offset + advance;
 }
 
 bool cxl_type2_cuda_mem_info_is_allowed(bool active_case, bool live_context,
