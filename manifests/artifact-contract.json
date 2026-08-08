@@ -3,7 +3,7 @@
   "component": "qemu-cxl-type2",
   "source_repository": "https://cnb.cool/gevico.online/jensen/qemu-cxl-type2.git",
   "artifact_repository": "docker.cnb.cool/gevico.online/jensen/qemu-cxl-type2",
-  "toolchain_image": "docker.cnb.cool/gevico.online/jensen/cxl-lab@sha256:75ce78ba92bc5b62c15437d959223b962e659e95481bb7cca4d48fbc985def53",
+  "toolchain_image": "docker.cnb.cool/gevico.online/jensen/cxl-lab@sha256:e74cee9e7350b26b11e7487509083cc3aacfd2f44280805ac4bd8f89eeb280d8",
   "oras_image": "ghcr.io/oras-project/oras@sha256:a4c54befd87d0366e0ba3ac3a9536a5288c8a3735acd3b635cdace59a2c559c8",
   "artifact_type": "application/vnd.gevico.cxl.component.v1",
   "archive_media_type": "application/vnd.gevico.cxl.component.layer.v1.tar+zstd",
