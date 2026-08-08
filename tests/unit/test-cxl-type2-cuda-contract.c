@@ -137,16 +137,6 @@ static void test_descriptor_rejects_wire_errors(void)
                         sizeof(uint32_t), 3, 6, 6, false, 0),
                     ==, CXL_TYPE2_DESCRIPTOR_INVALID_HEADER);
     request = valid_descriptor_request();
-    request.sync_hint_device_generation = 3;
-    request.sync_hint_case_epoch = 9;
-    request.sync_hint_stream_wire = 11;
-    request.sync_hint_valid = 1;
-    request.guest_elided_stream_syncs = 17;
-    g_assert_cmpint(validate_descriptor(
-                        &request, CXL_GPU_DESCRIPTOR_DOORBELL_VALUE,
-                        sizeof(uint32_t), 3, 6, 6, false, 0),
-                    ==, CXL_TYPE2_DESCRIPTOR_ACCEPT);
-    request = valid_descriptor_request();
     request.reserved[0] = 1;
     g_assert_cmpint(validate_descriptor(
                         &request, CXL_GPU_DESCRIPTOR_DOORBELL_VALUE,
@@ -294,7 +284,7 @@ static void test_batch_wire_layout_and_validation(void)
     g_assert_cmphex(CXL_GPU_CMD_SOURCE_REGISTER_BATCH_HTOD_DIRECT_ASYNC,
                     ==, 0x35);
     g_assert_cmphex(CXL_GPU_CMD_MEM_COPY_DTOD_ASYNC, ==, 0x2f);
-    g_assert_cmpuint(CXL_GPU_DESCRIPTOR_PROTOCOL_VERSION, ==, 2);
+    g_assert_cmpuint(CXL_GPU_DESCRIPTOR_PROTOCOL_VERSION, ==, 1);
     g_assert_cmpuint(CXL_GPU_CASE_PROTOCOL_VERSION, ==, 1);
     g_assert_cmphex(CXL_GPU_BATCH_DATA_OFFSET, ==, UINT64_C(0x802000));
     g_assert_cmphex(CXL_GPU_CMD_REG_SIZE, ==, UINT64_C(0x2802000));
