@@ -2734,6 +2734,40 @@ static void cxl_type2_log_interval_summary(
              next_operation, ledger->first_error ? ledger->first_error : "none");
 }
 
+static void cxl_type2_sync_hint_invalidate(CXLType2State *ct2d)
+{
+    CXLGPURAMCommandDescriptor *descriptor = ct2d->gpu_cmd.descriptor;
+
+    if (descriptor) {
+        qatomic_store_release(&descriptor->sync_hint_valid, 0);
+    }
+}
+
+static void cxl_type2_sync_hint_invalidate_stream(CXLType2State *ct2d,
+                                                  uint64_t stream_wire)
+{
+    CXLGPURAMCommandDescriptor *descriptor = ct2d->gpu_cmd.descriptor;
+
+    if (descriptor && descriptor->sync_hint_valid &&
+        descriptor->sync_hint_stream_wire == stream_wire) {
+        qatomic_store_release(&descriptor->sync_hint_valid, 0);
+    }
+}
+
+static void cxl_type2_sync_hint_publish(CXLType2State *ct2d,
+                                        uint64_t stream_wire)
+{
+    CXLGPURAMCommandDescriptor *descriptor = ct2d->gpu_cmd.descriptor;
+
+    if (!descriptor) {
+        return;
+    }
+    descriptor->sync_hint_device_generation = ct2d->gpu_cmd.device_generation;
+    descriptor->sync_hint_case_epoch = ct2d->paired_case.active_epoch;
+    descriptor->sync_hint_stream_wire = stream_wire;
+    qatomic_store_release(&descriptor->sync_hint_valid, 1);
+}
+
 static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
 {
     int64_t span_begin_ns = cxl_type2_host_monotonic_ns();
@@ -2817,6 +2851,10 @@ static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
     ct2d->paired_case.active_stream_work_commands = 0;
     ct2d->paired_case.active_stream_sync_driver_calls = 0;
     ct2d->paired_case.active_elided_stream_syncs = 0;
+    cxl_type2_sync_hint_invalidate(ct2d);
+    if (ct2d->gpu_cmd.descriptor) {
+        ct2d->gpu_cmd.descriptor->guest_elided_stream_syncs = 0;
+    }
     if (ct2d->paired_case.stream_progress) {
         g_hash_table_remove_all(ct2d->paired_case.stream_progress);
     }
@@ -3091,7 +3129,8 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
              " htod_peak_pooled_bytes=%" PRIu64
              " stream_work_commands=%" PRIu64
              " stream_sync_driver_calls=%" PRIu64
-             " elided_stream_syncs=%" PRIu64 "\n",
+             " elided_stream_syncs=%" PRIu64
+             " guest_elided_stream_syncs=%" PRIu64 "\n",
              run_binding, cxl_type2_paired_case_name(case_kind), epoch,
              command_scope->command_count,
              command_scope->command_failures,
@@ -3112,7 +3151,10 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
              ct2d->paired_case.active_htod_peak_pooled_bytes,
              ct2d->paired_case.active_stream_work_commands,
              ct2d->paired_case.active_stream_sync_driver_calls,
-             ct2d->paired_case.active_elided_stream_syncs);
+             ct2d->paired_case.active_elided_stream_syncs,
+             ct2d->gpu_cmd.descriptor
+                 ? ct2d->gpu_cmd.descriptor->guest_elided_stream_syncs
+                 : 0);
 
     qemu_log("KIMI_CXL_REQUEST_SUMMARY run_binding=%" PRIu64
              " case=%s epoch=%" PRIu64
@@ -5899,6 +5941,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             ct2d, ct2d->gpu_cmd.params[0]);
 
     if (stream_progress_command) {
+        cxl_type2_sync_hint_invalidate_stream(ct2d, stream_work_wire);
         cxl_type2_stream_progress_record_work(ct2d, stream_work_wire);
     }
 
@@ -7673,6 +7716,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             ct2d->gpu_cmd.cmd_result = result;
             if (result == CXL_GPU_SUCCESS) {
                 ct2d->gpu_cmd.streams[id] = NULL;
+                cxl_type2_sync_hint_invalidate_stream(ct2d, id);
                 if (ct2d->paired_case.stream_progress) {
                     g_hash_table_remove(ct2d->paired_case.stream_progress,
                                         &id);
@@ -7688,6 +7732,8 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
                 break;
             }
+            cxl_type2_sync_hint_invalidate_stream(
+                ct2d, ct2d->gpu_cmd.params[0]);
             void *stream = NULL;
             if (!cxl_type2_stream_from_wire(ct2d, ct2d->gpu_cmd.params[0],
                                             &stream)) {
@@ -8732,6 +8778,11 @@ complete:
         ct2d->gpu_cmd.cmd_result == CXL_GPU_SUCCESS) {
         cxl_type2_stream_progress_record_sync(ct2d,
                                               ct2d->gpu_cmd.params[0]);
+        cxl_type2_sync_hint_publish(ct2d, ct2d->gpu_cmd.params[0]);
+    } else if ((cmd == CXL_GPU_CMD_CTX_DESTROY ||
+                cmd == CXL_GPU_CMD_CASE_END) &&
+               ct2d->gpu_cmd.cmd_result == CXL_GPU_SUCCESS) {
+        cxl_type2_sync_hint_invalidate(ct2d);
     }
     hetgpu_cuda_trace_set_call_id(0);
     ct2d->gpu_cmd.cmd_status = CXL_GPU_CMD_STATUS_COMPLETE;

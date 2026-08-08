@@ -41,7 +41,7 @@
 #define CXL_GPU_DESCRIPTOR_OFFSET 0x801000
 #define CXL_GPU_DESCRIPTOR_REGION_SIZE 0x1000
 #define CXL_GPU_DESCRIPTOR_WIRE_SIZE 0x0100
-#define CXL_GPU_DESCRIPTOR_PROTOCOL_VERSION 1U
+#define CXL_GPU_DESCRIPTOR_PROTOCOL_VERSION 2U
 #define CXL_GPU_DESCRIPTOR_DOORBELL_OFFSET CXL_GPU_REG_CMD
 #define CXL_GPU_DESCRIPTOR_DOORBELL_VALUE 1U
 
@@ -65,7 +65,12 @@ typedef struct CXLGPURAMCommandDescriptor {
     uint64_t results[4];
     uint64_t active_case_epoch;
     uint64_t device_generation;
-    uint8_t reserved[0x40];
+    uint64_t sync_hint_device_generation;
+    uint64_t sync_hint_case_epoch;
+    uint64_t sync_hint_stream_wire;
+    uint64_t sync_hint_valid;
+    uint64_t guest_elided_stream_syncs;
+    uint8_t reserved[0x18];
 } CXLGPURAMCommandDescriptor;
 
 _Static_assert(sizeof(CXLGPURAMCommandDescriptor) == CXL_GPU_DESCRIPTOR_WIRE_SIZE,
@@ -84,6 +89,14 @@ _Static_assert(offsetof(CXLGPURAMCommandDescriptor, active_case_epoch) == 0xb0,
                "CXL GPU case epoch offset mismatch");
 _Static_assert(offsetof(CXLGPURAMCommandDescriptor, device_generation) == 0xb8,
                "CXL GPU generation offset mismatch");
+_Static_assert(offsetof(CXLGPURAMCommandDescriptor,
+                        sync_hint_device_generation) == 0xc0,
+               "CXL GPU sync hint generation offset mismatch");
+_Static_assert(offsetof(CXLGPURAMCommandDescriptor, sync_hint_valid) == 0xd8,
+               "CXL GPU sync hint validity offset mismatch");
+_Static_assert(offsetof(CXLGPURAMCommandDescriptor,
+                        guest_elided_stream_syncs) == 0xe0,
+               "CXL GPU guest elided sync counter offset mismatch");
 
 /* Device info registers */
 #define CXL_GPU_REG_DEV_NAME        0x0100  /* Device name (64 bytes) */
