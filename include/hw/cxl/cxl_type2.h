@@ -286,6 +286,21 @@ typedef struct CXLType2IntervalLedger {
     const char *first_error;
 } CXLType2IntervalLedger;
 
+typedef struct CXLType2CommandScopeLedger {
+    bool active;
+    uint64_t command_count;
+    uint64_t command_failures;
+    uint64_t command_busy_ns;
+    int64_t first_command_host_ns;
+    int64_t last_command_host_ns;
+    uint64_t command_calls[256];
+    uint64_t command_busy_ns_by_command[256];
+    uint64_t driver_calls_by_command[256];
+    uint64_t driver_busy_ns_by_command[256];
+    CXLType2IntervalLedger command_intervals;
+    CXLType2IntervalLedger driver_intervals;
+} CXLType2CommandScopeLedger;
+
 /* Main Type 2 device state */
 typedef struct CXLType2State {
     PCIDevice parent_obj;
@@ -401,19 +416,10 @@ typedef struct CXLType2State {
         uint64_t active_epoch;
         uint64_t active_first_sequence;
         uint64_t active_config_binding;
-        uint64_t active_command_count;
-        uint64_t active_command_failures;
-        uint64_t active_command_busy_ns;
-        int64_t active_first_command_host_ns;
-        int64_t active_last_command_host_ns;
-        uint64_t active_command_calls[256];
-        uint64_t active_command_busy_ns_by_command[256];
-        uint64_t active_driver_calls_by_command[256];
-        uint64_t active_driver_busy_ns_by_command[256];
+        CXLType2CommandScopeLedger case_command_scope;
+        CXLType2CommandScopeLedger decode_command_scope;
         uint64_t active_command_sequence;
         uint32_t active_command_code;
-        CXLType2IntervalLedger command_intervals;
-        CXLType2IntervalLedger driver_intervals;
         uint64_t active_cxl_request_count;
         uint64_t active_cxl_read_count;
         uint64_t active_cxl_write_count;

@@ -227,11 +227,21 @@ void hetgpu_set_driver_interval_callback(
     state->driver_interval_opaque = opaque;
 }
 
+static int64_t hetgpu_driver_monotonic_ns(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return 0;
+    }
+    return now.tv_sec * NANOSECONDS_PER_SECOND + now.tv_nsec;
+}
+
 #define HETGPU_CUDA_CALL_STATE(driver_state, field, ...)                       \
   ({                                                                           \
     HetGPUState *_driver_state = (driver_state);                               \
     uint32_t _driver_occurrence = ++g_cuda_trace_occurrence;                   \
-    int64_t _driver_start_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);             \
+    int64_t _driver_start_ns = hetgpu_driver_monotonic_ns();                   \
     if (g_cuda_trace_detailed_logs) {                                          \
       qemu_log("CXL TYPE2 TRACE driver_begin call_id=0x%016" PRIx64            \
                " occurrence=%u symbol=%s host_ns=%" PRId64 "\n",               \
@@ -239,7 +249,7 @@ void hetgpu_set_driver_interval_callback(
                _driver_start_ns);                                              \
     }                                                                          \
     int _driver_result = g_cuda_funcs.field(__VA_ARGS__);                      \
-    int64_t _driver_end_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);               \
+    int64_t _driver_end_ns = hetgpu_driver_monotonic_ns();                     \
     if (_driver_state && _driver_state->driver_interval_callback) {            \
       _driver_state->driver_interval_callback(                                 \
           _driver_state->driver_interval_opaque, g_cuda_trace_call_id,         \

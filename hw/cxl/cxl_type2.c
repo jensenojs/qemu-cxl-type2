@@ -76,6 +76,16 @@ extern int LZ4_decompress_safe(const char *src, char *dst,
 #define CXL_CUDA_MEMHOSTREGISTER_PORTABLE 0x01U
 #define CXL_CUDA_MEMHOSTREGISTER_READ_ONLY 0x08U
 
+static int64_t cxl_type2_host_monotonic_ns(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return 0;
+    }
+    return now.tv_sec * NANOSECONDS_PER_SECOND + now.tv_nsec;
+}
+
 typedef struct QEMU_PACKED CXLMemSimRequest {
     uint8_t op_type;
     uint64_t addr;
@@ -2519,6 +2529,19 @@ static void cxl_type2_interval_reset(
     };
 }
 
+static void cxl_type2_command_scope_reset(
+    CXLType2CommandScopeLedger *scope, int64_t span_begin_ns,
+    CXLType2IntervalIdentity span_begin_identity)
+{
+    *scope = (CXLType2CommandScopeLedger) {
+        .active = true,
+    };
+    cxl_type2_interval_reset(&scope->command_intervals, span_begin_ns,
+                             span_begin_identity);
+    cxl_type2_interval_reset(&scope->driver_intervals, span_begin_ns,
+                             span_begin_identity);
+}
+
 static void cxl_type2_interval_consider_gap(
     CXLType2IntervalLedger *ledger, int64_t begin_ns, int64_t end_ns,
     CXLType2IntervalIdentity previous, CXLType2IntervalIdentity next)
@@ -2610,6 +2633,17 @@ static void cxl_type2_interval_finish(
     }
 }
 
+static void cxl_type2_command_scope_finish(
+    CXLType2CommandScopeLedger *scope, int64_t span_end_ns,
+    CXLType2IntervalIdentity span_end_identity)
+{
+    cxl_type2_interval_finish(&scope->command_intervals, span_end_ns,
+                              span_end_identity);
+    cxl_type2_interval_finish(&scope->driver_intervals, span_end_ns,
+                              span_end_identity);
+    scope->active = false;
+}
+
 static void cxl_type2_interval_format_identity(
     const CXLType2IntervalIdentity *identity, char *sequence,
     size_t sequence_size, char *operation, size_t operation_size)
@@ -2636,7 +2670,7 @@ static void cxl_type2_interval_format_identity(
 
 static void cxl_type2_log_interval_summary(
     uint64_t run_binding, uint32_t case_kind, uint64_t epoch,
-    const char *category, CXLType2IntervalLedger *ledger)
+    const char *scope, const char *category, CXLType2IntervalLedger *ledger)
 {
     uint64_t span_duration_ns = ledger->span_end_ns >= ledger->span_begin_ns
                                     ? ledger->span_end_ns - ledger->span_begin_ns
@@ -2671,7 +2705,7 @@ static void cxl_type2_log_interval_summary(
 
     qemu_log("KIMI_INTERVAL_SUMMARY schema=interval-summary-v1 producer=qemu"
              " clock_domain=host-monotonic run_binding=%" PRIu64
-             " case=%s case_epoch=%" PRIu64 " scope=case category=%s owner=qemu"
+             " case=%s case_epoch=%" PRIu64 " scope=%s category=%s owner=qemu"
              " status=%s span_begin_ns=%" PRId64 " span_end_ns=%" PRId64
              " interval_count=%" PRIu64 " total_duration_ns=%" PRIu64
              " union_duration_ns=%" PRIu64 " overlap_duration_ns=%" PRIu64
@@ -2681,7 +2715,7 @@ static void cxl_type2_log_interval_summary(
              " previous_operation=%s next_sequence=%s next_owner=%s"
              " next_category=%s next_operation=%s first_error=%s\n",
              run_binding, cxl_type2_paired_case_name(case_kind), epoch,
-             category, ledger->first_error ? "incomplete" : "complete",
+             scope, category, ledger->first_error ? "incomplete" : "complete",
              ledger->span_begin_ns, ledger->span_end_ns,
              ledger->interval_count, ledger->total_duration_ns,
              ledger->union_duration_ns, overlap_duration_ns, gap_duration_ns,
@@ -2702,30 +2736,16 @@ static void cxl_type2_log_interval_summary(
 
 static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
 {
-    int64_t span_begin_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+    int64_t span_begin_ns = cxl_type2_host_monotonic_ns();
     CXLType2IntervalIdentity begin_identity = cxl_type2_interval_identity(
         ct2d->paired_case.active_first_sequence, "qemu", "case", "case-begin",
         0, false);
 
-    ct2d->paired_case.active_command_count = 0;
-    ct2d->paired_case.active_command_failures = 0;
-    ct2d->paired_case.active_command_busy_ns = 0;
-    ct2d->paired_case.active_first_command_host_ns = 0;
-    ct2d->paired_case.active_last_command_host_ns = 0;
-    memset(ct2d->paired_case.active_command_calls, 0,
-           sizeof(ct2d->paired_case.active_command_calls));
-    memset(ct2d->paired_case.active_command_busy_ns_by_command, 0,
-           sizeof(ct2d->paired_case.active_command_busy_ns_by_command));
-    memset(ct2d->paired_case.active_driver_calls_by_command, 0,
-           sizeof(ct2d->paired_case.active_driver_calls_by_command));
-    memset(ct2d->paired_case.active_driver_busy_ns_by_command, 0,
-           sizeof(ct2d->paired_case.active_driver_busy_ns_by_command));
+    cxl_type2_command_scope_reset(&ct2d->paired_case.case_command_scope,
+                                  span_begin_ns, begin_identity);
+    ct2d->paired_case.decode_command_scope.active = false;
     ct2d->paired_case.active_command_sequence = 0;
     ct2d->paired_case.active_command_code = 0;
-    cxl_type2_interval_reset(&ct2d->paired_case.command_intervals,
-                             span_begin_ns, begin_identity);
-    cxl_type2_interval_reset(&ct2d->paired_case.driver_intervals,
-                             span_begin_ns, begin_identity);
     ct2d->paired_case.active_cxl_request_count = 0;
     ct2d->paired_case.active_cxl_read_count = 0;
     ct2d->paired_case.active_cxl_write_count = 0;
@@ -2802,45 +2822,89 @@ static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
     }
 }
 
-static void cxl_type2_record_driver_interval(
-    void *opaque, uint64_t call_id, uint32_t occurrence, const char *symbol,
-    int64_t begin_host_ns, int64_t end_host_ns, int result)
+static void cxl_type2_record_driver_scope(
+    CXLType2State *ct2d, CXLType2CommandScopeLedger *scope,
+    uint64_t call_id, uint32_t occurrence, const char *symbol,
+    int64_t begin_host_ns, int64_t end_host_ns)
 {
-    CXLType2State *ct2d = opaque;
     uint64_t duration_ns;
 
-    (void)result;
-    if (ct2d->paired_case.active_case == CXL_GPU_CASE_NONE) {
+    if (!scope->active) {
         return;
     }
     if (ct2d->paired_case.active_command_sequence == 0) {
-        cxl_type2_interval_fail(&ct2d->paired_case.driver_intervals,
+        cxl_type2_interval_fail(&scope->driver_intervals,
                                 "driver-without-command-sequence");
         return;
     }
     if (call_id != ct2d->gpu_cmd.call_id) {
-        cxl_type2_interval_fail(&ct2d->paired_case.driver_intervals,
+        cxl_type2_interval_fail(&scope->driver_intervals,
                                 "driver-call-id-mismatch");
         return;
     }
     if (ct2d->paired_case.active_command_code >= G_N_ELEMENTS(
-            ct2d->paired_case.active_driver_calls_by_command)) {
-        cxl_type2_interval_fail(&ct2d->paired_case.driver_intervals,
+            scope->driver_calls_by_command)) {
+        cxl_type2_interval_fail(&scope->driver_intervals,
                                 "driver-command-out-of-range");
         return;
     }
     cxl_type2_interval_record(
-        &ct2d->paired_case.driver_intervals, begin_host_ns, end_host_ns,
+        &scope->driver_intervals, begin_host_ns, end_host_ns,
         cxl_type2_interval_identity(
             ct2d->paired_case.active_command_sequence, "qemu", "driver",
             symbol, occurrence, true));
     duration_ns = end_host_ns >= begin_host_ns
                       ? (uint64_t)(end_host_ns - begin_host_ns)
                       : 0;
-    ct2d->paired_case.active_driver_calls_by_command[
-        ct2d->paired_case.active_command_code]++;
-    ct2d->paired_case.active_driver_busy_ns_by_command[
+    scope->driver_calls_by_command[ct2d->paired_case.active_command_code]++;
+    scope->driver_busy_ns_by_command[
         ct2d->paired_case.active_command_code] += duration_ns;
+}
+
+static void cxl_type2_record_driver_interval(
+    void *opaque, uint64_t call_id, uint32_t occurrence, const char *symbol,
+    int64_t begin_host_ns, int64_t end_host_ns, int result)
+{
+    CXLType2State *ct2d = opaque;
+
+    (void)result;
+    if (ct2d->paired_case.active_case == CXL_GPU_CASE_NONE) {
+        return;
+    }
+    cxl_type2_record_driver_scope(
+        ct2d, &ct2d->paired_case.case_command_scope, call_id, occurrence,
+        symbol, begin_host_ns, end_host_ns);
+    cxl_type2_record_driver_scope(
+        ct2d, &ct2d->paired_case.decode_command_scope, call_id, occurrence,
+        symbol, begin_host_ns, end_host_ns);
+}
+
+static void cxl_type2_record_command_scope(
+    CXLType2CommandScopeLedger *scope, uint32_t command, uint64_t sequence,
+    int64_t begin_host_ns, int64_t end_host_ns, uint32_t result)
+{
+    uint64_t duration_ns;
+
+    if (!scope->active || command >= G_N_ELEMENTS(scope->command_calls)) {
+        return;
+    }
+
+    duration_ns = end_host_ns >= begin_host_ns
+                      ? (uint64_t)(end_host_ns - begin_host_ns)
+                      : 0;
+    scope->command_count++;
+    scope->command_failures += result != CXL_GPU_SUCCESS;
+    scope->command_busy_ns += duration_ns;
+    if (scope->first_command_host_ns == 0) {
+        scope->first_command_host_ns = begin_host_ns;
+    }
+    scope->last_command_host_ns = end_host_ns;
+    scope->command_calls[command]++;
+    scope->command_busy_ns_by_command[command] += duration_ns;
+    cxl_type2_interval_record(
+        &scope->command_intervals, begin_host_ns, end_host_ns,
+        cxl_type2_interval_identity(sequence, "qemu", "command", NULL,
+                                    command, true));
 }
 
 static void cxl_type2_record_case_command(CXLType2State *ct2d,
@@ -2850,29 +2914,65 @@ static void cxl_type2_record_case_command(CXLType2State *ct2d,
                                           int64_t end_host_ns,
                                           uint32_t result)
 {
-    uint64_t duration_ns;
-
-    if (ct2d->paired_case.active_case == CXL_GPU_CASE_NONE ||
-        command >= G_N_ELEMENTS(ct2d->paired_case.active_command_calls)) {
+    if (ct2d->paired_case.active_case == CXL_GPU_CASE_NONE) {
         return;
     }
+    cxl_type2_record_command_scope(
+        &ct2d->paired_case.case_command_scope, command, sequence,
+        begin_host_ns, end_host_ns, result);
+    cxl_type2_record_command_scope(
+        &ct2d->paired_case.decode_command_scope, command, sequence,
+        begin_host_ns, end_host_ns, result);
+}
 
-    duration_ns = end_host_ns >= begin_host_ns
-                      ? (uint64_t)(end_host_ns - begin_host_ns)
-                      : 0;
-    ct2d->paired_case.active_command_count++;
-    ct2d->paired_case.active_command_failures += result != CXL_GPU_SUCCESS;
-    ct2d->paired_case.active_command_busy_ns += duration_ns;
-    if (ct2d->paired_case.active_first_command_host_ns == 0) {
-        ct2d->paired_case.active_first_command_host_ns = begin_host_ns;
+static void cxl_type2_log_command_scope_summary(
+    uint64_t run_binding, uint32_t case_kind, uint64_t epoch,
+    const char *scope_name, CXLType2CommandScopeLedger *scope)
+{
+    for (uint32_t command = 0;
+         command < G_N_ELEMENTS(scope->command_calls); command++) {
+        if (scope->command_calls[command] == 0) {
+            continue;
+        }
+        qemu_log(
+            "KIMI_COMMAND_SUMMARY schema=qemu-command-summary-v2"
+            " run_binding=%" PRIu64 " case=%s case_epoch=%" PRIu64
+            " scope=%s command=0x%x calls=%" PRIu64
+            " busy_ns=%" PRIu64 " driver_calls=%" PRIu64
+            " driver_busy_ns=%" PRIu64 "\n",
+            run_binding, cxl_type2_paired_case_name(case_kind), epoch,
+            scope_name, command, scope->command_calls[command],
+            scope->command_busy_ns_by_command[command],
+            scope->driver_calls_by_command[command],
+            scope->driver_busy_ns_by_command[command]);
     }
-    ct2d->paired_case.active_last_command_host_ns = end_host_ns;
-    ct2d->paired_case.active_command_calls[command]++;
-    ct2d->paired_case.active_command_busy_ns_by_command[command] += duration_ns;
-    cxl_type2_interval_record(
-        &ct2d->paired_case.command_intervals, begin_host_ns, end_host_ns,
-        cxl_type2_interval_identity(sequence, "qemu", "command", NULL,
-                                    command, true));
+
+    cxl_type2_log_interval_summary(run_binding, case_kind, epoch, scope_name,
+                                   "command", &scope->command_intervals);
+    cxl_type2_log_interval_summary(run_binding, case_kind, epoch, scope_name,
+                                   "driver", &scope->driver_intervals);
+}
+
+static void cxl_type2_finish_decode_command_scope(
+    CXLType2State *ct2d, int64_t end_host_ns, uint64_t sequence,
+    bool terminal_observed)
+{
+    CXLType2CommandScopeLedger *scope =
+        &ct2d->paired_case.decode_command_scope;
+    const char *operation = terminal_observed ? "decode-end" : "case-end";
+    CXLType2IntervalIdentity end_identity = cxl_type2_interval_identity(
+        sequence, "qemu", "decode", operation, 0, false);
+
+    if (!terminal_observed) {
+        cxl_type2_interval_fail(&scope->command_intervals,
+                                "decode-end-missing");
+        cxl_type2_interval_fail(&scope->driver_intervals,
+                                "decode-end-missing");
+    }
+    cxl_type2_command_scope_finish(scope, end_host_ns, end_identity);
+    cxl_type2_log_command_scope_summary(
+        ct2d->paired_case.run_binding, ct2d->paired_case.active_case,
+        ct2d->paired_case.active_epoch, "decode", scope);
 }
 
 static void cxl_type2_log_case_summary(CXLType2State *ct2d,
@@ -2880,17 +2980,17 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
                                        uint32_t case_kind,
                                        uint64_t epoch)
 {
-    uint64_t *calls = ct2d->paired_case.active_command_calls;
-    uint64_t *busy = ct2d->paired_case.active_command_busy_ns_by_command;
-    uint64_t *driver_calls =
-        ct2d->paired_case.active_driver_calls_by_command;
-    uint64_t *driver_busy =
-        ct2d->paired_case.active_driver_busy_ns_by_command;
+    CXLType2CommandScopeLedger *command_scope =
+        &ct2d->paired_case.case_command_scope;
+    uint64_t *calls = command_scope->command_calls;
+    uint64_t *busy = command_scope->command_busy_ns_by_command;
+    uint64_t *driver_calls = command_scope->driver_calls_by_command;
+    uint64_t *driver_busy = command_scope->driver_busy_ns_by_command;
     uint64_t host_window_ns =
-        ct2d->paired_case.active_last_command_host_ns >=
-        ct2d->paired_case.active_first_command_host_ns
-            ? (uint64_t)(ct2d->paired_case.active_last_command_host_ns -
-                         ct2d->paired_case.active_first_command_host_ns)
+        command_scope->last_command_host_ns >=
+        command_scope->first_command_host_ns
+            ? (uint64_t)(command_scope->last_command_host_ns -
+                         command_scope->first_command_host_ns)
             : 0;
 
     qemu_log("KIMI_CASE_SUMMARY run_binding=%" PRIu64 " case=%s epoch=%" PRIu64
@@ -2912,9 +3012,9 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
              " stream_sync_driver_calls=%" PRIu64
              " elided_stream_syncs=%" PRIu64 "\n",
              run_binding, cxl_type2_paired_case_name(case_kind), epoch,
-             ct2d->paired_case.active_command_count,
-             ct2d->paired_case.active_command_failures,
-             ct2d->paired_case.active_command_busy_ns, host_window_ns,
+             command_scope->command_count,
+             command_scope->command_failures,
+             command_scope->command_busy_ns, host_window_ns,
              calls[CXL_GPU_CMD_LAUNCH_KERNEL], busy[CXL_GPU_CMD_LAUNCH_KERNEL],
              calls[CXL_GPU_CMD_MEM_COPY_HTOD_ASYNC],
              busy[CXL_GPU_CMD_MEM_COPY_HTOD_ASYNC],
@@ -2954,21 +3054,6 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
              ct2d->paired_case.active_cxl_range_requests,
              ct2d->paired_case.active_cxl_range_bytes,
              ct2d->paired_case.active_cxl_wire_bytes);
-
-    for (uint32_t command = 0; command < G_N_ELEMENTS(
-             ct2d->paired_case.active_command_calls); command++) {
-        if (calls[command] == 0) {
-            continue;
-        }
-        qemu_log(
-            "KIMI_COMMAND_SUMMARY schema=qemu-command-summary-v1"
-            " run_binding=%" PRIu64 " case=%s case_epoch=%" PRIu64
-            " command=0x%x calls=%" PRIu64 " busy_ns=%" PRIu64
-            " driver_calls=%" PRIu64 " driver_busy_ns=%" PRIu64 "\n",
-            run_binding, cxl_type2_paired_case_name(case_kind), epoch,
-            command, calls[command], busy[command], driver_calls[command],
-            driver_busy[command]);
-    }
 
     {
         uint64_t live_sources = 0;
@@ -3124,12 +3209,8 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             ct2d->direct_source_poisoned);
     }
 
-    cxl_type2_log_interval_summary(
-        run_binding, case_kind, epoch, "command",
-        &ct2d->paired_case.command_intervals);
-    cxl_type2_log_interval_summary(
-        run_binding, case_kind, epoch, "driver",
-        &ct2d->paired_case.driver_intervals);
+    cxl_type2_log_command_scope_summary(run_binding, case_kind, epoch, "case",
+                                        command_scope);
 }
 
 static void cxl_type2_log_kimi_case_stage(uint64_t run_binding,
@@ -5585,6 +5666,10 @@ static void cxl_type2_paired_case_end(CXLType2State *ct2d,
 
     cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch, "case_end",
                                   "begin", 0, false);
+    if (ct2d->paired_case.decode_command_scope.active) {
+        cxl_type2_finish_decode_command_scope(
+            ct2d, cxl_type2_host_monotonic_ns(), trace_sequence, false);
+    }
     cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
                                   "backend_synchronize", "begin", 0, false);
     sync_error = hetgpu_synchronize(hetgpu);
@@ -5653,21 +5738,21 @@ static void cxl_type2_paired_case_end(CXLType2State *ct2d,
     ct2d->gpu_cmd.results[3] = reset_error;
 
     {
-        int64_t interval_end_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+        int64_t interval_end_ns = cxl_type2_host_monotonic_ns();
         CXLType2IntervalIdentity end_identity = cxl_type2_interval_identity(
             trace_sequence, "qemu", "case", "case-end", 0, false);
 
         if (hetgpu->driver_interval_callback !=
                 cxl_type2_record_driver_interval ||
             hetgpu->driver_interval_opaque != ct2d) {
-            cxl_type2_interval_fail(&ct2d->paired_case.driver_intervals,
+            cxl_type2_interval_fail(
+                &ct2d->paired_case.case_command_scope.driver_intervals,
                                     "driver-observer-detached");
         }
         hetgpu_set_driver_interval_callback(hetgpu, NULL, NULL);
-        cxl_type2_interval_finish(&ct2d->paired_case.command_intervals,
-                                  interval_end_ns, end_identity);
-        cxl_type2_interval_finish(&ct2d->paired_case.driver_intervals,
-                                  interval_end_ns, end_identity);
+        cxl_type2_command_scope_finish(
+            &ct2d->paired_case.case_command_scope, interval_end_ns,
+            end_identity);
     }
     cxl_type2_log_case_summary(ct2d, run_binding, case_kind, epoch);
     cxl_type2_notify_case_scope(run_binding, case_kind, epoch, false);
@@ -5723,7 +5808,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
     uint64_t dev_ptr;
     size_t size;
     uint64_t trace_sequence = ++ct2d->gpu_cmd.trace_sequence;
-    int64_t trace_start_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+    int64_t trace_start_ns = cxl_type2_host_monotonic_ns();
     uint64_t stream_work_wire = 0;
     bool stream_progress_command = cxl_type2_cuda_stream_progress_wire(
         cmd, ct2d->gpu_cmd.params, &stream_work_wire);
@@ -5779,8 +5864,15 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
              ct2d->gpu_cmd.params[1] !=
                  CXL_GPU_OBSERVATION_ANCHOR_DECODE_END) ||
             (ct2d->paired_case.required &&
-             (ct2d->paired_case.active_case == CXL_GPU_CASE_NONE ||
-              ct2d->gpu_cmd.params[2] != ct2d->paired_case.active_epoch))) {
+             ct2d->paired_case.active_case == CXL_GPU_CASE_NONE) ||
+            (ct2d->paired_case.active_case != CXL_GPU_CASE_NONE &&
+             (ct2d->gpu_cmd.params[2] != ct2d->paired_case.active_epoch ||
+              (ct2d->gpu_cmd.params[1] ==
+                       CXL_GPU_OBSERVATION_ANCHOR_DECODE_BEGIN &&
+               ct2d->paired_case.decode_command_scope.active) ||
+              (ct2d->gpu_cmd.params[1] ==
+                       CXL_GPU_OBSERVATION_ANCHOR_DECODE_END &&
+               !ct2d->paired_case.decode_command_scope.active)))) {
             ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
             break;
         }
@@ -5815,6 +5907,21 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             ct2d->gpu_cmd.results[2] =
                 (host_after_ns - host_before_ns + 1) / 2;
             ct2d->gpu_cmd.results[3] = CXL_GPU_OBSERVATION_ANCHOR_VERSION;
+            if (ct2d->paired_case.active_case != CXL_GPU_CASE_NONE) {
+                int64_t host_mid_ns = ct2d->gpu_cmd.results[0];
+
+                if (ct2d->gpu_cmd.params[1] ==
+                    CXL_GPU_OBSERVATION_ANCHOR_DECODE_BEGIN) {
+                    cxl_type2_command_scope_reset(
+                        &ct2d->paired_case.decode_command_scope, host_mid_ns,
+                        cxl_type2_interval_identity(
+                            trace_sequence, "qemu", "decode", "decode-begin",
+                            0, false));
+                } else {
+                    cxl_type2_finish_decode_command_scope(
+                        ct2d, host_mid_ns, trace_sequence, true);
+                }
+            }
         }
         break;
 
@@ -8547,7 +8654,7 @@ complete:
     }
     hetgpu_cuda_trace_set_call_id(0);
     ct2d->gpu_cmd.cmd_status = CXL_GPU_CMD_STATUS_COMPLETE;
-    int64_t trace_end_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+    int64_t trace_end_ns = cxl_type2_host_monotonic_ns();
     int64_t trace_duration_ns = trace_end_ns - trace_start_ns;
     if (cmd != CXL_GPU_CMD_CASE_BEGIN && cmd != CXL_GPU_CMD_CASE_END &&
         cmd != CXL_GPU_CMD_OBSERVATION_ANCHOR) {
