@@ -476,6 +476,12 @@ typedef struct CXLType2State {
         uint64_t active_direct_physical_boundaries;
         uint64_t active_direct_host_contiguous_boundaries;
         uint64_t active_direct_host_contiguous_following_bytes;
+        uint64_t active_direct_cross_reg_boundaries;
+        uint64_t active_direct_cross_reg_bytes;
+        uint64_t active_direct_cross_reg_any_registered_boundaries;
+        uint64_t active_direct_cross_reg_any_registered_bytes;
+        uint64_t active_direct_cross_reg_both_registered_boundaries;
+        uint64_t active_direct_cross_reg_both_registered_bytes;
         uint64_t active_direct_physical_unregister_calls;
         uint64_t active_direct_physical_unregister_ns;
         uint64_t active_direct_cache_hits;

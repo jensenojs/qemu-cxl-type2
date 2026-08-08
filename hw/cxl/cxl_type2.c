@@ -2793,6 +2793,12 @@ static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
     ct2d->paired_case.active_direct_physical_boundaries = 0;
     ct2d->paired_case.active_direct_host_contiguous_boundaries = 0;
     ct2d->paired_case.active_direct_host_contiguous_following_bytes = 0;
+    ct2d->paired_case.active_direct_cross_reg_boundaries = 0;
+    ct2d->paired_case.active_direct_cross_reg_bytes = 0;
+    ct2d->paired_case.active_direct_cross_reg_any_registered_boundaries = 0;
+    ct2d->paired_case.active_direct_cross_reg_any_registered_bytes = 0;
+    ct2d->paired_case.active_direct_cross_reg_both_registered_boundaries = 0;
+    ct2d->paired_case.active_direct_cross_reg_both_registered_bytes = 0;
     ct2d->paired_case.active_direct_physical_unregister_calls = 0;
     ct2d->paired_case.active_direct_physical_unregister_ns = 0;
     ct2d->paired_case.active_direct_cache_hits = 0;
@@ -3158,7 +3164,7 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             live_registration_groups++;
         }
         qemu_log(
-            "KIMI_DIRECT_SOURCE_SUMMARY schema=direct-source-summary-v7"
+            "KIMI_DIRECT_SOURCE_SUMMARY schema=direct-source-summary-v8"
             " run_binding=%" PRIu64 " case=%s case_epoch=%" PRIu64
             " policy_enabled=%u register_calls=%" PRIu64
             " register_busy_ns=%" PRIu64
@@ -3210,6 +3216,12 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             " physical_boundaries=%" PRIu64
             " host_contiguous_boundaries=%" PRIu64
             " host_contiguous_following_bytes=%" PRIu64
+            " cross_registration_boundaries=%" PRIu64
+            " cross_registration_following_bytes=%" PRIu64
+            " cross_registration_any_registered_boundaries=%" PRIu64
+            " cross_registration_any_registered_following_bytes=%" PRIu64
+            " cross_registration_both_registered_boundaries=%" PRIu64
+            " cross_registration_both_registered_following_bytes=%" PRIu64
             " physical_unregister_calls=%" PRIu64
             " physical_unregister_ns=%" PRIu64
             " cache_hits=%" PRIu64 " active_hits=%" PRIu64
@@ -3274,6 +3286,16 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             ct2d->paired_case.active_direct_physical_boundaries,
             ct2d->paired_case.active_direct_host_contiguous_boundaries,
             ct2d->paired_case.active_direct_host_contiguous_following_bytes,
+            ct2d->paired_case.active_direct_cross_reg_boundaries,
+            ct2d->paired_case.active_direct_cross_reg_bytes,
+            ct2d->paired_case
+                .active_direct_cross_reg_any_registered_boundaries,
+            ct2d->paired_case
+                .active_direct_cross_reg_any_registered_bytes,
+            ct2d->paired_case
+                .active_direct_cross_reg_both_registered_boundaries,
+            ct2d->paired_case
+                .active_direct_cross_reg_both_registered_bytes,
             ct2d->paired_case.active_direct_physical_unregister_calls,
             ct2d->paired_case.active_direct_physical_unregister_ns,
             ct2d->paired_case.active_direct_cache_hits,
@@ -4592,11 +4614,43 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
                 ct2d->paired_case.active_direct_physical_boundaries++;
                 if (previous_address <= UINTPTR_MAX - previous->length &&
                     previous_address + previous->length == current_address) {
+                    bool any_registered;
+                    bool both_registered;
+
                     ct2d->paired_case
                         .active_direct_host_contiguous_boundaries++;
                     ct2d->paired_case
                         .active_direct_host_contiguous_following_bytes +=
                         current->length;
+                    if (previous->physical->registration ==
+                        current->physical->registration) {
+                        continue;
+                    }
+                    any_registered =
+                        previous->physical->registration->cuda_registered ||
+                        current->physical->registration->cuda_registered;
+                    both_registered =
+                        previous->physical->registration->cuda_registered &&
+                        current->physical->registration->cuda_registered;
+                    ct2d->paired_case
+                        .active_direct_cross_reg_boundaries++;
+                    ct2d->paired_case
+                        .active_direct_cross_reg_bytes +=
+                        current->length;
+                    if (any_registered) {
+                        ct2d->paired_case
+                            .active_direct_cross_reg_any_registered_boundaries++;
+                        ct2d->paired_case
+                            .active_direct_cross_reg_any_registered_bytes +=
+                            current->length;
+                    }
+                    if (both_registered) {
+                        ct2d->paired_case
+                            .active_direct_cross_reg_both_registered_boundaries++;
+                        ct2d->paired_case
+                            .active_direct_cross_reg_both_registered_bytes +=
+                            current->length;
+                    }
                 }
             }
         }
