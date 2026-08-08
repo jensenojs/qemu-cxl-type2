@@ -3926,9 +3926,16 @@ static int cxl_type2_direct_source_unregister(CXLType2State *ct2d,
     g_free(source->ranges);
     g_free(source->runs);
     g_free(source);
+    /*
+     * The guest kernel lease is released after this source completes.  An
+     * idle pin cannot identify the next lease that reuses the same DAX slot,
+     * so retain registrations only while another source still references
+     * them.
+     */
+    first_error = cxl_type2_direct_idle_cleanup(ct2d);
     ct2d->paired_case.active_direct_unregister_release_ns +=
         qemu_clock_get_ns(QEMU_CLOCK_HOST) - release_begin_ns;
-    return CXL_GPU_SUCCESS;
+    return first_error;
 }
 
 static int cxl_type2_direct_sources_cleanup(CXLType2State *ct2d)
