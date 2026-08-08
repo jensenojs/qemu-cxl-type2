@@ -554,9 +554,12 @@ static void test_stream_progress_classification(void)
 
 static void test_stream_sync_requires_unchanged_work_generation(void)
 {
-    g_assert_false(cxl_type2_cuda_stream_sync_can_elide(false, 0, 0));
-    g_assert_true(cxl_type2_cuda_stream_sync_can_elide(true, 7, 7));
-    g_assert_false(cxl_type2_cuda_stream_sync_can_elide(true, 8, 7));
+    g_assert_false(cxl_type2_cuda_adjacent_stream_sync_can_elide(
+        false, 7, 7));
+    g_assert_true(cxl_type2_cuda_adjacent_stream_sync_can_elide(
+        true, 7, 7));
+    g_assert_false(cxl_type2_cuda_adjacent_stream_sync_can_elide(
+        true, 8, 7));
 }
 
 int main(int argc, char **argv)

@@ -103,12 +103,6 @@ typedef struct QEMU_PACKED CXLMemSimResponse {
     uint8_t data[64];
 } CXLMemSimResponse;
 
-typedef struct CXLType2StreamProgress {
-    uint64_t work_generation;
-    uint64_t synced_generation;
-    bool has_successful_sync;
-} CXLType2StreamProgress;
-
 /* Forward declarations for hetGPU coherency integration */
 static void cxl_type2_hetgpu_coherency_callback(void *opaque, uint64_t addr,
                                                  uint64_t size, bool invalidate);
@@ -2823,9 +2817,8 @@ static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
     ct2d->paired_case.active_stream_work_commands = 0;
     ct2d->paired_case.active_stream_sync_driver_calls = 0;
     ct2d->paired_case.active_elided_stream_syncs = 0;
-    if (ct2d->paired_case.stream_progress) {
-        g_hash_table_remove_all(ct2d->paired_case.stream_progress);
-    }
+    ct2d->paired_case.last_successful_stream_sync_wire = 0;
+    ct2d->paired_case.last_command_was_successful_stream_sync = false;
 }
 
 static void cxl_type2_record_driver_scope(
@@ -3497,63 +3490,6 @@ static bool cxl_type2_stream_from_wire(CXLType2State *ct2d, uint64_t wire,
     }
     *stream = ct2d->gpu_cmd.streams[wire];
     return true;
-}
-
-static CXLType2StreamProgress *cxl_type2_stream_progress(
-    CXLType2State *ct2d, uint64_t stream_wire, bool create)
-{
-    CXLType2StreamProgress *progress;
-
-    if (!ct2d->paired_case.stream_progress) {
-        if (!create) {
-            return NULL;
-        }
-        ct2d->paired_case.stream_progress = g_hash_table_new_full(
-            g_int64_hash, g_int64_equal, g_free, g_free);
-    }
-    progress = g_hash_table_lookup(ct2d->paired_case.stream_progress,
-                                   &stream_wire);
-    if (!progress && create) {
-        uint64_t *key = g_new(uint64_t, 1);
-
-        *key = stream_wire;
-        progress = g_new0(CXLType2StreamProgress, 1);
-        g_hash_table_insert(ct2d->paired_case.stream_progress, key, progress);
-    }
-    return progress;
-}
-
-static void cxl_type2_stream_progress_record_work(CXLType2State *ct2d,
-                                                  uint64_t stream_wire)
-{
-    CXLType2StreamProgress *progress = cxl_type2_stream_progress(
-        ct2d, stream_wire, true);
-
-    g_assert(progress->work_generation != UINT64_MAX);
-    progress->work_generation++;
-    ct2d->paired_case.active_stream_work_commands++;
-}
-
-static bool cxl_type2_stream_progress_can_elide_sync(
-    CXLType2State *ct2d, uint64_t stream_wire)
-{
-    CXLType2StreamProgress *progress = cxl_type2_stream_progress(
-        ct2d, stream_wire, false);
-
-    return progress && cxl_type2_cuda_stream_sync_can_elide(
-                           progress->has_successful_sync,
-                           progress->work_generation,
-                           progress->synced_generation);
-}
-
-static void cxl_type2_stream_progress_record_sync(CXLType2State *ct2d,
-                                                  uint64_t stream_wire)
-{
-    CXLType2StreamProgress *progress = cxl_type2_stream_progress(
-        ct2d, stream_wire, true);
-
-    progress->synced_generation = progress->work_generation;
-    progress->has_successful_sync = true;
 }
 
 static int cxl_type2_htod_staging_free(CXLType2State *ct2d, void *data)
@@ -5843,11 +5779,15 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         cmd, ct2d->gpu_cmd.params, &stream_work_wire);
     bool elide_stream_sync =
         cmd == CXL_GPU_CMD_STREAM_SYNC &&
-        cxl_type2_stream_progress_can_elide_sync(
-            ct2d, ct2d->gpu_cmd.params[0]);
+        cxl_type2_cuda_adjacent_stream_sync_can_elide(
+            ct2d->paired_case.last_command_was_successful_stream_sync,
+            ct2d->paired_case.last_successful_stream_sync_wire,
+            ct2d->gpu_cmd.params[0]);
+
+    ct2d->paired_case.last_command_was_successful_stream_sync = false;
 
     if (stream_progress_command) {
-        cxl_type2_stream_progress_record_work(ct2d, stream_work_wire);
+        ct2d->paired_case.active_stream_work_commands++;
     }
 
     if (ct2d->paired_case.qemu_cuda_calls_enabled) qemu_log("CXL TYPE2 TRACE cmd_begin seq=%" PRIu64
@@ -7621,10 +7561,6 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             ct2d->gpu_cmd.cmd_result = result;
             if (result == CXL_GPU_SUCCESS) {
                 ct2d->gpu_cmd.streams[id] = NULL;
-                if (ct2d->paired_case.stream_progress) {
-                    g_hash_table_remove(ct2d->paired_case.stream_progress,
-                                        &id);
-                }
             }
         }
         break;
@@ -8678,8 +8614,9 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
 complete:
     if (cmd == CXL_GPU_CMD_STREAM_SYNC &&
         ct2d->gpu_cmd.cmd_result == CXL_GPU_SUCCESS) {
-        cxl_type2_stream_progress_record_sync(ct2d,
-                                              ct2d->gpu_cmd.params[0]);
+        ct2d->paired_case.last_command_was_successful_stream_sync = true;
+        ct2d->paired_case.last_successful_stream_sync_wire =
+            ct2d->gpu_cmd.params[0];
     }
     hetgpu_cuda_trace_set_call_id(0);
     ct2d->gpu_cmd.cmd_status = CXL_GPU_CMD_STATUS_COMPLETE;
@@ -9391,9 +9328,6 @@ static void cxl_type2_exit(PCIDevice *pci_dev)
         }
     }
     cxl_type2_direct_indexes_destroy(ct2d);
-    g_clear_pointer(&ct2d->paired_case.stream_progress,
-                    g_hash_table_destroy);
-
     (void)cxl_type2_clear_gpu_handles(ct2d, 0, CXL_GPU_CASE_NONE, 0);
 
     /* Cleanup GPU passthrough */

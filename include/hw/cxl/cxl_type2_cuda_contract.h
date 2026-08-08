@@ -29,9 +29,10 @@ bool cxl_type2_cuda_attribute_wire_is_valid(uint64_t wire_value);
 bool cxl_type2_cuda_stream_progress_wire(uint32_t command,
                                          const uint64_t params[8],
                                          uint64_t *stream_wire);
-bool cxl_type2_cuda_stream_sync_can_elide(bool has_successful_sync,
-                                          uint64_t work_generation,
-                                          uint64_t synced_generation);
+bool cxl_type2_cuda_adjacent_stream_sync_can_elide(
+    bool previous_command_was_successful_sync,
+    uint64_t previous_stream_wire,
+    uint64_t current_stream_wire);
 bool cxl_type2_cuda_mem_info_is_allowed(bool active_case, bool live_context,
                                         uint64_t token, uint64_t active_epoch);
 

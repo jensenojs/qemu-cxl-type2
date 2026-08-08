@@ -140,11 +140,13 @@ bool cxl_type2_cuda_stream_progress_wire(uint32_t command,
     return true;
 }
 
-bool cxl_type2_cuda_stream_sync_can_elide(bool has_successful_sync,
-                                          uint64_t work_generation,
-                                          uint64_t synced_generation)
+bool cxl_type2_cuda_adjacent_stream_sync_can_elide(
+    bool previous_command_was_successful_sync,
+    uint64_t previous_stream_wire,
+    uint64_t current_stream_wire)
 {
-    return has_successful_sync && work_generation == synced_generation;
+    return previous_command_was_successful_sync &&
+           previous_stream_wire == current_stream_wire;
 }
 
 int cxl_gpu_direct_host_address_order(uintptr_t left, uintptr_t right)
