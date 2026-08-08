@@ -3721,11 +3721,11 @@ static int cxl_type2_direct_registration_ensure(
     int64_t begin_ns;
     int result;
 
-    if (registration->cuda_registered) {
-        return CXL_GPU_SUCCESS;
-    }
     if (registration->revoke_pending || ct2d->direct_source_poisoned) {
         return CXL_GPU_ERROR_INVALID_VALUE;
+    }
+    if (registration->cuda_registered) {
+        return CXL_GPU_SUCCESS;
     }
     begin_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
     result = hetgpu_cuda_mem_host_register(
@@ -3926,16 +3926,9 @@ static int cxl_type2_direct_source_unregister(CXLType2State *ct2d,
     g_free(source->ranges);
     g_free(source->runs);
     g_free(source);
-    /*
-     * The guest kernel lease is released after this source completes.  An
-     * idle pin cannot identify the next lease that reuses the same DAX slot,
-     * so retain registrations only while another source still references
-     * them.
-     */
-    first_error = cxl_type2_direct_idle_cleanup(ct2d);
     ct2d->paired_case.active_direct_unregister_release_ns +=
         qemu_clock_get_ns(QEMU_CLOCK_HOST) - release_begin_ns;
-    return first_error;
+    return CXL_GPU_SUCCESS;
 }
 
 static int cxl_type2_direct_sources_cleanup(CXLType2State *ct2d)
@@ -4612,10 +4605,8 @@ static int cxl_type2_direct_span_submit(
     uint64_t length, void *stream, CXLType2DirectSource *source,
     CXLType2DirectRegistration *registration)
 {
-    int result = cxl_type2_direct_registration_ensure(ct2d, registration);
-
-    if (result != CXL_GPU_SUCCESS) {
-        return result;
+    if (!registration->cuda_registered || registration->revoke_pending) {
+        return CXL_GPU_ERROR_INVALID_VALUE;
     }
     return cxl_type2_enqueue_htod_direct(
         ct2d, destination, host, length, stream, source);
@@ -4667,6 +4658,36 @@ static bool cxl_type2_direct_range_is_valid(
     return true;
 }
 
+static int cxl_type2_direct_range_prepare_registrations(
+    CXLType2State *ct2d, const CXLGPUDirectRangeV1 *wire,
+    CXLType2DirectSource *source)
+{
+    CXLGPUSourceRangeV1 *range = &source->ranges[wire->source_range];
+    uint64_t skip = range->first_run_byte_offset + wire->source_offset;
+    uint64_t remaining = wire->size;
+
+    for (uint32_t i = 0; i < range->run_count && remaining; i++) {
+        CXLType2DirectRun *run = &source->runs[range->first_run + i];
+        uint64_t chunk;
+        int result;
+
+        if (skip >= run->length) {
+            skip -= run->length;
+            continue;
+        }
+        chunk = MIN(remaining, run->length - skip);
+        result = cxl_type2_direct_registration_ensure(
+            ct2d, run->physical->registration);
+        if (result != CXL_GPU_SUCCESS) {
+            return result;
+        }
+        remaining -= chunk;
+        skip = 0;
+    }
+    g_assert(remaining == 0);
+    return CXL_GPU_SUCCESS;
+}
+
 static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
                                           const uint8_t *payload,
                                           uint64_t payload_capacity,
@@ -4709,6 +4730,16 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
                 &resolved[i].source)) {
             *fail_index = i;
             result = CXL_GPU_ERROR_INVALID_VALUE;
+            goto out;
+        }
+    }
+
+    /* Finish every Driver registration before the first asynchronous copy. */
+    for (uint64_t i = 0; i < range_count; i++) {
+        result = cxl_type2_direct_range_prepare_registrations(
+            ct2d, &resolved[i].wire, resolved[i].source);
+        if (result != CXL_GPU_SUCCESS) {
+            *fail_index = i;
             goto out;
         }
     }
