@@ -2825,9 +2825,10 @@ static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
 static void cxl_type2_record_driver_scope(
     CXLType2State *ct2d, CXLType2CommandScopeLedger *scope,
     uint64_t call_id, uint32_t occurrence, const char *symbol,
-    int64_t begin_host_ns, int64_t end_host_ns)
+    int64_t begin_host_ns, int64_t end_host_ns, int result)
 {
     uint64_t duration_ns;
+    uint32_t symbol_index;
 
     if (!scope->active) {
         return;
@@ -2859,6 +2860,39 @@ static void cxl_type2_record_driver_scope(
     scope->driver_calls_by_command[ct2d->paired_case.active_command_code]++;
     scope->driver_busy_ns_by_command[
         ct2d->paired_case.active_command_code] += duration_ns;
+    scope->driver_failures += result != 0;
+
+    if (scope->driver_symbol_error) {
+        return;
+    }
+    if (!symbol) {
+        scope->driver_symbol_error = "missing-symbol";
+        return;
+    }
+    for (symbol_index = 0; symbol_index < scope->driver_symbol_count;
+         symbol_index++) {
+        if (strcmp(scope->driver_symbols[symbol_index].symbol, symbol) == 0) {
+            break;
+        }
+    }
+    if (symbol_index == scope->driver_symbol_count) {
+        if (symbol_index == G_N_ELEMENTS(scope->driver_symbols)) {
+            scope->driver_symbol_error = "capacity-exceeded";
+            return;
+        }
+        scope->driver_symbols[symbol_index].symbol = symbol;
+        scope->driver_symbol_count++;
+    }
+    if (scope->driver_symbols[symbol_index].calls == UINT64_MAX ||
+        scope->driver_symbols[symbol_index].busy_ns > UINT64_MAX - duration_ns ||
+        (result != 0 &&
+         scope->driver_symbols[symbol_index].failures == UINT64_MAX)) {
+        scope->driver_symbol_error = "counter-overflow";
+        return;
+    }
+    scope->driver_symbols[symbol_index].calls++;
+    scope->driver_symbols[symbol_index].failures += result != 0;
+    scope->driver_symbols[symbol_index].busy_ns += duration_ns;
 }
 
 static void cxl_type2_record_driver_interval(
@@ -2867,16 +2901,15 @@ static void cxl_type2_record_driver_interval(
 {
     CXLType2State *ct2d = opaque;
 
-    (void)result;
     if (ct2d->paired_case.active_case == CXL_GPU_CASE_NONE) {
         return;
     }
     cxl_type2_record_driver_scope(
         ct2d, &ct2d->paired_case.case_command_scope, call_id, occurrence,
-        symbol, begin_host_ns, end_host_ns);
+        symbol, begin_host_ns, end_host_ns, result);
     cxl_type2_record_driver_scope(
         ct2d, &ct2d->paired_case.decode_command_scope, call_id, occurrence,
-        symbol, begin_host_ns, end_host_ns);
+        symbol, begin_host_ns, end_host_ns, result);
 }
 
 static void cxl_type2_record_command_scope(
@@ -2929,8 +2962,17 @@ static void cxl_type2_log_command_scope_summary(
     uint64_t run_binding, uint32_t case_kind, uint64_t epoch,
     const char *scope_name, CXLType2CommandScopeLedger *scope)
 {
+    uint64_t command_driver_calls = 0;
+    uint64_t command_driver_busy_ns = 0;
+    uint64_t symbol_calls = 0;
+    uint64_t symbol_failures = 0;
+    uint64_t symbol_busy_ns = 0;
+    const char *symbol_error = scope->driver_symbol_error;
+
     for (uint32_t command = 0;
          command < G_N_ELEMENTS(scope->command_calls); command++) {
+        command_driver_calls += scope->driver_calls_by_command[command];
+        command_driver_busy_ns += scope->driver_busy_ns_by_command[command];
         if (scope->command_calls[command] == 0) {
             continue;
         }
@@ -2946,6 +2988,45 @@ static void cxl_type2_log_command_scope_summary(
             scope->driver_calls_by_command[command],
             scope->driver_busy_ns_by_command[command]);
     }
+
+    if (!symbol_error) {
+        for (uint32_t index = 0; index < scope->driver_symbol_count; index++) {
+            symbol_calls += scope->driver_symbols[index].calls;
+            symbol_failures += scope->driver_symbols[index].failures;
+            symbol_busy_ns += scope->driver_symbols[index].busy_ns;
+        }
+        if (symbol_calls != command_driver_calls ||
+            symbol_failures != scope->driver_failures ||
+            symbol_busy_ns != command_driver_busy_ns) {
+            symbol_error = "totals-mismatch";
+        }
+    }
+    if (!symbol_error) {
+        for (uint32_t index = 0; index < scope->driver_symbol_count; index++) {
+            qemu_log(
+                "KIMI_DRIVER_SYMBOL_SUMMARY"
+                " schema=qemu-driver-symbol-summary-v1"
+                " run_binding=%" PRIu64 " case=%s case_epoch=%" PRIu64
+                " scope=%s symbol=%s calls=%" PRIu64
+                " failures=%" PRIu64 " busy_ns=%" PRIu64 "\n",
+                run_binding, cxl_type2_paired_case_name(case_kind), epoch,
+                scope_name, scope->driver_symbols[index].symbol,
+                scope->driver_symbols[index].calls,
+                scope->driver_symbols[index].failures,
+                scope->driver_symbols[index].busy_ns);
+        }
+    }
+    qemu_log(
+        "KIMI_DRIVER_SYMBOL_TERMINAL"
+        " schema=qemu-driver-symbol-terminal-v1"
+        " run_binding=%" PRIu64 " case=%s case_epoch=%" PRIu64
+        " scope=%s status=%s symbol_count=%u calls=%" PRIu64
+        " failures=%" PRIu64 " busy_ns=%" PRIu64 " reason=%s\n",
+        run_binding, cxl_type2_paired_case_name(case_kind), epoch,
+        scope_name, symbol_error ? "unavailable" : "available",
+        symbol_error ? 0 : scope->driver_symbol_count,
+        command_driver_calls, scope->driver_failures, command_driver_busy_ns,
+        symbol_error ? symbol_error : "none");
 
     cxl_type2_log_interval_summary(run_binding, case_kind, epoch, scope_name,
                                    "command", &scope->command_intervals);

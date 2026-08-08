@@ -297,6 +297,15 @@ typedef struct CXLType2CommandScopeLedger {
     uint64_t command_busy_ns_by_command[256];
     uint64_t driver_calls_by_command[256];
     uint64_t driver_busy_ns_by_command[256];
+    struct {
+        const char *symbol;
+        uint64_t calls;
+        uint64_t failures;
+        uint64_t busy_ns;
+    } driver_symbols[128];
+    uint32_t driver_symbol_count;
+    uint64_t driver_failures;
+    const char *driver_symbol_error;
     CXLType2IntervalLedger command_intervals;
     CXLType2IntervalLedger driver_intervals;
 } CXLType2CommandScopeLedger;
