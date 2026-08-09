@@ -6471,9 +6471,29 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             total_bytes = width * height;
 
             int64_t driver_start_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+            void *copy_stream = NULL;
+            bool copy_async = false;
+            if (ct2d->gpu_cmd.descriptor &&
+                ct2d->gpu_cmd.descriptor->protocol_version >= 2) {
+                uint64_t stream_wire = ct2d->gpu_cmd.params[6];
+                if (stream_wire != CXL_GPU_STREAM_WIRE_NULL &&
+                    stream_wire != CXL_GPU_STREAM_WIRE_LEGACY &&
+                    cxl_type2_stream_from_wire(ct2d, stream_wire,
+                                               &copy_stream)) {
+                    copy_async = true;
+                }
+            }
             if (hetgpu->initialized && hetgpu->backend != HETGPU_BACKEND_SIMULATION) {
-                err = hetgpu_memcpy2d_dtod(hetgpu, dst_dev_ptr, dst_pitch,
-                                           src_dev_ptr, src_pitch, width, height);
+                if (copy_async) {
+                    err = hetgpu_memcpy2d_dtod_async(hetgpu, dst_dev_ptr,
+                                                     dst_pitch, src_dev_ptr,
+                                                     src_pitch, width, height,
+                                                     copy_stream);
+                } else {
+                    err = hetgpu_memcpy2d_dtod(hetgpu, dst_dev_ptr, dst_pitch,
+                                               src_dev_ptr, src_pitch, width,
+                                               height);
+                }
             } else if (hetgpu->backend == HETGPU_BACKEND_SIMULATION) {
                 err = HETGPU_SUCCESS;
                 for (size_t row = 0; row < height; row++) {
@@ -6489,10 +6509,12 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             if (ct2d->paired_case.qemu_cuda_calls_enabled) qemu_log("CXL TYPE2 TRACE copy_driver call_id=0x%016" PRIx64
                      " direction=dtod bytes=%zu rows=%zu row_commands_eliminated=%zu "
                      "driver_duration_ns=%" PRId64
-                     " backend_result=%d implementation=blocking-direct-2d "
-                     "stream_forwarded=0\n",
+                     " backend_result=%d implementation=%s "
+                     "stream_forwarded=%d\n",
                      ct2d->gpu_cmd.call_id, total_bytes, height, height - 1,
-                     qemu_clock_get_ns(QEMU_CLOCK_HOST) - driver_start_ns, err);
+                     qemu_clock_get_ns(QEMU_CLOCK_HOST) - driver_start_ns, err,
+                     copy_async ? "async-stream-2d" : "blocking-direct-2d",
+                     copy_async ? 1 : 0);
             if (err != HETGPU_SUCCESS) {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
                 break;
