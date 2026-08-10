@@ -2817,6 +2817,9 @@ static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
     ct2d->paired_case.active_stream_work_commands = 0;
     ct2d->paired_case.active_stream_sync_driver_calls = 0;
     ct2d->paired_case.active_elided_stream_syncs = 0;
+    ct2d->paired_case.active_stream_sync_reason =
+        CXL_GPU_STREAM_SYNC_PUBLIC_API;
+    ct2d->paired_case.active_stream_sync_reason_valid = false;
     ct2d->paired_case.last_successful_stream_sync_wire = 0;
     ct2d->paired_case.last_command_was_successful_stream_sync = false;
 }
@@ -2859,6 +2862,17 @@ static void cxl_type2_record_driver_scope(
     scope->driver_calls_by_command[ct2d->paired_case.active_command_code]++;
     scope->driver_busy_ns_by_command[
         ct2d->paired_case.active_command_code] += duration_ns;
+    if (ct2d->paired_case.active_command_code == CXL_GPU_CMD_STREAM_SYNC) {
+        if (!ct2d->paired_case.active_stream_sync_reason_valid) {
+            scope->stream_sync_reason_error = "invalid-reason";
+        } else {
+            CXLGPUStreamSyncReason reason =
+                ct2d->paired_case.active_stream_sync_reason;
+
+            scope->stream_sync_driver_calls_by_reason[reason]++;
+            scope->stream_sync_driver_busy_ns_by_reason[reason] += duration_ns;
+        }
+    }
     scope->driver_failures += result != 0;
 
     if (scope->driver_symbol_error) {
@@ -2939,12 +2953,30 @@ static void cxl_type2_record_command_scope(
                                     command, true));
 }
 
+static void cxl_type2_record_stream_sync_scope(
+    CXLType2CommandScopeLedger *scope, bool reason_valid,
+    CXLGPUStreamSyncReason reason, bool elided)
+{
+    if (!scope->active) {
+        return;
+    }
+    if (!reason_valid || reason >= CXL_GPU_STREAM_SYNC_REASON_COUNT) {
+        scope->stream_sync_reason_error = "invalid-reason";
+        return;
+    }
+    scope->stream_sync_calls_by_reason[reason]++;
+    scope->stream_sync_elided_calls_by_reason[reason] += elided;
+}
+
 static void cxl_type2_record_case_command(CXLType2State *ct2d,
                                           uint32_t command,
                                           uint64_t sequence,
                                           int64_t begin_host_ns,
                                           int64_t end_host_ns,
-                                          uint32_t result)
+                                          uint32_t result,
+                                          bool stream_sync_reason_valid,
+                                          CXLGPUStreamSyncReason stream_sync_reason,
+                                          bool stream_sync_elided)
 {
     if (ct2d->paired_case.active_case == CXL_GPU_CASE_NONE) {
         return;
@@ -2955,6 +2987,26 @@ static void cxl_type2_record_case_command(CXLType2State *ct2d,
     cxl_type2_record_command_scope(
         &ct2d->paired_case.decode_command_scope, command, sequence,
         begin_host_ns, end_host_ns, result);
+    if (command == CXL_GPU_CMD_STREAM_SYNC) {
+        cxl_type2_record_stream_sync_scope(
+            &ct2d->paired_case.case_command_scope, stream_sync_reason_valid,
+            stream_sync_reason, stream_sync_elided);
+        cxl_type2_record_stream_sync_scope(
+            &ct2d->paired_case.decode_command_scope, stream_sync_reason_valid,
+            stream_sync_reason, stream_sync_elided);
+    }
+}
+
+static const char *cxl_type2_stream_sync_reason_name(
+    CXLGPUStreamSyncReason reason)
+{
+    static const char *const names[] = {
+        [CXL_GPU_STREAM_SYNC_PUBLIC_API] = "public-api",
+        [CXL_GPU_STREAM_SYNC_DTOH_ASYNC_DRAIN] = "dtoh-async-drain",
+        [CXL_GPU_STREAM_SYNC_MEMSET_D8_ASYNC_DRAIN] = "memset-d8-async-drain",
+    };
+
+    return reason < G_N_ELEMENTS(names) ? names[reason] : "invalid";
 }
 
 static void cxl_type2_log_command_scope_summary(
@@ -2966,7 +3018,12 @@ static void cxl_type2_log_command_scope_summary(
     uint64_t symbol_calls = 0;
     uint64_t symbol_failures = 0;
     uint64_t symbol_busy_ns = 0;
+    uint64_t reason_calls = 0;
+    uint64_t reason_elided_calls = 0;
+    uint64_t reason_driver_calls = 0;
+    uint64_t reason_driver_busy_ns = 0;
     const char *symbol_error = scope->driver_symbol_error;
+    const char *reason_error = scope->stream_sync_reason_error;
 
     for (uint32_t command = 0;
          command < G_N_ELEMENTS(scope->command_calls); command++) {
@@ -2987,6 +3044,51 @@ static void cxl_type2_log_command_scope_summary(
             scope->driver_calls_by_command[command],
             scope->driver_busy_ns_by_command[command]);
     }
+
+    for (CXLGPUStreamSyncReason reason = CXL_GPU_STREAM_SYNC_PUBLIC_API;
+         reason < CXL_GPU_STREAM_SYNC_REASON_COUNT; reason++) {
+        reason_calls += scope->stream_sync_calls_by_reason[reason];
+        reason_elided_calls +=
+            scope->stream_sync_elided_calls_by_reason[reason];
+        reason_driver_calls +=
+            scope->stream_sync_driver_calls_by_reason[reason];
+        reason_driver_busy_ns +=
+            scope->stream_sync_driver_busy_ns_by_reason[reason];
+        qemu_log(
+            "KIMI_STREAM_SYNC_REASON_SUMMARY"
+            " schema=qemu-stream-sync-reason-summary-v1"
+            " run_binding=%" PRIu64 " case=%s case_epoch=%" PRIu64
+            " scope=%s reason=%s calls=%" PRIu64
+            " elided_calls=%" PRIu64 " driver_calls=%" PRIu64
+            " driver_busy_ns=%" PRIu64 "\n",
+            run_binding, cxl_type2_paired_case_name(case_kind), epoch,
+            scope_name, cxl_type2_stream_sync_reason_name(reason),
+            scope->stream_sync_calls_by_reason[reason],
+            scope->stream_sync_elided_calls_by_reason[reason],
+            scope->stream_sync_driver_calls_by_reason[reason],
+            scope->stream_sync_driver_busy_ns_by_reason[reason]);
+    }
+    if (!reason_error &&
+        (reason_calls != scope->command_calls[CXL_GPU_CMD_STREAM_SYNC] ||
+         reason_driver_calls !=
+             scope->driver_calls_by_command[CXL_GPU_CMD_STREAM_SYNC] ||
+         reason_driver_busy_ns !=
+             scope->driver_busy_ns_by_command[CXL_GPU_CMD_STREAM_SYNC] ||
+         reason_elided_calls > reason_calls)) {
+        reason_error = "totals-mismatch";
+    }
+    qemu_log(
+        "KIMI_STREAM_SYNC_REASON_TERMINAL"
+        " schema=qemu-stream-sync-reason-terminal-v1"
+        " run_binding=%" PRIu64 " case=%s case_epoch=%" PRIu64
+        " scope=%s status=%s reason_count=%u calls=%" PRIu64
+        " elided_calls=%" PRIu64 " driver_calls=%" PRIu64
+        " driver_busy_ns=%" PRIu64 " error=%s\n",
+        run_binding, cxl_type2_paired_case_name(case_kind), epoch,
+        scope_name, reason_error ? "unavailable" : "available",
+        CXL_GPU_STREAM_SYNC_REASON_COUNT, reason_calls, reason_elided_calls,
+        reason_driver_calls, reason_driver_busy_ns,
+        reason_error ? reason_error : "none");
 
     if (!symbol_error) {
         for (uint32_t index = 0; index < scope->driver_symbol_count; index++) {
@@ -5836,10 +5938,23 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
     uint64_t trace_sequence = ++ct2d->gpu_cmd.trace_sequence;
     int64_t trace_start_ns = cxl_type2_host_monotonic_ns();
     uint64_t stream_work_wire = 0;
+    CXLGPUStreamSyncReason stream_sync_reason =
+        CXL_GPU_STREAM_SYNC_PUBLIC_API;
+    bool stream_sync_reason_valid = true;
+    bool stream_sync_elided = false;
     bool stream_progress_command = cxl_type2_cuda_stream_progress_wire(
         cmd, ct2d->gpu_cmd.params, &stream_work_wire);
+    if (cmd == CXL_GPU_CMD_STREAM_SYNC) {
+        uint32_t protocol_version = ct2d->gpu_cmd.descriptor
+                                        ? ct2d->gpu_cmd.descriptor->protocol_version
+                                        : 1U;
+
+        stream_sync_reason_valid = cxl_type2_cuda_decode_stream_sync_reason(
+            protocol_version, ct2d->gpu_cmd.params[1], &stream_sync_reason);
+    }
     bool elide_stream_sync =
         cmd == CXL_GPU_CMD_STREAM_SYNC &&
+        stream_sync_reason_valid &&
         cxl_type2_cuda_adjacent_stream_sync_can_elide(
             ct2d->paired_case.last_command_was_successful_stream_sync,
             ct2d->paired_case.last_successful_stream_sync_wire,
@@ -5868,6 +5983,9 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
     if (ct2d->paired_case.active_case != CXL_GPU_CASE_NONE) {
         ct2d->paired_case.active_command_sequence = trace_sequence;
         ct2d->paired_case.active_command_code = cmd;
+        ct2d->paired_case.active_stream_sync_reason = stream_sync_reason;
+        ct2d->paired_case.active_stream_sync_reason_valid =
+            cmd == CXL_GPU_CMD_STREAM_SYNC && stream_sync_reason_valid;
     }
 
     if (ct2d->paired_case.required && ct2d->paired_case.failed) {
@@ -7663,8 +7781,13 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
 
     case CXL_GPU_CMD_STREAM_SYNC:
         {
+            if (!stream_sync_reason_valid) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                break;
+            }
             if (elide_stream_sync) {
                 ct2d->paired_case.active_elided_stream_syncs++;
+                stream_sync_elided = true;
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
                 break;
             }
@@ -8721,10 +8844,14 @@ complete:
     if (cmd != CXL_GPU_CMD_CASE_BEGIN && cmd != CXL_GPU_CMD_CASE_END &&
         cmd != CXL_GPU_CMD_OBSERVATION_ANCHOR) {
         cxl_type2_record_case_command(ct2d, cmd, trace_sequence, trace_start_ns,
-                                      trace_end_ns, ct2d->gpu_cmd.cmd_result);
+                                      trace_end_ns, ct2d->gpu_cmd.cmd_result,
+                                      stream_sync_reason_valid,
+                                      stream_sync_reason,
+                                      stream_sync_elided);
     }
     ct2d->paired_case.active_command_sequence = 0;
     ct2d->paired_case.active_command_code = 0;
+    ct2d->paired_case.active_stream_sync_reason_valid = false;
     if (ct2d->paired_case.qemu_cuda_calls_enabled) qemu_log("CXL TYPE2 TRACE cmd_end seq=%" PRIu64
              " call_id=0x%016" PRIx64
              " cmd=0x%x host_ns=%" PRId64 " result=%u duration_ns=%" PRId64

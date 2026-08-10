@@ -51,7 +51,7 @@ source迁移只证明公开heads/tags及其可达superproject对象，不证明`
 
 涉及BAR2寄存器、命令ID、kernel参数布局、module/global查询或async copy时，必须同时检查CXLMemSim guest header和Concordia/backend消费者。禁止通过默认CPU fallback或吞没backend错误让QEMU看似成功。
 
-`CXL_GPU_CMD_MEM_COPY_2D_DTOD`的共享描述符协议常量版本为`2`，并与CXLMemSim guest shim配对：v2在`PARAM6`传递`stream_wire`。QEMU仅在版本`2`解析到非sentinel stream时调用异步HetGPU路径；版本`1`及未解析stream保持同步legacy路径以兼容旧shim。`copy_driver` trace中的`stream_forwarded=1`表示该stream已透传，`implementation`表示实际copy实现；这两个字段只证明QEMU路径选择，不能单独证明最终CUDA完成顺序。
+共享描述符协议常量版本为`3`，并与CXLMemSim guest shim配对：v2在`MEM_COPY_2D_DTOD`的`PARAM6`传递`stream_wire`；v3在`STREAM_SYNC`的`PARAM1`传递public API、blocking DtoH drain或memset emulation drain来源。QEMU对v1/v2 sync按public API解释，对v3未知来源直接失败。`copy_driver` trace中的`stream_forwarded=1`表示stream已透传，`implementation`表示实际copy实现；这些字段只证明QEMU路径选择，不能单独证明最终CUDA完成顺序。
 
 `HETGPU_PROBE_SYNC_BEFORE_2D_DTOD=1|true`仅在同步2D DtoD copy前注入`cuCtxSynchronize()`，默认关闭。它是定罪门控，不得作为正常路径的容错或同步策略。
 

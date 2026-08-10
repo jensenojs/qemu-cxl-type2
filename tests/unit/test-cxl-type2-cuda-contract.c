@@ -284,7 +284,7 @@ static void test_batch_wire_layout_and_validation(void)
     g_assert_cmphex(CXL_GPU_CMD_SOURCE_REGISTER_BATCH_HTOD_DIRECT_ASYNC,
                     ==, 0x35);
     g_assert_cmphex(CXL_GPU_CMD_MEM_COPY_DTOD_ASYNC, ==, 0x2f);
-    g_assert_cmpuint(CXL_GPU_DESCRIPTOR_PROTOCOL_VERSION, ==, 1);
+    g_assert_cmpuint(CXL_GPU_DESCRIPTOR_PROTOCOL_VERSION, ==, 3);
     g_assert_cmpuint(CXL_GPU_CASE_PROTOCOL_VERSION, ==, 1);
     g_assert_cmphex(CXL_GPU_BATCH_DATA_OFFSET, ==, UINT64_C(0x802000));
     g_assert_cmphex(CXL_GPU_CMD_REG_SIZE, ==, UINT64_C(0x2802000));
@@ -562,6 +562,23 @@ static void test_stream_sync_requires_unchanged_work_generation(void)
         true, 8, 7));
 }
 
+static void test_stream_sync_reason_protocol_boundary(void)
+{
+    CXLGPUStreamSyncReason reason = CXL_GPU_STREAM_SYNC_REASON_COUNT;
+
+    g_assert_true(cxl_type2_cuda_decode_stream_sync_reason(
+        2, UINT64_MAX, &reason));
+    g_assert_cmpint(reason, ==, CXL_GPU_STREAM_SYNC_PUBLIC_API);
+    for (uint64_t wire = 0; wire < CXL_GPU_STREAM_SYNC_REASON_COUNT; wire++) {
+        g_assert_true(cxl_type2_cuda_decode_stream_sync_reason(3, wire,
+                                                               &reason));
+        g_assert_cmpint(reason, ==, wire);
+    }
+    g_assert_false(cxl_type2_cuda_decode_stream_sync_reason(
+        3, CXL_GPU_STREAM_SYNC_REASON_COUNT, &reason));
+    g_assert_false(cxl_type2_cuda_decode_stream_sync_reason(3, 0, NULL));
+}
+
 static void test_per_thread_stream_uses_stable_qemu_handle(void)
 {
     void *const qemu_stream = (void *)(uintptr_t)0x1234;
@@ -623,6 +640,8 @@ int main(int argc, char **argv)
                     test_stream_progress_classification);
     g_test_add_func("/cxl/type2/stream/sync-generation",
                     test_stream_sync_requires_unchanged_work_generation);
+    g_test_add_func("/cxl/type2/stream/sync-reason-protocol",
+                    test_stream_sync_reason_protocol_boundary);
     g_test_add_func("/cxl/type2/stream/per-thread-stable-handle",
                     test_per_thread_stream_uses_stable_qemu_handle);
     return g_test_run();

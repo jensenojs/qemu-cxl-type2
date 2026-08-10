@@ -297,6 +297,14 @@ typedef struct CXLType2CommandScopeLedger {
     uint64_t command_busy_ns_by_command[256];
     uint64_t driver_calls_by_command[256];
     uint64_t driver_busy_ns_by_command[256];
+    uint64_t stream_sync_calls_by_reason[CXL_GPU_STREAM_SYNC_REASON_COUNT];
+    uint64_t stream_sync_elided_calls_by_reason[
+        CXL_GPU_STREAM_SYNC_REASON_COUNT];
+    uint64_t stream_sync_driver_calls_by_reason[
+        CXL_GPU_STREAM_SYNC_REASON_COUNT];
+    uint64_t stream_sync_driver_busy_ns_by_reason[
+        CXL_GPU_STREAM_SYNC_REASON_COUNT];
+    const char *stream_sync_reason_error;
     struct {
         const char *symbol;
         uint64_t calls;
@@ -509,6 +517,8 @@ typedef struct CXLType2State {
         uint64_t active_stream_work_commands;
         uint64_t active_stream_sync_driver_calls;
         uint64_t active_elided_stream_syncs;
+        CXLGPUStreamSyncReason active_stream_sync_reason;
+        bool active_stream_sync_reason_valid;
         uint64_t last_successful_stream_sync_wire;
         bool last_command_was_successful_stream_sync;
     } paired_case;

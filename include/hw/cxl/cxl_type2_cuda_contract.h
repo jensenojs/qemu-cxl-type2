@@ -33,6 +33,9 @@ bool cxl_type2_cuda_adjacent_stream_sync_can_elide(
     bool previous_command_was_successful_sync,
     uint64_t previous_stream_wire,
     uint64_t current_stream_wire);
+bool cxl_type2_cuda_decode_stream_sync_reason(
+    uint32_t descriptor_protocol_version, uint64_t wire_reason,
+    CXLGPUStreamSyncReason *reason);
 bool cxl_type2_cuda_special_stream_from_wire(uint64_t wire,
                                               void *per_thread_stream,
                                               void **stream);

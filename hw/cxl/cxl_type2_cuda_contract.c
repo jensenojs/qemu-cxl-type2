@@ -150,6 +150,24 @@ bool cxl_type2_cuda_adjacent_stream_sync_can_elide(
            previous_stream_wire == current_stream_wire;
 }
 
+bool cxl_type2_cuda_decode_stream_sync_reason(
+    uint32_t descriptor_protocol_version, uint64_t wire_reason,
+    CXLGPUStreamSyncReason *reason)
+{
+    if (!reason) {
+        return false;
+    }
+    if (descriptor_protocol_version < 3U) {
+        *reason = CXL_GPU_STREAM_SYNC_PUBLIC_API;
+        return true;
+    }
+    if (wire_reason >= CXL_GPU_STREAM_SYNC_REASON_COUNT) {
+        return false;
+    }
+    *reason = wire_reason;
+    return true;
+}
+
 bool cxl_type2_cuda_special_stream_from_wire(uint64_t wire,
                                               void *per_thread_stream,
                                               void **stream)
