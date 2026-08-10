@@ -1721,6 +1721,13 @@ HetGPUError hetgpu_memcpy2d_dtod(HetGPUState *state, HetGPUDevicePtr dst,
     if (!cuda_lock(state)) {
         return HETGPU_ERROR_INVALID_CONTEXT;
     }
+    const char *stream_sync_probe =
+        getenv("HETGPU_PROBE_SYNC_BEFORE_2D_DTOD");
+    if (stream_sync_probe &&
+        (!strcmp(stream_sync_probe, "1") || !strcmp(stream_sync_probe, "true")) &&
+        g_cuda_funcs.cuCtxSynchronize) {
+        HETGPU_CUDA_CALL(cuCtxSynchronize);
+    }
     int err = HETGPU_CUDA_CALL(cuMemcpy2D, &copy);
     cuda_unlock(state);
     if (err != 0) {
