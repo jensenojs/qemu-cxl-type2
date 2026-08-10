@@ -202,6 +202,13 @@ bool cxl_gpu_direct_host_range_follows(uintptr_t base, uint64_t length,
            next_length <= UINT64_MAX - length;
 }
 
+bool cxl_gpu_direct_epoch_is_cross_case(uint64_t last_case_epoch,
+                                        uint64_t active_case_epoch)
+{
+    return last_case_epoch && active_case_epoch &&
+           last_case_epoch != active_case_epoch;
+}
+
 bool cxl_gpu_direct_registration_group_follows(
     uintptr_t mapping, uintptr_t base, uint64_t length,
     uintptr_t next_mapping, uintptr_t next, uint64_t next_length)

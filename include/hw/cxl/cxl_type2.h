@@ -213,6 +213,7 @@ typedef struct CXLType2DirectRegistration {
 typedef struct CXLType2DirectPhysical {
     VirtioSharedMemoryMapping *mapping;
     uint64_t generation;
+    uint64_t last_case_epoch;
     hwaddr mapping_offset;
     uint64_t length;
     uint64_t padding_bytes;
@@ -496,6 +497,7 @@ typedef struct CXLType2State {
         uint64_t active_direct_physical_unregister_calls;
         uint64_t active_direct_physical_unregister_ns;
         uint64_t active_direct_cache_hits;
+        uint64_t active_direct_cross_case_hits;
         uint64_t active_direct_active_hits;
         uint64_t active_direct_cache_misses;
         uint64_t active_direct_revoke_releases;

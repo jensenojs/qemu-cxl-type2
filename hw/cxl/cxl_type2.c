@@ -2731,9 +2731,22 @@ static void cxl_type2_log_interval_summary(
 static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
 {
     int64_t span_begin_ns = cxl_type2_host_monotonic_ns();
+    uint64_t retained_groups = 0;
+    uint64_t retained_physicals = 0;
+    CXLType2DirectRegistration *registration;
+    CXLType2DirectPhysical *physical;
     CXLType2IntervalIdentity begin_identity = cxl_type2_interval_identity(
         ct2d->paired_case.active_first_sequence, "qemu", "case", "case-begin",
         0, false);
+
+    for (registration = ct2d->direct_registrations; registration;
+         registration = registration->next) {
+        retained_groups++;
+    }
+    for (physical = ct2d->direct_physicals; physical;
+         physical = physical->next) {
+        retained_physicals++;
+    }
 
     cxl_type2_command_scope_reset(&ct2d->paired_case.case_command_scope,
                                   span_begin_ns, begin_identity);
@@ -2780,8 +2793,8 @@ static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
     ct2d->paired_case.active_direct_registration_groups = 0;
     ct2d->paired_case.active_direct_group_members = 0;
     ct2d->paired_case.active_direct_max_group_members = 0;
-    ct2d->paired_case.active_direct_retained_groups = 0;
-    ct2d->paired_case.active_direct_peak_retained_groups = 0;
+    ct2d->paired_case.active_direct_retained_groups = retained_groups;
+    ct2d->paired_case.active_direct_peak_retained_groups = retained_groups;
     ct2d->paired_case.active_direct_coalesced_views = 0;
     ct2d->paired_case.active_direct_max_registration_views = 0;
     ct2d->paired_case.active_direct_physical_boundaries = 0;
@@ -2796,11 +2809,13 @@ static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
     ct2d->paired_case.active_direct_physical_unregister_calls = 0;
     ct2d->paired_case.active_direct_physical_unregister_ns = 0;
     ct2d->paired_case.active_direct_cache_hits = 0;
+    ct2d->paired_case.active_direct_cross_case_hits = 0;
     ct2d->paired_case.active_direct_active_hits = 0;
     ct2d->paired_case.active_direct_cache_misses = 0;
     ct2d->paired_case.active_direct_revoke_releases = 0;
-    ct2d->paired_case.active_direct_retained_physicals = 0;
-    ct2d->paired_case.active_direct_peak_retained_physicals = 0;
+    ct2d->paired_case.active_direct_retained_physicals = retained_physicals;
+    ct2d->paired_case.active_direct_peak_retained_physicals =
+        retained_physicals;
     ct2d->paired_case.active_direct_logical_ranges = 0;
     ct2d->paired_case.active_direct_fragments = 0;
     ct2d->paired_case.active_direct_bytes = 0;
@@ -3259,7 +3274,7 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             live_registration_groups++;
         }
         qemu_log(
-            "KIMI_DIRECT_SOURCE_SUMMARY schema=direct-source-summary-v8"
+            "KIMI_DIRECT_SOURCE_SUMMARY schema=direct-source-summary-v9"
             " run_binding=%" PRIu64 " case=%s case_epoch=%" PRIu64
             " policy_enabled=%u register_calls=%" PRIu64
             " register_busy_ns=%" PRIu64
@@ -3319,7 +3334,8 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             " cross_registration_both_registered_following_bytes=%" PRIu64
             " physical_unregister_calls=%" PRIu64
             " physical_unregister_ns=%" PRIu64
-            " cache_hits=%" PRIu64 " active_hits=%" PRIu64
+            " cache_hits=%" PRIu64 " cross_case_hits=%" PRIu64
+            " active_hits=%" PRIu64
             " cache_misses=%" PRIu64 " revoke_releases=%" PRIu64
             " peak_retained_physicals=%" PRIu64
             " logical_ranges=%" PRIu64
@@ -3394,6 +3410,7 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             ct2d->paired_case.active_direct_physical_unregister_calls,
             ct2d->paired_case.active_direct_physical_unregister_ns,
             ct2d->paired_case.active_direct_cache_hits,
+            ct2d->paired_case.active_direct_cross_case_hits,
             ct2d->paired_case.active_direct_active_hits,
             ct2d->paired_case.active_direct_cache_misses,
             ct2d->paired_case.active_direct_revoke_releases,
@@ -4027,23 +4044,38 @@ static int cxl_type2_direct_source_unregister(CXLType2State *ct2d,
     return CXL_GPU_SUCCESS;
 }
 
-static int cxl_type2_direct_sources_cleanup(CXLType2State *ct2d)
+static int cxl_type2_direct_sources_release(CXLType2State *ct2d)
 {
-    int first_error = CXL_GPU_SUCCESS;
+    int result;
+    CXLType2DirectRegistration *registration;
+    CXLType2DirectPhysical *physical;
 
     while (ct2d->direct_sources) {
         uint64_t source_id = ct2d->direct_sources->source_id;
-        int result = cxl_type2_direct_source_unregister(ct2d, source_id);
 
+        result = cxl_type2_direct_source_unregister(ct2d, source_id);
         if (result != CXL_GPU_SUCCESS) {
-            first_error = result;
-            break;
+            return result;
         }
     }
-    if (first_error == CXL_GPU_SUCCESS) {
-        first_error = cxl_type2_direct_physicals_cleanup(ct2d);
+    for (registration = ct2d->direct_registrations; registration;
+         registration = registration->next) {
+        g_assert(registration->references == 0);
     }
-    return first_error;
+    for (physical = ct2d->direct_physicals; physical;
+         physical = physical->next) {
+        g_assert(physical->references == 0);
+    }
+    return CXL_GPU_SUCCESS;
+}
+
+static int cxl_type2_direct_sources_cleanup(CXLType2State *ct2d)
+{
+    int result = cxl_type2_direct_sources_release(ct2d);
+
+    return result == CXL_GPU_SUCCESS
+               ? cxl_type2_direct_physicals_cleanup(ct2d)
+               : result;
 }
 
 typedef struct CXLType2DirectValidatedRun {
@@ -4277,6 +4309,13 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
                         physical->length -
                             (cursor - physical->mapping_offset));
                     if (physical->registration) {
+                        if (cxl_gpu_direct_epoch_is_cross_case(
+                                physical->last_case_epoch,
+                                ct2d->paired_case.active_epoch)) {
+                            ct2d->paired_case.active_direct_cross_case_hits++;
+                            physical->last_case_epoch =
+                                ct2d->paired_case.active_epoch;
+                        }
                         if (physical->references == 0) {
                             ct2d->paired_case.active_direct_cache_hits++;
                         } else {
@@ -4354,6 +4393,8 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
                     physical = g_new0(CXLType2DirectPhysical, 1);
                     physical->mapping = pinned_mapping;
                     physical->generation = pinned_generation;
+                    physical->last_case_epoch =
+                        ct2d->paired_case.active_epoch;
                     physical->mapping_offset = cursor;
                     physical->length = pin_length;
                     physical->padding_bytes = pin_length - segment_length;
@@ -5700,6 +5741,7 @@ static void cxl_type2_paired_case_begin(CXLType2State *ct2d,
         result.run_binding != run_binding ||
         result.config_binding != config_binding) {
         HetGPUError cleanup_error;
+        int direct_cleanup_error;
         int handle_error;
         int cleanup_status;
 
@@ -5711,6 +5753,11 @@ static void cxl_type2_paired_case_begin(CXLType2State *ct2d,
         cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
                                       "failed_begin_cleanup", "begin", 0,
                                       false);
+        direct_cleanup_error = cxl_type2_direct_sources_cleanup(ct2d);
+        if (direct_cleanup_error != CXL_GPU_SUCCESS) {
+            qemu_log("CXL Type2: direct source cleanup after failed case "
+                     "begin failed: %d\n", direct_cleanup_error);
+        }
         cleanup_error = hetgpu_cleanup_formal(hetgpu);
         if (cleanup_error != HETGPU_SUCCESS) {
             qemu_log("CXL Type2: cleanup after failed case begin also "
@@ -5719,8 +5766,10 @@ static void cxl_type2_paired_case_begin(CXLType2State *ct2d,
         }
         handle_error =
             cxl_type2_clear_gpu_handles(ct2d, run_binding, case_kind, epoch);
-        cleanup_status =
-            cleanup_error != HETGPU_SUCCESS ? cleanup_error : handle_error;
+        cleanup_status = direct_cleanup_error != CXL_GPU_SUCCESS
+                             ? direct_cleanup_error
+                         : cleanup_error != HETGPU_SUCCESS ? cleanup_error
+                                                          : handle_error;
         cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
                                       "failed_begin_cleanup", "end",
                                       cleanup_status, true);
@@ -5808,7 +5857,7 @@ static void cxl_type2_paired_case_end(CXLType2State *ct2d,
         sync_error = HETGPU_ERROR_UNKNOWN;
     }
     if (sync_error == HETGPU_SUCCESS &&
-        cxl_type2_direct_sources_cleanup(ct2d) != CXL_GPU_SUCCESS) {
+        cxl_type2_direct_sources_release(ct2d) != CXL_GPU_SUCCESS) {
         sync_error = HETGPU_ERROR_UNKNOWN;
     }
     pool_clear_result = cxl_type2_clear_htod_staging_pool(ct2d);
@@ -5849,10 +5898,21 @@ static void cxl_type2_paired_case_end(CXLType2State *ct2d,
             false);
         reset_error = HETGPU_SUCCESS;
     } else {
+        int direct_cleanup_error;
+
         cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
                                       "formal_backend_cleanup", "begin", 0,
                                       false);
+        direct_cleanup_error = cxl_type2_direct_sources_cleanup(ct2d);
+        if (direct_cleanup_error != CXL_GPU_SUCCESS) {
+            qemu_log("CXL Type2: direct source cleanup after failed case "
+                     "end failed: %d\n", direct_cleanup_error);
+        }
         reset_error = hetgpu_cleanup_formal(hetgpu);
+        if (direct_cleanup_error != CXL_GPU_SUCCESS &&
+            reset_error == HETGPU_SUCCESS) {
+            reset_error = HETGPU_ERROR_UNKNOWN;
+        }
         cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
                                       "formal_backend_cleanup", "end",
                                       reset_error, true);

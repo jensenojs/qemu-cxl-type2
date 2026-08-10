@@ -87,6 +87,8 @@ bool cxl_gpu_direct_batch_validate(const uint8_t *payload,
 int cxl_gpu_direct_host_address_order(uintptr_t left, uintptr_t right);
 bool cxl_gpu_direct_host_range_follows(uintptr_t base, uint64_t length,
                                        uintptr_t next, uint64_t next_length);
+bool cxl_gpu_direct_epoch_is_cross_case(uint64_t last_case_epoch,
+                                        uint64_t active_case_epoch);
 bool cxl_gpu_direct_registration_group_follows(
     uintptr_t mapping, uintptr_t base, uint64_t length,
     uintptr_t next_mapping, uintptr_t next, uint64_t next_length);

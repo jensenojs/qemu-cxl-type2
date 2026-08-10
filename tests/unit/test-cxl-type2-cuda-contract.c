@@ -526,6 +526,14 @@ static void test_direct_registration_tile_bounds(void)
                      ==, 0);
 }
 
+static void test_direct_cross_case_epoch(void)
+{
+    g_assert_false(cxl_gpu_direct_epoch_is_cross_case(0, 2));
+    g_assert_false(cxl_gpu_direct_epoch_is_cross_case(1, 0));
+    g_assert_false(cxl_gpu_direct_epoch_is_cross_case(2, 2));
+    g_assert_true(cxl_gpu_direct_epoch_is_cross_case(1, 2));
+}
+
 static void test_stream_progress_classification(void)
 {
     uint64_t params[8] = { 11, 12, 13, 14, 15, 16, 17, 18 };
@@ -636,6 +644,8 @@ int main(int argc, char **argv)
                     test_direct_copy_span_adjacency);
     g_test_add_func("/cxl/type2/direct/registration-tile-bounds",
                     test_direct_registration_tile_bounds);
+    g_test_add_func("/cxl/type2/direct/cross-case-epoch",
+                    test_direct_cross_case_epoch);
     g_test_add_func("/cxl/type2/stream/progress-classification",
                     test_stream_progress_classification);
     g_test_add_func("/cxl/type2/stream/sync-generation",
