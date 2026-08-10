@@ -61,6 +61,7 @@ typedef int (*cuMemHostAlloc_fn)(void **, size_t, unsigned int);
 typedef int (*cuMemFreeHost_fn)(void *);
 typedef int (*cuMemHostRegister_fn)(void *, size_t, unsigned int);
 typedef int (*cuMemHostUnregister_fn)(void *);
+typedef int (*cuMemHostGetDevicePointer_fn)(uint64_t *, void *, unsigned int);
 typedef int (*cuMemcpyDtoD_fn)(uint64_t, uint64_t, size_t);
 typedef int (*cuMemcpyDtoDAsync_fn)(uint64_t, uint64_t, size_t, void *);
 typedef struct CudaMemcpy2D {
@@ -158,6 +159,9 @@ typedef int (*cuGetErrorName_fn)(int, const char **);
 #define CUDA_ERROR_INVALID_CONTEXT 201
 #define CUDA_ERROR_INVALID_HANDLE 400
 #define CUDA_ERROR_NOT_SUPPORTED 801
+#define CUDA_MEMHOSTREGISTER_PORTABLE 0x01U
+#define CUDA_MEMHOSTREGISTER_DEVICEMAP 0x02U
+#define CUDA_MEMHOSTREGISTER_READ_ONLY 0x08U
 
 static __thread uint64_t g_cuda_trace_call_id;
 static __thread uint32_t g_cuda_trace_occurrence;
@@ -293,6 +297,7 @@ static struct {
     cuMemFreeHost_fn cuMemFreeHost;
     cuMemHostRegister_fn cuMemHostRegister;
     cuMemHostUnregister_fn cuMemHostUnregister;
+    cuMemHostGetDevicePointer_fn cuMemHostGetDevicePointer;
     cuMemcpyDtoD_fn cuMemcpyDtoD;
     cuMemcpyDtoDAsync_fn cuMemcpyDtoDAsync;
     cuMemcpy2D_fn cuMemcpy2D;
@@ -471,6 +476,8 @@ static HetGPUError hetgpu_init_internal(HetGPUState *state,
                 dlsym(g_cuda_lib_handle, "cuMemHostRegister_v2");
             g_cuda_funcs.cuMemHostUnregister =
                 dlsym(g_cuda_lib_handle, "cuMemHostUnregister");
+            g_cuda_funcs.cuMemHostGetDevicePointer =
+                dlsym(g_cuda_lib_handle, "cuMemHostGetDevicePointer_v2");
             g_cuda_funcs.cuMemcpyDtoD = dlsym(g_cuda_lib_handle, "cuMemcpyDtoD_v2");
             g_cuda_funcs.cuMemcpyDtoDAsync =
                 dlsym(g_cuda_lib_handle, "cuMemcpyDtoDAsync_v2");
@@ -1551,6 +1558,161 @@ int hetgpu_cuda_mem_host_unregister(HetGPUState *state, void *ptr)
     result = HETGPU_CUDA_CALL(cuMemHostUnregister, ptr);
     cuda_unlock(state);
     return result;
+}
+
+int hetgpu_cuda_mem_host_get_device_pointer(HetGPUState *state,
+                                            HetGPUDevicePtr *device_ptr,
+                                            void *host_ptr)
+{
+    int result;
+
+    if (!state || !state->initialized || !device_ptr || !host_ptr ||
+        !g_cuda_funcs.cuMemHostGetDevicePointer) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if (!cuda_lock(state)) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    result =
+        HETGPU_CUDA_CALL(cuMemHostGetDevicePointer, device_ptr, host_ptr, 0U);
+    cuda_unlock(state);
+    return result;
+}
+
+int hetgpu_cuda_stale_alias_probe(HetGPUState *state, void *host_ptr,
+                                  size_t size, int *positive_status,
+                                  int *stale_launch_status,
+                                  int *stale_sync_status)
+{
+    static const char ptx[] =
+        ".version 7.0\n"
+        ".target sm_52\n"
+        ".address_size 64\n"
+        ".visible .entry cxl_copy_one(.param .u64 src, .param .u64 dst) {\n"
+        " .reg .b64 %rd<3>; .reg .b32 %r<2>;\n"
+        " ld.param.u64 %rd1, [src]; ld.param.u64 %rd2, [dst];\n"
+        " ld.global.u32 %r1, [%rd1]; st.global.u32 [%rd2], %r1; ret;\n"
+        "}\n";
+    void *saved_context = NULL;
+    void *probe_context = NULL;
+    void *module = NULL;
+    void *function = NULL;
+    uint64_t alias = 0;
+    uint64_t output = 0;
+    void *args[2] = {&alias, &output};
+    uint32_t expected;
+    uint32_t actual = 0;
+    int result = CUDA_ERROR_INVALID_VALUE;
+    int restore_status = CUDA_SUCCESS;
+    int destroy_status = CUDA_SUCCESS;
+    void *restored_context = NULL;
+
+    if (positive_status) {
+        *positive_status = CUDA_ERROR_INVALID_VALUE;
+    }
+    if (stale_launch_status) {
+        *stale_launch_status = CUDA_ERROR_INVALID_VALUE;
+    }
+    if (stale_sync_status) {
+        *stale_sync_status = CUDA_ERROR_INVALID_VALUE;
+    }
+    if (!state || !state->initialized || !host_ptr || size < sizeof(expected) ||
+        !positive_status || !stale_launch_status || !stale_sync_status ||
+        !g_cuda_mutex_initialized || !g_cuda_funcs.cuCtxGetCurrent ||
+        !g_cuda_funcs.cuCtxSetCurrent || !g_cuda_funcs.cuCtxCreate ||
+        !g_cuda_funcs.cuCtxDestroy || !g_cuda_funcs.cuMemHostRegister ||
+        !g_cuda_funcs.cuMemHostGetDevicePointer ||
+        !g_cuda_funcs.cuMemHostUnregister || !g_cuda_funcs.cuModuleLoadData ||
+        !g_cuda_funcs.cuModuleGetFunction || !g_cuda_funcs.cuMemAlloc ||
+        !g_cuda_funcs.cuLaunchKernel || !g_cuda_funcs.cuCtxSynchronize ||
+        !g_cuda_funcs.cuMemcpyDtoH) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+
+    memcpy(&expected, host_ptr, sizeof(expected));
+    qemu_mutex_lock(&g_cuda_mutex);
+    result = HETGPU_CUDA_CALL(cuCtxGetCurrent, &saved_context);
+    if (result != CUDA_SUCCESS || !saved_context ||
+        saved_context != state->context) {
+        result = CUDA_ERROR_INVALID_CONTEXT;
+        goto out;
+    }
+    result =
+        HETGPU_CUDA_CALL(cuCtxCreate, &probe_context, 0U, state->cuda_device);
+    if (result != CUDA_SUCCESS) {
+        goto out;
+    }
+    result = HETGPU_CUDA_CALL(cuMemHostRegister, host_ptr, size,
+                              CUDA_MEMHOSTREGISTER_PORTABLE |
+                                  CUDA_MEMHOSTREGISTER_DEVICEMAP |
+                                  CUDA_MEMHOSTREGISTER_READ_ONLY);
+    if (result != CUDA_SUCCESS) {
+        goto out;
+    }
+    result = HETGPU_CUDA_CALL(cuMemHostGetDevicePointer, &alias, host_ptr, 0U);
+    if (result != CUDA_SUCCESS || !alias) {
+        goto unregister;
+    }
+    result = HETGPU_CUDA_CALL(cuModuleLoadData, &module, ptx);
+    if (result != CUDA_SUCCESS) {
+        goto unregister;
+    }
+    result = HETGPU_CUDA_CALL(cuModuleGetFunction, &function, module,
+                              "cxl_copy_one");
+    if (result != CUDA_SUCCESS) {
+        goto unregister;
+    }
+    result = HETGPU_CUDA_CALL(cuMemAlloc, &output, sizeof(actual));
+    if (result != CUDA_SUCCESS) {
+        goto unregister;
+    }
+    result = HETGPU_CUDA_CALL(cuLaunchKernel, function, 1U, 1U, 1U, 1U, 1U, 1U,
+                              0U, NULL, args, NULL);
+    if (result == CUDA_SUCCESS) {
+        result = HETGPU_CUDA_CALL(cuCtxSynchronize);
+    }
+    if (result == CUDA_SUCCESS) {
+        result =
+            HETGPU_CUDA_CALL(cuMemcpyDtoH, &actual, output, sizeof(actual));
+    }
+    *positive_status = result == CUDA_SUCCESS && actual == expected
+                           ? CUDA_SUCCESS
+                           : CUDA_ERROR_INVALID_VALUE;
+
+unregister:
+    result = HETGPU_CUDA_CALL(cuMemHostUnregister, host_ptr);
+    if (*positive_status != CUDA_SUCCESS || result != CUDA_SUCCESS) {
+        goto out;
+    }
+    *stale_launch_status = HETGPU_CUDA_CALL(
+        cuLaunchKernel, function, 1U, 1U, 1U, 1U, 1U, 1U, 0U, NULL, args, NULL);
+    *stale_sync_status = *stale_launch_status == CUDA_SUCCESS
+                             ? HETGPU_CUDA_CALL(cuCtxSynchronize)
+                             : CUDA_ERROR_INVALID_VALUE;
+    result = (*stale_launch_status != CUDA_SUCCESS ||
+              *stale_sync_status != CUDA_SUCCESS)
+                 ? CUDA_SUCCESS
+                 : CUDA_ERROR_INVALID_VALUE;
+
+out:
+    if (probe_context) {
+        destroy_status = HETGPU_CUDA_CALL(cuCtxDestroy, probe_context);
+    }
+    if (saved_context) {
+        restore_status = HETGPU_CUDA_CALL(cuCtxSetCurrent, saved_context);
+    }
+    if (restore_status == CUDA_SUCCESS) {
+        restore_status = HETGPU_CUDA_CALL(cuCtxGetCurrent, &restored_context);
+    }
+    if (restore_status == CUDA_SUCCESS && restored_context != saved_context) {
+        restore_status = CUDA_ERROR_INVALID_CONTEXT;
+    }
+    cuda_thread_binding_clear();
+    qemu_mutex_unlock(&g_cuda_mutex);
+    return result == CUDA_SUCCESS && destroy_status == CUDA_SUCCESS &&
+                   restore_status == CUDA_SUCCESS
+               ? CUDA_SUCCESS
+               : CUDA_ERROR_INVALID_VALUE;
 }
 
 int hetgpu_cuda_memcpy_htod_async(HetGPUState *state, HetGPUDevicePtr dst,

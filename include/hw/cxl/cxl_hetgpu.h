@@ -450,6 +450,13 @@ int hetgpu_cuda_mem_free_host(HetGPUState *state, void *ptr);
 int hetgpu_cuda_mem_host_register(HetGPUState *state, void *ptr, size_t size,
                                   unsigned int flags);
 int hetgpu_cuda_mem_host_unregister(HetGPUState *state, void *ptr);
+int hetgpu_cuda_mem_host_get_device_pointer(HetGPUState *state,
+                                            HetGPUDevicePtr *device_ptr,
+                                            void *host_ptr);
+int hetgpu_cuda_stale_alias_probe(HetGPUState *state, void *host_ptr,
+                                  size_t size, int *positive_status,
+                                  int *stale_launch_status,
+                                  int *stale_sync_status);
 int hetgpu_cuda_memcpy_htod_async(HetGPUState *state, HetGPUDevicePtr dst,
                                   const void *src, size_t size,
                                   HetGPUStream stream);

@@ -116,6 +116,14 @@ typedef struct CXLCohFreeBlock {
     struct CXLCohFreeBlock *next;
 } CXLCohFreeBlock;
 
+typedef struct CXLCohAllocation {
+    uint64_t size;
+    uint64_t device_alias;
+    uint64_t htod_calls_at_map;
+    bool host_registered;
+    bool ever_mapped;
+} CXLCohAllocation;
+
 /* Dynamic Capacity Device extent state for Type2 CXL.mem BAR4 */
 typedef struct CXLType2DCDExtent {
     uint64_t base;
@@ -569,8 +577,10 @@ typedef struct CXLType2State {
         uint64_t base_offset;       /* device_mem_size - pool_size */
         uint64_t size;              /* Configurable, default 256MB */
         uint64_t used;
-        GHashTable *allocations;    /* bar4_offset -> alloc_size */
+        GHashTable *allocations;    /* bar4_offset -> CXLCohAllocation */
         struct CXLCohFreeBlock *free_list;
+        uint64_t retired_bytes;
+        uint64_t retired_allocations;
         QemuMutex lock;
     } coherent_pool;
 
