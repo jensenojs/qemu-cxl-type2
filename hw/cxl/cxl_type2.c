@@ -4276,16 +4276,25 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
             uint64_t registration_length = member->length;
             uint64_t registration_padding = member->padding_bytes;
             guint end = first + 1;
+            bool cross_mapping = false;
 
             while (end < pending->len) {
                 CXLType2DirectPhysical *next =
                     g_ptr_array_index(pending, end);
 
-                if (!cxl_gpu_direct_registration_group_follows(
-                        (uintptr_t)member->mapping, base, registration_length,
-                        (uintptr_t)next->mapping,
+                /* Merge on host-VA contiguity alone. Members keep their own
+                 * mapping pins; prepare_revoke marks the whole registration
+                 * when any member mapping is revoked, so the stricter
+                 * same-mapping rule is not required for correctness and it
+                 * defeats coalescing when the guest maps the file through
+                 * small DAX windows. */
+                if (!cxl_gpu_direct_host_range_follows(
+                        base, registration_length,
                         (uintptr_t)next->host_address, next->length)) {
                     break;
+                }
+                if (next->mapping != member->mapping) {
+                    cross_mapping = true;
                 }
                 registration_length += next->length;
                 registration_padding += next->padding_bytes;
@@ -4299,6 +4308,11 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
             registration->next = ct2d->direct_registrations;
             ct2d->direct_registrations = registration;
             g_ptr_array_add(new_groups, registration);
+            if (cross_mapping) {
+                ct2d->paired_case.active_direct_cross_mapping_groups++;
+                ct2d->paired_case.active_direct_cross_mapping_members +=
+                    registration->member_count;
+            }
             ct2d->paired_case.active_direct_retained_groups++;
             ct2d->paired_case.active_direct_peak_retained_groups = MAX(
                 ct2d->paired_case.active_direct_peak_retained_groups,
