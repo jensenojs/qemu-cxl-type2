@@ -23,7 +23,8 @@ CXLType2DescriptorRequestVerdict cxl_type2_descriptor_validate_request(
         return CXL_TYPE2_DESCRIPTOR_INVALID_DOORBELL;
     }
     if (device_generation == 0 ||
-        request->protocol_version != CXL_GPU_DESCRIPTOR_PROTOCOL_VERSION ||
+        (request->protocol_version < 1U ||
+         request->protocol_version > CXL_GPU_DESCRIPTOR_PROTOCOL_VERSION) ||
         request->descriptor_size != CXL_GPU_DESCRIPTOR_WIRE_SIZE ||
         !cxl_type2_descriptor_reserved_is_zero(request)) {
         return CXL_TYPE2_DESCRIPTOR_INVALID_HEADER;

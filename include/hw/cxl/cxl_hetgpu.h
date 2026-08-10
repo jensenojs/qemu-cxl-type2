@@ -485,6 +485,12 @@ HetGPUError hetgpu_memcpy2d_dtod(HetGPUState *state, HetGPUDevicePtr dst,
                                  size_t dst_pitch, HetGPUDevicePtr src,
                                  size_t src_pitch, size_t width, size_t height);
 
+HetGPUError hetgpu_memcpy2d_dtod_async(HetGPUState *state,
+                                       HetGPUDevicePtr dst, size_t dst_pitch,
+                                       HetGPUDevicePtr src, size_t src_pitch,
+                                       size_t width, size_t height,
+                                       HetGPUStream stream);
+
 /**
  * hetgpu_memset - Set device memory
  * @state: Initialized HetGPUState
