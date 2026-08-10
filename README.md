@@ -279,6 +279,14 @@ guest和QEMU对协议的定义必须一致：
 
 任何一侧单独增加命令、参数或返回值都会制造ABI断裂。
 
+### 2D DtoD描述符的stream语义
+
+共享描述符协议当前常量版本为`2`。它与CXLMemSim guest shim配对：`CXL_GPU_CMD_MEM_COPY_2D_DTOD`在`PARAM6`携带`stream_wire`。QEMU接受版本`1..2`；版本`2`且该字段能解析为非sentinel stream时，调用`hetgpu_memcpy2d_dtod_async()`，由动态加载的`cuMemcpy2DAsync_v2`在该stream上提交copy。
+
+版本`1`、sentinel stream或无法解析的stream保持既有`hetgpu_memcpy2d_dtod()`同步路径。这个分支保留旧shim兼容性，也使缺失的stream信息保持可见：它不会被推断为任意异步stream。
+
+`copy_driver` trace把这次选择写为两个字段：`stream_forwarded=1`证明stream已经透传到当前copy路径；`implementation`记录实际实现路径，例如同步legacy或异步direct。两者必须一起读取：前者不能单独证明Driver已在目标stream完成copy，后者也不能替代BAR2描述符的输入证据。
+
 ### BAR4：device-attached memory与bulk window
 
 QEMU把`device_mem`注册为BAR4。它承载Type-2 device-attached memory、bulk copy的中间窗口、coherent pool、dynamic-capacity和部分shadow/coherency状态。
@@ -320,6 +328,10 @@ QEMU cxl_type2
 ```
 
 QEMU还维护module和function handle表、paired case epoch、command sequence与返回码。guest把QEMU分配的稳定ID作为opaque token使用，QEMU再把它解析成host pointer。core或日志中的handle问题需要同时检查guest编码、BAR2参数、QEMU表和Concordia/NVIDIA返回值。
+
+### 2D DtoD同步定罪探针
+
+`hetgpu_memcpy2d_dtod()`读取`HETGPU_PROBE_SYNC_BEFORE_2D_DTOD`。值为`1`或`true`时，它在同步2D DtoD copy之前注入`cuCtxSynchronize()`；默认关闭。该门控只用于定罪实验：若强制上下文同步改变结果，它证明待确认的异步stream语义影响了该copy前的可见性。它不证明丢失stream发生在哪一层，也不构成正式路径的同步策略。
 
 ## CXLMemSim怎样接入
 
