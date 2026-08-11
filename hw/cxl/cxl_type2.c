@@ -5030,36 +5030,6 @@ static bool cxl_type2_direct_range_is_valid(
     return true;
 }
 
-static int cxl_type2_direct_range_prepare_registrations(
-    CXLType2State *ct2d, const CXLGPUDirectRangeV1 *wire,
-    CXLType2DirectSource *source)
-{
-    CXLGPUSourceRangeV1 *range = &source->ranges[wire->source_range];
-    uint64_t skip = range->first_run_byte_offset + wire->source_offset;
-    uint64_t remaining = wire->size;
-
-    for (uint32_t i = 0; i < range->run_count && remaining; i++) {
-        CXLType2DirectRun *run = &source->runs[range->first_run + i];
-        uint64_t chunk;
-        int result;
-
-        if (skip >= run->length) {
-            skip -= run->length;
-            continue;
-        }
-        chunk = MIN(remaining, run->length - skip);
-        result = cxl_type2_direct_registration_ensure(
-            ct2d, run->physical->registration);
-        if (result != CXL_GPU_SUCCESS) {
-            return result;
-        }
-        remaining -= chunk;
-        skip = 0;
-    }
-    g_assert(remaining == 0);
-    return CXL_GPU_SUCCESS;
-}
-
 static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
                                           const uint8_t *payload,
                                           uint64_t payload_capacity,
@@ -5090,7 +5060,6 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
     HetGPUDevicePtr *destinations = NULL;
     const void **hosts = NULL;
     size_t *sizes = NULL;
-    size_t submitted = 0;
     size_t failed_span = SIZE_MAX;
     int result = CXL_GPU_SUCCESS;
 
@@ -5118,16 +5087,6 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
                 &resolved[i].source)) {
             *fail_index = i;
             result = CXL_GPU_ERROR_INVALID_VALUE;
-            goto out;
-        }
-    }
-
-    /* Finish every Driver registration before the first asynchronous copy. */
-    for (uint64_t i = 0; i < range_count; i++) {
-        result = cxl_type2_direct_range_prepare_registrations(
-            ct2d, &resolved[i].wire, resolved[i].source);
-        if (result != CXL_GPU_SUCCESS) {
-            *fail_index = i;
             goto out;
         }
     }
@@ -5215,8 +5174,7 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
         CXLType2DirectSpan *span = &g_array_index(
             spans, CXLType2DirectSpan, i);
 
-        if (!span->registration->cuda_registered ||
-            span->registration->revoke_pending) {
+        if (span->registration->revoke_pending) {
             *fail_index = span->logical_index;
             result = CXL_GPU_ERROR_INVALID_VALUE;
             goto out;
@@ -5224,7 +5182,6 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
         destinations[i] = span->destination;
         hosts[i] = span->host;
         sizes[i] = span->length;
-        span->enqueue_start_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
     }
     if (!cxl_gpu_direct_destinations_are_independent(
             destinations, sizes, spans->len, &failed_span)) {
@@ -5235,28 +5192,85 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
         result = CXL_GPU_ERROR_INVALID_VALUE;
         goto out;
     }
-    result = hetgpu_cuda_memcpy_htod_batch_async(
-        &ct2d->gpu_info.hetgpu_state, destinations, hosts, sizes, spans->len,
-        stream, &submitted, &failed_span);
-    for (size_t i = 0; i < submitted; i++) {
-        CXLType2DirectSpan *span = &g_array_index(
-            spans, CXLType2DirectSpan, i);
+    /* Let each ready prefix run while the host registers the next range. */
+    for (size_t slice_start = 0, boundary = 0; boundary <= spans->len;
+         boundary++) {
+        CXLType2DirectSpan *boundary_span =
+            boundary < spans->len
+                ? &g_array_index(spans, CXLType2DirectSpan, boundary)
+                : NULL;
 
-        cxl_type2_record_htod_direct(
-            ct2d, span->destination, span->host, span->length, stream,
-            span->source, span->enqueue_start_ns);
-        (*fragments_enqueued)++;
-    }
-    if (result != CXL_GPU_SUCCESS) {
-        g_assert(submitted == 0);
-        if (failed_span >= spans->len) {
-            failed_span = 0;
+        if (boundary_span && boundary_span->registration->cuda_registered) {
+            continue;
         }
-        *fail_index = g_array_index(
-            spans, CXLType2DirectSpan, failed_span).logical_index;
-        goto out;
+        if (boundary > slice_start) {
+            size_t slice_count = boundary - slice_start;
+            size_t slice_submitted = 0;
+            size_t slice_failed = SIZE_MAX;
+            int64_t enqueue_start_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+
+            for (size_t i = slice_start; i < boundary; i++) {
+                CXLType2DirectSpan *span = &g_array_index(
+                    spans, CXLType2DirectSpan, i);
+
+                if (!span->registration->cuda_registered ||
+                    span->registration->revoke_pending) {
+                    *fail_index = span->logical_index;
+                    result = CXL_GPU_ERROR_INVALID_VALUE;
+                    goto out;
+                }
+                span->enqueue_start_ns = enqueue_start_ns;
+            }
+            result = hetgpu_cuda_memcpy_htod_batch_async(
+                &ct2d->gpu_info.hetgpu_state,
+                destinations + slice_start, hosts + slice_start,
+                sizes + slice_start, slice_count, stream,
+                &slice_submitted, &slice_failed);
+            for (size_t i = slice_start;
+                 i < slice_start + slice_submitted; i++) {
+                CXLType2DirectSpan *span = &g_array_index(
+                    spans, CXLType2DirectSpan, i);
+
+                cxl_type2_record_htod_direct(
+                    ct2d, span->destination, span->host, span->length,
+                    stream, span->source, span->enqueue_start_ns);
+                (*fragments_enqueued)++;
+            }
+            if (slice_submitted) {
+                size_t next = slice_start + slice_submitted;
+                CXLType2DirectSpan *last = &g_array_index(
+                    spans, CXLType2DirectSpan, next - 1);
+
+                *logical_enqueued =
+                    next == spans->len ||
+                    g_array_index(spans, CXLType2DirectSpan,
+                                  next).logical_index != last->logical_index
+                        ? last->logical_index + 1
+                        : last->logical_index;
+            }
+            if (result != CXL_GPU_SUCCESS) {
+                size_t failed =
+                    slice_failed < slice_count
+                        ? slice_start + slice_failed
+                        : slice_start;
+
+                *fail_index = g_array_index(
+                    spans, CXLType2DirectSpan, failed).logical_index;
+                goto out;
+            }
+        }
+        if (!boundary_span) {
+            break;
+        }
+        result = cxl_type2_direct_registration_ensure(
+            ct2d, boundary_span->registration);
+        if (result != CXL_GPU_SUCCESS) {
+            *fail_index = boundary_span->logical_index;
+            goto out;
+        }
+        slice_start = boundary;
     }
-    *logical_enqueued = range_count;
+    g_assert(*logical_enqueued == range_count);
     *fail_index = SIZE_MAX;
 out:
     g_free(sizes);
