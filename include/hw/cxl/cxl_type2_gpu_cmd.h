@@ -354,8 +354,7 @@ typedef enum {
     CXL_GPU_CMD_GET_BIAS            = 0xA5,  /* Get bias mode for address */
     CXL_GPU_CMD_BIAS_FLIP           = 0xA6,  /* Flip bias with cache flush */
     CXL_GPU_CMD_COHERENT_MAP_DEVICE = 0xA7,  /* Register BAR4 range for GPU reads */
-    CXL_GPU_CMD_COHERENT_UNMAP_DEVICE = 0xA8, /* Complete and unregister GPU alias */
-    CXL_GPU_CMD_COHERENT_STALE_ALIAS_PROBE = 0xA9, /* Isolated stale-alias falsifier */
+    CXL_GPU_CMD_COHERENT_UNMAP_DEVICE = 0xA8, /* Complete, unregister and verify GPU alias */
 
     /* Coherency statistics commands */
     CXL_GPU_CMD_COH_GET_STATS       = 0xB0,  /* Get coherency statistics */

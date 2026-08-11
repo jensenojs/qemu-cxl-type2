@@ -46,6 +46,12 @@ typedef int (*CXLType2CudaAttributeQuery)(void *opaque, int32_t attribute);
 typedef int (*CXLType2CudaMemInfoQuery)(void *opaque);
 typedef int (*CXLGPUBatchHtoDEnqueue)(void *opaque, uint64_t destination,
                                       const void *source, size_t size);
+typedef struct CXLType2CoherentUnmapOps {
+    int (*synchronize)(void *opaque);
+    uint64_t (*htod_calls)(void *opaque);
+    int (*unregister_host)(void *opaque);
+    int (*query_memory_type)(void *opaque, uint64_t device_alias);
+} CXLType2CoherentUnmapOps;
 
 /*
  * The command handler must enter the real CUDA helper only through these
@@ -59,6 +65,11 @@ bool cxl_type2_cuda_dispatch_mem_info(bool active_case, bool live_context,
                                       uint64_t token, uint64_t active_epoch,
                                       CXLType2CudaMemInfoQuery query,
                                       void *opaque, int *query_result);
+int cxl_type2_coherent_unmap_execute(
+    bool host_registered, uint64_t stored_alias, uint64_t requested_alias,
+    uint64_t htod_calls_at_map, const CXLType2CoherentUnmapOps *ops,
+    void *opaque, uint64_t *htod_delta, int *stale_query_status,
+    bool *mapping_invalidated);
 bool cxl_gpu_batch_htod_validate(const uint8_t *payload,
                                  uint64_t payload_capacity,
                                  uint64_t expected_range_count,

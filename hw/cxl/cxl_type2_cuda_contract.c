@@ -312,6 +312,47 @@ bool cxl_type2_cuda_dispatch_mem_info(bool active_case, bool live_context,
     return true;
 }
 
+int cxl_type2_coherent_unmap_execute(
+    bool host_registered, uint64_t stored_alias, uint64_t requested_alias,
+    uint64_t htod_calls_at_map, const CXLType2CoherentUnmapOps *ops,
+    void *opaque, uint64_t *htod_delta, int *stale_query_status,
+    bool *mapping_invalidated)
+{
+    int result;
+
+    if (!ops || !ops->synchronize || !ops->htod_calls ||
+        !ops->unregister_host || !ops->query_memory_type || !htod_delta ||
+        !stale_query_status || !mapping_invalidated) {
+        return CXL_GPU_ERROR_INVALID_VALUE;
+    }
+    *htod_delta = 0;
+    *stale_query_status = CXL_GPU_ERROR_UNKNOWN;
+    *mapping_invalidated = false;
+    if (!host_registered || !stored_alias || stored_alias != requested_alias) {
+        return CXL_GPU_ERROR_INVALID_VALUE;
+    }
+    result = ops->synchronize(opaque);
+    if (result != CXL_GPU_SUCCESS) {
+        return result;
+    }
+    *htod_delta = ops->htod_calls(opaque) - htod_calls_at_map;
+    if (*htod_delta != 0) {
+        return CXL_GPU_ERROR_INVALID_VALUE;
+    }
+    result = ops->unregister_host(opaque);
+    if (result != CXL_GPU_SUCCESS) {
+        return result;
+    }
+    *mapping_invalidated = true;
+    *stale_query_status = ops->query_memory_type(opaque, requested_alias);
+    if (*stale_query_status == CXL_GPU_ERROR_INVALID_VALUE) {
+        return CXL_GPU_SUCCESS;
+    }
+    return *stale_query_status == CXL_GPU_SUCCESS
+               ? CXL_GPU_ERROR_INVALID_VALUE
+               : *stale_query_status;
+}
+
 bool cxl_gpu_batch_htod_validate(const uint8_t *payload,
                                  uint64_t payload_capacity,
                                  uint64_t expected_range_count,

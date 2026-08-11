@@ -2522,7 +2522,6 @@ static int cxl_coherent_map_device(CXLType2State *ct2d, uint64_t offset,
 
     qemu_mutex_lock(&ct2d->coherent_pool.lock);
     allocation->host_registered = true;
-    allocation->ever_mapped = true;
     allocation->htod_calls_at_map = cxl_coherent_htod_command_calls(ct2d);
     qemu_mutex_unlock(&ct2d->coherent_pool.lock);
     result =
@@ -2538,54 +2537,104 @@ static int cxl_coherent_map_device(CXLType2State *ct2d, uint64_t offset,
         return result != CXL_GPU_SUCCESS ? result : CXL_GPU_ERROR_INVALID_VALUE;
     }
     qemu_mutex_lock(&ct2d->coherent_pool.lock);
+    allocation->ever_mapped = true;
     allocation->device_alias = *device_alias;
     qemu_mutex_unlock(&ct2d->coherent_pool.lock);
     return CXL_GPU_SUCCESS;
 }
 
+typedef struct CXLCoherentUnmapContext {
+    CXLType2State *ct2d;
+    HetGPUState *hetgpu;
+    uint8_t *host_ptr;
+} CXLCoherentUnmapContext;
+
+static int cxl_coherent_unmap_synchronize(void *opaque)
+{
+    CXLCoherentUnmapContext *context = opaque;
+
+    return hetgpu_synchronize(context->hetgpu) == HETGPU_SUCCESS
+               ? CXL_GPU_SUCCESS
+               : CXL_GPU_ERROR_UNKNOWN;
+}
+
+static uint64_t cxl_coherent_unmap_htod_calls(void *opaque)
+{
+    CXLCoherentUnmapContext *context = opaque;
+
+    return cxl_coherent_htod_command_calls(context->ct2d);
+}
+
+static int cxl_coherent_unmap_unregister(void *opaque)
+{
+    CXLCoherentUnmapContext *context = opaque;
+
+    return hetgpu_cuda_mem_host_unregister(context->hetgpu, context->host_ptr);
+}
+
+static int cxl_coherent_unmap_query(void *opaque, uint64_t device_alias)
+{
+    CXLCoherentUnmapContext *context = opaque;
+    int memory_type;
+
+    return hetgpu_pointer_get_memory_type(context->hetgpu, device_alias,
+                                          &memory_type);
+}
+
 static int cxl_coherent_unmap_device(CXLType2State *ct2d, uint64_t offset,
                                      uint64_t device_alias,
-                                     uint64_t *htod_delta)
+                                     uint64_t *htod_delta,
+                                     int *stale_query_status)
 {
     HetGPUState *hetgpu = &ct2d->gpu_info.hetgpu_state;
+    const CXLType2CoherentUnmapOps ops = {
+        .synchronize = cxl_coherent_unmap_synchronize,
+        .htod_calls = cxl_coherent_unmap_htod_calls,
+        .unregister_host = cxl_coherent_unmap_unregister,
+        .query_memory_type = cxl_coherent_unmap_query,
+    };
     CXLCohAllocation *allocation;
+    CXLCoherentUnmapContext context;
     uint8_t *host_ptr;
     uint64_t calls_at_map;
+    uint64_t stored_alias;
+    bool host_registered;
+    bool mapping_invalidated;
     int result;
 
-    if (!htod_delta) {
+    if (!htod_delta || !stale_query_status) {
         return CXL_GPU_ERROR_INVALID_VALUE;
     }
+    *stale_query_status = CXL_GPU_ERROR_UNKNOWN;
     qemu_mutex_lock(&ct2d->coherent_pool.lock);
     allocation = g_hash_table_lookup(ct2d->coherent_pool.allocations, &offset);
-    if (!allocation || !allocation->host_registered ||
-        allocation->device_alias != device_alias) {
+    if (!allocation) {
         qemu_mutex_unlock(&ct2d->coherent_pool.lock);
         return CXL_GPU_ERROR_INVALID_VALUE;
     }
+    host_registered = allocation->host_registered;
+    stored_alias = allocation->device_alias;
     calls_at_map = allocation->htod_calls_at_map;
     host_ptr = cxl_type2_bar4_host_ptr(ct2d, offset, allocation->size);
     qemu_mutex_unlock(&ct2d->coherent_pool.lock);
     if (!host_ptr) {
         return CXL_GPU_ERROR_INVALID_VALUE;
     }
-    result = hetgpu_synchronize(hetgpu);
-    if (result != HETGPU_SUCCESS) {
-        return CXL_GPU_ERROR_UNKNOWN;
+    context = (CXLCoherentUnmapContext) {
+        .ct2d = ct2d,
+        .hetgpu = hetgpu,
+        .host_ptr = host_ptr,
+    };
+    result = cxl_type2_coherent_unmap_execute(
+        host_registered, stored_alias, device_alias, calls_at_map, &ops,
+        &context, htod_delta, stale_query_status, &mapping_invalidated);
+    if (mapping_invalidated) {
+        qemu_mutex_lock(&ct2d->coherent_pool.lock);
+        allocation->host_registered = false;
+        allocation->device_alias = 0;
+        qemu_mutex_unlock(&ct2d->coherent_pool.lock);
     }
-    *htod_delta = cxl_coherent_htod_command_calls(ct2d) - calls_at_map;
-    if (*htod_delta != 0) {
-        return CXL_GPU_ERROR_INVALID_VALUE;
-    }
-    result = hetgpu_cuda_mem_host_unregister(hetgpu, host_ptr);
-    if (result != CXL_GPU_SUCCESS) {
-        return result;
-    }
-    qemu_mutex_lock(&ct2d->coherent_pool.lock);
-    allocation->host_registered = false;
-    allocation->device_alias = 0;
-    qemu_mutex_unlock(&ct2d->coherent_pool.lock);
-    return CXL_GPU_SUCCESS;
+    return result;
 }
 
 static void cxl_coherent_pool_cleanup_mappings(CXLType2State *ct2d)
@@ -8851,50 +8900,18 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
 
     case CXL_GPU_CMD_COHERENT_UNMAP_DEVICE: {
         uint64_t htod_delta = 0;
-        int result =
-            cxl_coherent_unmap_device(ct2d, ct2d->gpu_cmd.params[0],
-                                      ct2d->gpu_cmd.params[1], &htod_delta);
+        int stale_query_status = CXL_GPU_ERROR_UNKNOWN;
+        int result = cxl_coherent_unmap_device(
+            ct2d, ct2d->gpu_cmd.params[0], ct2d->gpu_cmd.params[1],
+            &htod_delta, &stale_query_status);
         ct2d->gpu_cmd.cmd_result = result;
         ct2d->gpu_cmd.results[0] = htod_delta;
+        ct2d->gpu_cmd.results[1] = (uint32_t)stale_query_status;
         qemu_log("cxl_coherent_device_unmap status=%d offset=0x%" PRIx64
-                 " device_alias=0x%" PRIx64 " htod_command_delta=%" PRIu64 "\n",
+                 " device_alias=0x%" PRIx64 " htod_command_delta=%" PRIu64
+                 " stale_query_driver_status=%d\n",
                  result, ct2d->gpu_cmd.params[0], ct2d->gpu_cmd.params[1],
-                 htod_delta);
-    } break;
-
-    case CXL_GPU_CMD_COHERENT_STALE_ALIAS_PROBE: {
-        uint64_t offset = ct2d->gpu_cmd.params[0];
-        uint64_t probe_size = ct2d->gpu_cmd.params[1];
-        CXLCohAllocation *allocation;
-        uint8_t *host_ptr;
-        int positive = CXL_GPU_ERROR_INVALID_VALUE;
-        int stale_launch = CXL_GPU_ERROR_INVALID_VALUE;
-        int stale_sync = CXL_GPU_ERROR_INVALID_VALUE;
-
-        qemu_mutex_lock(&ct2d->coherent_pool.lock);
-        allocation =
-            g_hash_table_lookup(ct2d->coherent_pool.allocations, &offset);
-        host_ptr = allocation && allocation->ever_mapped &&
-                           !allocation->host_registered && probe_size &&
-                           probe_size <= allocation->size
-                       ? cxl_type2_bar4_host_ptr(ct2d, offset, probe_size)
-                       : NULL;
-        qemu_mutex_unlock(&ct2d->coherent_pool.lock);
-        ct2d->gpu_cmd.cmd_result =
-            host_ptr
-                ? hetgpu_cuda_stale_alias_probe(&ct2d->gpu_info.hetgpu_state,
-                                                host_ptr, probe_size, &positive,
-                                                &stale_launch, &stale_sync)
-                : CXL_GPU_ERROR_INVALID_VALUE;
-        ct2d->gpu_cmd.results[0] = (uint32_t)positive;
-        ct2d->gpu_cmd.results[1] = (uint32_t)stale_launch;
-        ct2d->gpu_cmd.results[2] = (uint32_t)stale_sync;
-        qemu_log("cxl_coherent_stale_alias status=%d offset=0x%" PRIx64
-                 " bytes=%" PRIu64 " positive=%d stale_launch=%d"
-                 " stale_sync=%d main_context_restored=%d\n",
-                 ct2d->gpu_cmd.cmd_result, offset, probe_size, positive,
-                 stale_launch, stale_sync,
-                 ct2d->gpu_cmd.cmd_result == CXL_GPU_SUCCESS);
+                 htod_delta, stale_query_status);
     } break;
 
     /* ---- Device-biased directory commands ---- */
