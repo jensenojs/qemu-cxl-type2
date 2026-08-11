@@ -231,6 +231,32 @@ bool cxl_gpu_direct_copy_span_follows(
            next_destination == destination + length;
 }
 
+bool cxl_gpu_direct_destinations_are_independent(
+    const uint64_t *destinations, const size_t *sizes, size_t count,
+    size_t *conflict_index)
+{
+    if (!destinations || !sizes || !count || !conflict_index) {
+        return false;
+    }
+    *conflict_index = SIZE_MAX;
+    for (size_t i = 0; i < count; i++) {
+        if (!sizes[i] || destinations[i] > UINT64_MAX - sizes[i]) {
+            *conflict_index = i;
+            return false;
+        }
+        for (size_t j = 0; j < i; j++) {
+            uint64_t end = destinations[i] + sizes[i];
+            uint64_t previous_end = destinations[j] + sizes[j];
+
+            if (destinations[i] < previous_end && destinations[j] < end) {
+                *conflict_index = i;
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 uint64_t cxl_gpu_direct_registration_length(
     uint64_t mapping_offset, uint64_t mapping_length,
     uint64_t request_offset, uint64_t request_length,

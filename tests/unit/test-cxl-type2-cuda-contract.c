@@ -566,6 +566,29 @@ static void test_direct_copy_span_adjacency(void)
         1, 2, 0x2000, 0x800, 0x800));
 }
 
+static void test_direct_batch_destinations_are_independent(void)
+{
+    const uint64_t destinations[] = { 0x1000, 0x3000, 0x2000 };
+    const size_t sizes[] = { 0x1000, 0x800, 0x1000 };
+    const uint64_t overlapping[] = { 0x1000, 0x1800 };
+    const size_t overlapping_sizes[] = { 0x1000, 0x1000 };
+    const uint64_t overflowing[] = { UINT64_MAX - 7 };
+    const size_t overflowing_sizes[] = { 8 };
+    size_t conflict = 0;
+
+    g_assert_true(cxl_gpu_direct_destinations_are_independent(
+        destinations, sizes, G_N_ELEMENTS(destinations), &conflict));
+    g_assert_cmpuint(conflict, ==, SIZE_MAX);
+    g_assert_false(cxl_gpu_direct_destinations_are_independent(
+        overlapping, overlapping_sizes, G_N_ELEMENTS(overlapping),
+        &conflict));
+    g_assert_cmpuint(conflict, ==, 1);
+    g_assert_false(cxl_gpu_direct_destinations_are_independent(
+        overflowing, overflowing_sizes, G_N_ELEMENTS(overflowing),
+        &conflict));
+    g_assert_cmpuint(conflict, ==, 0);
+}
+
 static void test_direct_registration_tile_bounds(void)
 {
     const uint64_t mib = 1024 * 1024;
@@ -840,6 +863,8 @@ int main(int argc, char **argv)
                     test_direct_registration_mapping_owner);
     g_test_add_func("/cxl/type2/direct/copy-span-layout",
                     test_direct_copy_span_adjacency);
+    g_test_add_func("/cxl/type2/direct/batch-destination-independence",
+                    test_direct_batch_destinations_are_independent);
     g_test_add_func("/cxl/type2/direct/registration-tile-bounds",
                     test_direct_registration_tile_bounds);
     g_test_add_func("/cxl/type2/direct/cross-case-epoch",

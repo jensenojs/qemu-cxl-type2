@@ -459,7 +459,7 @@ int hetgpu_cuda_memcpy_htod_async(HetGPUState *state, HetGPUDevicePtr dst,
 int hetgpu_cuda_memcpy_htod_batch_async(
     HetGPUState *state, const HetGPUDevicePtr *dsts,
     const void *const *srcs, const size_t *sizes, size_t count,
-    HetGPUStream stream, size_t *submitted_out);
+    HetGPUStream stream, size_t *submitted_out, size_t *failed_out);
 
 /**
  * hetgpu_memcpy_dtoh - Copy memory from device to host

@@ -57,6 +57,19 @@ typedef int (*cuMemFree_fn)(uint64_t);
 typedef int (*cuMemcpyHtoD_fn)(uint64_t, const void *, size_t);
 typedef int (*cuMemcpyDtoH_fn)(void *, uint64_t, size_t);
 typedef int (*cuMemcpyHtoDAsync_fn)(uint64_t, const void *, size_t, void *);
+typedef struct CudaMemLocation {
+    int type;
+    int id;
+} CudaMemLocation;
+typedef struct CudaMemcpyAttributes {
+    int src_access_order;
+    CudaMemLocation src_location_hint;
+    CudaMemLocation dst_location_hint;
+    unsigned int flags;
+} CudaMemcpyAttributes;
+typedef int (*cuMemcpyBatchAsync_fn)(
+    uint64_t *, uint64_t *, size_t *, size_t, CudaMemcpyAttributes *,
+    size_t *, size_t, size_t *, void *);
 typedef int (*cuMemHostAlloc_fn)(void **, size_t, unsigned int);
 typedef int (*cuMemFreeHost_fn)(void *);
 typedef int (*cuMemHostRegister_fn)(void *, size_t, unsigned int);
@@ -155,6 +168,7 @@ typedef int (*cuGetErrorName_fn)(int, const char **);
 
 #define CUDA_SUCCESS 0
 #define CUDA_ERROR_INVALID_VALUE 1
+#define CUDA_ERROR_OUT_OF_MEMORY 2
 #define CUDA_ERROR_NOT_INITIALIZED 3
 #define CUDA_ERROR_INVALID_CONTEXT 201
 #define CUDA_ERROR_INVALID_HANDLE 400
@@ -293,6 +307,7 @@ static struct {
     cuMemcpyHtoD_fn cuMemcpyHtoD;
     cuMemcpyDtoH_fn cuMemcpyDtoH;
     cuMemcpyHtoDAsync_fn cuMemcpyHtoDAsync;
+    cuMemcpyBatchAsync_fn cuMemcpyBatchAsync;
     cuMemHostAlloc_fn cuMemHostAlloc;
     cuMemFreeHost_fn cuMemFreeHost;
     cuMemHostRegister_fn cuMemHostRegister;
@@ -468,6 +483,8 @@ static HetGPUError hetgpu_init_internal(HetGPUState *state,
             g_cuda_funcs.cuMemcpyDtoH = dlsym(g_cuda_lib_handle, "cuMemcpyDtoH_v2");
             g_cuda_funcs.cuMemcpyHtoDAsync =
                 dlsym(g_cuda_lib_handle, "cuMemcpyHtoDAsync_v2");
+            g_cuda_funcs.cuMemcpyBatchAsync =
+                dlsym(g_cuda_lib_handle, "cuMemcpyBatchAsync");
             g_cuda_funcs.cuMemHostAlloc =
                 dlsym(g_cuda_lib_handle, "cuMemHostAlloc");
             g_cuda_funcs.cuMemFreeHost =
@@ -1598,34 +1615,54 @@ int hetgpu_cuda_memcpy_htod_async(HetGPUState *state, HetGPUDevicePtr dst,
 int hetgpu_cuda_memcpy_htod_batch_async(
     HetGPUState *state, const HetGPUDevicePtr *dsts,
     const void *const *srcs, const size_t *sizes, size_t count,
-    HetGPUStream stream, size_t *submitted_out)
+    HetGPUStream stream, size_t *submitted_out, size_t *failed_out)
 {
-    int result = CUDA_SUCCESS;
+    CudaMemcpyAttributes attributes = {
+        .src_access_order = 1,
+    };
+    size_t attributes_index = 0;
+    HetGPUDevicePtr *source_ptrs = NULL;
+    size_t driver_fail_index = SIZE_MAX;
+    int result;
 
     if (submitted_out) {
         *submitted_out = 0;
     }
+    if (failed_out) {
+        *failed_out = SIZE_MAX;
+    }
     if (!state || !state->initialized || !dsts || !srcs || !sizes ||
-        !count || !submitted_out || !g_cuda_funcs.cuMemcpyHtoDAsync) {
+        !count || !stream || !submitted_out || !failed_out ||
+        !g_cuda_funcs.cuMemcpyBatchAsync) {
         return CUDA_ERROR_INVALID_VALUE;
+    }
+    source_ptrs = g_try_new(HetGPUDevicePtr, count);
+    if (!source_ptrs) {
+        return CUDA_ERROR_OUT_OF_MEMORY;
     }
     for (size_t i = 0; i < count; i++) {
         if (!srcs[i] || !sizes[i]) {
+            *failed_out = i;
+            g_free(source_ptrs);
             return CUDA_ERROR_INVALID_VALUE;
         }
+        source_ptrs[i] = (uintptr_t)srcs[i];
     }
     if (!cuda_lock(state)) {
+        g_free(source_ptrs);
         return CUDA_ERROR_INVALID_CONTEXT;
     }
-    for (size_t i = 0; i < count; i++) {
-        result = HETGPU_CUDA_CALL(cuMemcpyHtoDAsync, dsts[i], srcs[i],
-                                 sizes[i], stream);
-        if (result != CUDA_SUCCESS) {
-            break;
-        }
-        *submitted_out = i + 1;
-    }
+    result = HETGPU_CUDA_CALL(
+        cuMemcpyBatchAsync, (HetGPUDevicePtr *)dsts, source_ptrs,
+        (size_t *)sizes, count, &attributes, &attributes_index, 1,
+        &driver_fail_index, stream);
     cuda_unlock(state);
+    g_free(source_ptrs);
+    if (result == CUDA_SUCCESS) {
+        *submitted_out = count;
+    } else {
+        *failed_out = driver_fail_index;
+    }
     return result;
 }
 

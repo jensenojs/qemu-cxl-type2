@@ -108,6 +108,9 @@ bool cxl_gpu_direct_copy_span_follows(
     uint64_t destination, uint64_t length, uintptr_t next_source,
     uintptr_t next_registration, uintptr_t next_host,
     uint64_t next_destination, uint64_t next_length);
+bool cxl_gpu_direct_destinations_are_independent(
+    const uint64_t *destinations, const size_t *sizes, size_t count,
+    size_t *conflict_index);
 uint64_t cxl_gpu_direct_registration_length(
     uint64_t mapping_offset, uint64_t mapping_length,
     uint64_t request_offset, uint64_t request_length,
