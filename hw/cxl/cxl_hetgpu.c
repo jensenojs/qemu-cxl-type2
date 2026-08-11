@@ -1595,6 +1595,40 @@ int hetgpu_cuda_memcpy_htod_async(HetGPUState *state, HetGPUDevicePtr dst,
     return result;
 }
 
+int hetgpu_cuda_memcpy_htod_batch_async(
+    HetGPUState *state, const HetGPUDevicePtr *dsts,
+    const void *const *srcs, const size_t *sizes, size_t count,
+    HetGPUStream stream, size_t *submitted_out)
+{
+    int result = CUDA_SUCCESS;
+
+    if (submitted_out) {
+        *submitted_out = 0;
+    }
+    if (!state || !state->initialized || !dsts || !srcs || !sizes ||
+        !count || !submitted_out || !g_cuda_funcs.cuMemcpyHtoDAsync) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (!srcs[i] || !sizes[i]) {
+            return CUDA_ERROR_INVALID_VALUE;
+        }
+    }
+    if (!cuda_lock(state)) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    for (size_t i = 0; i < count; i++) {
+        result = HETGPU_CUDA_CALL(cuMemcpyHtoDAsync, dsts[i], srcs[i],
+                                 sizes[i], stream);
+        if (result != CUDA_SUCCESS) {
+            break;
+        }
+        *submitted_out = i + 1;
+    }
+    cuda_unlock(state);
+    return result;
+}
+
 HetGPUError hetgpu_memcpy_dtoh(HetGPUState *state, void *dst,
                                HetGPUDevicePtr src, size_t size)
 {

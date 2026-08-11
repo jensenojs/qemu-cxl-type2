@@ -4944,20 +4944,15 @@ out:
     return result;
 }
 
-static int cxl_type2_enqueue_htod_direct(CXLType2State *ct2d,
+static void cxl_type2_record_htod_direct(CXLType2State *ct2d,
                                          uint64_t dev_ptr,
                                          const void *source_host, size_t size,
                                          void *stream,
-                                         CXLType2DirectSource *source)
+                                         CXLType2DirectSource *source,
+                                         int64_t enqueue_start_ns)
 {
     CXLType2PendingHtoD *pending;
-    int64_t enqueue_start_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
-    int result = hetgpu_cuda_memcpy_htod_async(
-        &ct2d->gpu_info.hetgpu_state, dev_ptr, source_host, size, stream);
 
-    if (result != CXL_GPU_SUCCESS) {
-        return result;
-    }
     pending = g_new0(CXLType2PendingHtoD, 1);
     pending->stream = stream;
     pending->dev_ptr = dev_ptr;
@@ -4987,19 +4982,6 @@ static int cxl_type2_enqueue_htod_direct(CXLType2State *ct2d,
                                          ct2d->htod_pending_copies);
     ct2d->htod_peak_pending_bytes = MAX(ct2d->htod_peak_pending_bytes,
                                         ct2d->htod_pending_bytes);
-    return CXL_GPU_SUCCESS;
-}
-
-static int cxl_type2_direct_span_submit(
-    CXLType2State *ct2d, uint64_t destination, const void *host,
-    uint64_t length, void *stream, CXLType2DirectSource *source,
-    CXLType2DirectRegistration *registration)
-{
-    if (!registration->cuda_registered || registration->revoke_pending) {
-        return CXL_GPU_ERROR_INVALID_VALUE;
-    }
-    return cxl_type2_enqueue_htod_direct(
-        ct2d, destination, host, length, stream, source);
 }
 
 static bool cxl_type2_direct_range_is_valid(
@@ -5093,8 +5075,22 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
         CXLGPUDirectRangeV1 wire;
         CXLType2DirectSource *source;
     } CXLType2DirectResolvedRange;
+    typedef struct CXLType2DirectSpan {
+        HetGPUDevicePtr destination;
+        const void *host;
+        size_t length;
+        CXLType2DirectSource *source;
+        CXLType2DirectRegistration *registration;
+        uint64_t logical_index;
+        int64_t enqueue_start_ns;
+    } CXLType2DirectSpan;
 
     CXLType2DirectResolvedRange *resolved = NULL;
+    GArray *spans = NULL;
+    HetGPUDevicePtr *destinations = NULL;
+    const void **hosts = NULL;
+    size_t *sizes = NULL;
+    size_t submitted = 0;
     int result = CXL_GPU_SUCCESS;
 
     *logical_enqueued = 0;
@@ -5110,6 +5106,7 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
         result = CXL_GPU_ERROR_OUT_OF_MEMORY;
         goto out;
     }
+    spans = g_array_new(false, false, sizeof(CXLType2DirectSpan));
     /* Resolve every source and range before the first Driver enqueue. */
     for (uint64_t i = 0; i < range_count; i++) {
         memcpy(&resolved[i].wire,
@@ -5172,14 +5169,15 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
                                    span_length, (uintptr_t)source,
                                    (uintptr_t)physical->registration,
                                    (uintptr_t)host, destination, chunk)) {
-                result = cxl_type2_direct_span_submit(
-                    ct2d, span_destination, span_host, span_length, stream,
-                    source, span_registration);
-                if (result != CXL_GPU_SUCCESS) {
-                    *fail_index = i;
-                    goto out;
-                }
-                (*fragments_enqueued)++;
+                CXLType2DirectSpan span = {
+                    .destination = span_destination,
+                    .host = span_host,
+                    .length = span_length,
+                    .source = source,
+                    .registration = span_registration,
+                    .logical_index = i,
+                };
+                g_array_append_val(spans, span);
                 span_length = 0;
             }
             if (!span_length) {
@@ -5193,19 +5191,68 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
             skip = 0;
         }
         if (span_length) {
-            result = cxl_type2_direct_span_submit(
-                ct2d, span_destination, span_host, span_length, stream,
-                source, span_registration);
-            if (result != CXL_GPU_SUCCESS) {
-                *fail_index = i;
-                goto out;
-            }
-            (*fragments_enqueued)++;
+            CXLType2DirectSpan span = {
+                .destination = span_destination,
+                .host = span_host,
+                .length = span_length,
+                .source = source,
+                .registration = span_registration,
+                .logical_index = i,
+            };
+            g_array_append_val(spans, span);
         }
-        (*logical_enqueued)++;
     }
+
+    destinations = g_try_new(HetGPUDevicePtr, spans->len);
+    hosts = g_try_new(const void *, spans->len);
+    sizes = g_try_new(size_t, spans->len);
+    if (!destinations || !hosts || !sizes) {
+        result = CXL_GPU_ERROR_OUT_OF_MEMORY;
+        goto out;
+    }
+    for (size_t i = 0; i < spans->len; i++) {
+        CXLType2DirectSpan *span = &g_array_index(
+            spans, CXLType2DirectSpan, i);
+
+        if (!span->registration->cuda_registered ||
+            span->registration->revoke_pending) {
+            *fail_index = span->logical_index;
+            result = CXL_GPU_ERROR_INVALID_VALUE;
+            goto out;
+        }
+        destinations[i] = span->destination;
+        hosts[i] = span->host;
+        sizes[i] = span->length;
+        span->enqueue_start_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+    }
+    result = hetgpu_cuda_memcpy_htod_batch_async(
+        &ct2d->gpu_info.hetgpu_state, destinations, hosts, sizes, spans->len,
+        stream, &submitted);
+    for (size_t i = 0; i < submitted; i++) {
+        CXLType2DirectSpan *span = &g_array_index(
+            spans, CXLType2DirectSpan, i);
+
+        cxl_type2_record_htod_direct(
+            ct2d, span->destination, span->host, span->length, stream,
+            span->source, span->enqueue_start_ns);
+        (*fragments_enqueued)++;
+    }
+    if (result != CXL_GPU_SUCCESS) {
+        g_assert(submitted < spans->len);
+        *fail_index = g_array_index(
+            spans, CXLType2DirectSpan, submitted).logical_index;
+        *logical_enqueued = *fail_index;
+        goto out;
+    }
+    *logical_enqueued = range_count;
     *fail_index = SIZE_MAX;
 out:
+    g_free(sizes);
+    g_free(hosts);
+    g_free(destinations);
+    if (spans) {
+        g_array_free(spans, true);
+    }
     g_free(resolved);
     return result;
 }
