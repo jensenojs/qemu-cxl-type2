@@ -514,6 +514,10 @@ typedef struct CXLType2State {
         uint64_t active_direct_logical_ranges;
         uint64_t active_direct_fragments;
         uint64_t active_direct_bytes;
+        uint64_t active_direct_pending_copies;
+        uint64_t active_direct_pending_bytes;
+        uint64_t active_direct_peak_pending_copies;
+        uint64_t active_direct_peak_pending_bytes;
         uint64_t active_payload_batches;
         uint64_t active_payload_source_bytes;
         uint64_t active_htod_pool_hits;

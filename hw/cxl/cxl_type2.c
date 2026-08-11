@@ -3038,6 +3038,10 @@ static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
     ct2d->paired_case.active_direct_logical_ranges = 0;
     ct2d->paired_case.active_direct_fragments = 0;
     ct2d->paired_case.active_direct_bytes = 0;
+    ct2d->paired_case.active_direct_pending_copies = 0;
+    ct2d->paired_case.active_direct_pending_bytes = 0;
+    ct2d->paired_case.active_direct_peak_pending_copies = 0;
+    ct2d->paired_case.active_direct_peak_pending_bytes = 0;
     ct2d->paired_case.active_payload_batches = 0;
     ct2d->paired_case.active_payload_source_bytes = 0;
     ct2d->paired_case.active_htod_pool_hits = 0;
@@ -3493,7 +3497,7 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             live_registration_groups++;
         }
         qemu_log(
-            "KIMI_DIRECT_SOURCE_SUMMARY schema=direct-source-summary-v9"
+            "KIMI_DIRECT_SOURCE_SUMMARY schema=direct-source-summary-v10"
             " run_binding=%" PRIu64 " case=%s case_epoch=%" PRIu64
             " policy_enabled=%u register_calls=%" PRIu64
             " register_busy_ns=%" PRIu64
@@ -3559,6 +3563,10 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             " peak_retained_physicals=%" PRIu64
             " logical_ranges=%" PRIu64
             " driver_fragments=%" PRIu64 " direct_bytes=%" PRIu64
+            " direct_pending_copies=%" PRIu64
+            " direct_pending_bytes=%" PRIu64
+            " direct_peak_pending_copies=%" PRIu64
+            " direct_peak_pending_bytes=%" PRIu64
             " payload_batches=%" PRIu64 " payload_source_bytes=%" PRIu64
             " live_sources=%" PRIu64 " live_physicals=%" PRIu64
             " live_registration_groups=%" PRIu64
@@ -3637,6 +3645,10 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             ct2d->paired_case.active_direct_logical_ranges,
             ct2d->paired_case.active_direct_fragments,
             ct2d->paired_case.active_direct_bytes,
+            ct2d->paired_case.active_direct_pending_copies,
+            ct2d->paired_case.active_direct_pending_bytes,
+            ct2d->paired_case.active_direct_peak_pending_copies,
+            ct2d->paired_case.active_direct_peak_pending_bytes,
             ct2d->paired_case.active_payload_batches,
             ct2d->paired_case.active_payload_source_bytes, live_sources,
             live_physicals, live_registration_groups, source_pending_refs,
@@ -4963,6 +4975,14 @@ static int cxl_type2_enqueue_htod_direct(CXLType2State *ct2d,
     ct2d->htod_pending_bytes += size;
     ct2d->paired_case.active_direct_fragments++;
     ct2d->paired_case.active_direct_bytes += size;
+    ct2d->paired_case.active_direct_pending_copies++;
+    ct2d->paired_case.active_direct_pending_bytes += size;
+    ct2d->paired_case.active_direct_peak_pending_copies = MAX(
+        ct2d->paired_case.active_direct_peak_pending_copies,
+        ct2d->paired_case.active_direct_pending_copies);
+    ct2d->paired_case.active_direct_peak_pending_bytes = MAX(
+        ct2d->paired_case.active_direct_peak_pending_bytes,
+        ct2d->paired_case.active_direct_pending_bytes);
     ct2d->htod_peak_pending_copies = MAX(ct2d->htod_peak_pending_copies,
                                          ct2d->htod_pending_copies);
     ct2d->htod_peak_pending_bytes = MAX(ct2d->htod_peak_pending_bytes,
@@ -5407,7 +5427,12 @@ static int cxl_type2_release_pending_htod(CXLType2State *ct2d,
             CXLType2DirectSource *source = pending->source;
 
             g_assert(pending->source && pending->source->pending_refcount > 0);
+            g_assert(ct2d->paired_case.active_direct_pending_copies > 0);
+            g_assert(ct2d->paired_case.active_direct_pending_bytes >=
+                     pending->size);
             source->pending_refcount--;
+            ct2d->paired_case.active_direct_pending_copies--;
+            ct2d->paired_case.active_direct_pending_bytes -= pending->size;
             result = CXL_GPU_SUCCESS;
             if (!source->pending_refcount && source->auto_unregister) {
                 result = cxl_type2_direct_source_unregister(
