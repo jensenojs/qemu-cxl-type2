@@ -172,6 +172,8 @@ typedef int (*cuGetErrorName_fn)(int, const char **);
 #define CUDA_ERROR_NOT_INITIALIZED 3
 #define CUDA_ERROR_INVALID_CONTEXT 201
 #define CUDA_ERROR_INVALID_HANDLE 400
+#define CUDA_MEMCPY_SRC_ACCESS_ORDER_ANY 3
+#define CUDA_MEMCPY_FLAG_PREFER_OVERLAP_WITH_COMPUTE 1
 #define CUDA_ERROR_NOT_SUPPORTED 801
 #define CUDA_MEMHOSTREGISTER_PORTABLE 0x01U
 #define CUDA_MEMHOSTREGISTER_DEVICEMAP 0x02U
@@ -1618,7 +1620,8 @@ int hetgpu_cuda_memcpy_htod_batch_async(
     HetGPUStream stream, size_t *submitted_out, size_t *failed_out)
 {
     CudaMemcpyAttributes attributes = {
-        .src_access_order = 1,
+        .src_access_order = CUDA_MEMCPY_SRC_ACCESS_ORDER_ANY,
+        .flags = CUDA_MEMCPY_FLAG_PREFER_OVERLAP_WITH_COMPUTE,
     };
     size_t attributes_index = 0;
     HetGPUDevicePtr *source_ptrs = NULL;
