@@ -2,6 +2,7 @@
 #define HW_CXL_TYPE2_CUDA_CONTRACT_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "hw/cxl/cxl_type2_gpu_cmd.h"
@@ -116,5 +117,101 @@ uint64_t cxl_gpu_direct_registration_length(
     uint64_t request_offset, uint64_t request_length,
     uint64_t following_offset, uint64_t tile_size,
     uint64_t padding_budget);
+
+typedef struct CXLType2CudaAllocation {
+    uint64_t base;
+    uint64_t size;
+    uint64_t epoch;
+} CXLType2CudaAllocation;
+
+typedef struct CXLType2CudaAllocationTable {
+    CXLType2CudaAllocation *entries;
+    size_t count;
+    size_t capacity;
+    size_t peak_count;
+    uint64_t next_epoch;
+    bool available;
+} CXLType2CudaAllocationTable;
+
+typedef enum CXLType2CudaCoverageKind {
+    CXL_TYPE2_CUDA_COVERAGE_WHOLE,
+    CXL_TYPE2_CUDA_COVERAGE_PARTIAL,
+    CXL_TYPE2_CUDA_COVERAGE_CROSS,
+    CXL_TYPE2_CUDA_COVERAGE_UNKNOWN,
+} CXLType2CudaCoverageKind;
+
+typedef enum CXLType2CudaClassifierStatus {
+    CXL_TYPE2_CUDA_CLASSIFIER_AVAILABLE,
+    CXL_TYPE2_CUDA_CLASSIFIER_CONTRADICTED,
+    CXL_TYPE2_CUDA_CLASSIFIER_UNAVAILABLE,
+} CXLType2CudaClassifierStatus;
+
+typedef enum CXLType2CudaRejectionReason {
+    CXL_TYPE2_CUDA_REJECTION_NONE,
+    CXL_TYPE2_CUDA_REJECTION_ALLOCATION_MISSING,
+    CXL_TYPE2_CUDA_REJECTION_PARTIAL_COVERAGE,
+    CXL_TYPE2_CUDA_REJECTION_CROSS_ALLOCATION,
+    CXL_TYPE2_CUDA_REJECTION_DESTINATION_OVERLAP,
+    CXL_TYPE2_CUDA_REJECTION_DESTINATION_OVERFLOW,
+    CXL_TYPE2_CUDA_REJECTION_GRAPH_NON_KERNEL,
+    CXL_TYPE2_CUDA_REJECTION_GRAPH_INCOMPLETE,
+    CXL_TYPE2_CUDA_REJECTION_OPCODE_UNKNOWN,
+} CXLType2CudaRejectionReason;
+
+typedef enum CXLType2CudaCommandRole {
+    CXL_TYPE2_CUDA_COMMAND_READER = 1U << 0,
+    CXL_TYPE2_CUDA_COMMAND_WRITER = 1U << 1,
+    CXL_TYPE2_CUDA_COMMAND_READER_WRITER =
+        CXL_TYPE2_CUDA_COMMAND_READER | CXL_TYPE2_CUDA_COMMAND_WRITER,
+    CXL_TYPE2_CUDA_COMMAND_LIFECYCLE = 1U << 2,
+    CXL_TYPE2_CUDA_COMMAND_NO_CHANGE = 1U << 3,
+    CXL_TYPE2_CUDA_COMMAND_UNKNOWN = 1U << 4,
+} CXLType2CudaCommandRole;
+
+typedef struct CXLType2CudaCoverageResult {
+    CXLType2CudaCoverageKind kind;
+    CXLType2CudaRejectionReason reason;
+    uint64_t bytes;
+    bool available;
+} CXLType2CudaCoverageResult;
+
+#define CXL_TYPE2_CUDA_OPCODE_RECORDS_CAPACITY (256 * 64)
+
+typedef struct CXLType2CudaOpcodeSummary {
+    uint64_t reader_commands;
+    uint64_t writer_commands;
+    uint64_t lifecycle_commands;
+    uint64_t no_change_commands;
+    uint64_t unknown_commands;
+    uint64_t estimated_materialize_bytes;
+    bool estimated_materialize_complete;
+    uint32_t first_incomplete_command;
+    bool first_incomplete_command_valid;
+} CXLType2CudaOpcodeSummary;
+
+void cxl_type2_cuda_allocation_table_init(
+    CXLType2CudaAllocationTable *table);
+void cxl_type2_cuda_allocation_table_reset(
+    CXLType2CudaAllocationTable *table);
+void cxl_type2_cuda_allocation_table_destroy(
+    CXLType2CudaAllocationTable *table);
+bool cxl_type2_cuda_allocation_record(CXLType2CudaAllocationTable *table,
+                                      uint64_t base, uint64_t size,
+                                      uint64_t *epoch);
+bool cxl_type2_cuda_allocation_forget(CXLType2CudaAllocationTable *table,
+                                      uint64_t base);
+void cxl_type2_cuda_destination_union_classify(
+    const CXLType2CudaAllocationTable *table,
+    const uint64_t *destinations, const size_t *sizes, size_t count,
+    CXLType2CudaCoverageResult *result);
+CXLType2CudaCommandRole cxl_type2_cuda_command_role(uint32_t command);
+const char *cxl_type2_cuda_command_role_name(CXLType2CudaCommandRole role);
+bool cxl_type2_cuda_opcode_summary_build(
+    const uint64_t command_counts[256], char *records,
+    size_t records_capacity, CXLType2CudaOpcodeSummary *summary);
+const char *cxl_type2_cuda_classifier_status_name(
+    CXLType2CudaClassifierStatus status);
+const char *cxl_type2_cuda_rejection_reason_name(
+    CXLType2CudaRejectionReason reason);
 
 #endif

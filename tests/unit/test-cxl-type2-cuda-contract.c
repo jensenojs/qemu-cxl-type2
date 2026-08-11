@@ -589,6 +589,208 @@ static void test_direct_batch_destinations_are_independent(void)
     g_assert_cmpuint(conflict, ==, 0);
 }
 
+static void assert_cuda_coverage(
+    const CXLType2CudaAllocationTable *table,
+    const uint64_t *destinations, const size_t *sizes, size_t count,
+    CXLType2CudaCoverageKind kind, CXLType2CudaRejectionReason reason,
+    uint64_t bytes)
+{
+    CXLType2CudaCoverageResult result;
+
+    cxl_type2_cuda_destination_union_classify(
+        table, destinations, sizes, count, &result);
+    g_assert_true(result.available);
+    g_assert_cmpint(result.kind, ==, kind);
+    g_assert_cmpint(result.reason, ==, reason);
+    g_assert_cmpuint(result.bytes, ==, bytes);
+}
+
+static void test_cuda_allocation_lifecycle_and_epoch(void)
+{
+    CXLType2CudaAllocationTable table;
+    uint64_t first_epoch = 0;
+    uint64_t second_epoch = 0;
+    uint64_t reused_epoch = 0;
+
+    cxl_type2_cuda_allocation_table_init(&table);
+    g_assert_true(cxl_type2_cuda_allocation_record(
+        &table, 0x3000, 0x1000, &first_epoch));
+    g_assert_true(cxl_type2_cuda_allocation_record(
+        &table, 0x1000, 0x1000, &second_epoch));
+    g_assert_cmpuint(first_epoch, ==, 1);
+    g_assert_cmpuint(second_epoch, ==, 2);
+    g_assert_cmpuint(table.count, ==, 2);
+    g_assert_cmpuint(table.peak_count, ==, 2);
+    g_assert_cmphex(table.entries[0].base, ==, 0x1000);
+    g_assert_cmphex(table.entries[1].base, ==, 0x3000);
+
+    g_assert_true(cxl_type2_cuda_allocation_forget(&table, 0x1000));
+    g_assert_true(cxl_type2_cuda_allocation_record(
+        &table, 0x1000, 0x1000, &reused_epoch));
+    g_assert_cmpuint(reused_epoch, >, second_epoch);
+    g_assert_cmpuint(table.count, ==, 2);
+    g_assert_cmpuint(table.peak_count, ==, 2);
+    g_assert_cmpuint(table.next_epoch, ==, reused_epoch + 1);
+    cxl_type2_cuda_allocation_table_destroy(&table);
+}
+
+static void test_cuda_allocation_rejects_invalid_state(void)
+{
+    CXLType2CudaAllocationTable table;
+
+    cxl_type2_cuda_allocation_table_init(&table);
+    g_assert_true(cxl_type2_cuda_allocation_record(
+        &table, 0x1000, 0x1000, NULL));
+    g_assert_false(cxl_type2_cuda_allocation_record(
+        &table, 0x1800, 0x1000, NULL));
+    g_assert_false(table.available);
+
+    cxl_type2_cuda_allocation_table_reset(&table);
+    g_assert_true(cxl_type2_cuda_allocation_record(
+        &table, 0x1000, 0x1000, NULL));
+    g_assert_false(cxl_type2_cuda_allocation_forget(&table, 0x1800));
+    g_assert_false(table.available);
+
+    cxl_type2_cuda_allocation_table_reset(&table);
+    g_assert_false(cxl_type2_cuda_allocation_record(
+        &table, UINT64_MAX - 7, 8, NULL));
+    g_assert_false(table.available);
+    cxl_type2_cuda_allocation_table_destroy(&table);
+}
+
+static void test_cuda_destination_union_coverage(void)
+{
+    CXLType2CudaAllocationTable table;
+    const uint64_t whole_destinations[] = { 0x1800, 0x1000 };
+    const size_t whole_sizes[] = { 0x800, 0x800 };
+    const uint64_t partial_destinations[] = { 0x1000 };
+    const size_t partial_sizes[] = { 0x800 };
+    const uint64_t gap_destinations[] = { 0x1000, 0x1800 };
+    const size_t gap_sizes[] = { 0x400, 0x800 };
+    const uint64_t overlap_destinations[] = { 0x1000, 0x1800 };
+    const size_t overlap_sizes[] = { 0x1000, 0x800 };
+    const uint64_t cross_destinations[] = { 0x3800 };
+    const size_t cross_sizes[] = { 0x1000 };
+    const uint64_t separate_allocations[] = { 0x1000, 0x3000 };
+    const size_t separate_allocation_sizes[] = { 0x1000, 0x1000 };
+    const uint64_t overflow_destinations[] = { UINT64_MAX - 7 };
+    const size_t overflow_sizes[] = { 8 };
+    const uint64_t missing_destinations[] = { 0x6000 };
+    const size_t missing_sizes[] = { 0x100 };
+
+    cxl_type2_cuda_allocation_table_init(&table);
+    g_assert_true(cxl_type2_cuda_allocation_record(
+        &table, 0x1000, 0x1000, NULL));
+    g_assert_true(cxl_type2_cuda_allocation_record(
+        &table, 0x3000, 0x1000, NULL));
+    g_assert_true(cxl_type2_cuda_allocation_record(
+        &table, 0x4000, 0x1000, NULL));
+
+    assert_cuda_coverage(
+        &table, whole_destinations, whole_sizes,
+        G_N_ELEMENTS(whole_destinations), CXL_TYPE2_CUDA_COVERAGE_WHOLE,
+        CXL_TYPE2_CUDA_REJECTION_NONE, 0x1000);
+    assert_cuda_coverage(
+        &table, partial_destinations, partial_sizes,
+        G_N_ELEMENTS(partial_destinations), CXL_TYPE2_CUDA_COVERAGE_PARTIAL,
+        CXL_TYPE2_CUDA_REJECTION_PARTIAL_COVERAGE, 0x800);
+    assert_cuda_coverage(
+        &table, gap_destinations, gap_sizes,
+        G_N_ELEMENTS(gap_destinations), CXL_TYPE2_CUDA_COVERAGE_PARTIAL,
+        CXL_TYPE2_CUDA_REJECTION_PARTIAL_COVERAGE, 0xc00);
+    assert_cuda_coverage(
+        &table, overlap_destinations, overlap_sizes,
+        G_N_ELEMENTS(overlap_destinations), CXL_TYPE2_CUDA_COVERAGE_UNKNOWN,
+        CXL_TYPE2_CUDA_REJECTION_DESTINATION_OVERLAP, 0x1800);
+    assert_cuda_coverage(
+        &table, cross_destinations, cross_sizes,
+        G_N_ELEMENTS(cross_destinations), CXL_TYPE2_CUDA_COVERAGE_CROSS,
+        CXL_TYPE2_CUDA_REJECTION_CROSS_ALLOCATION, 0x1000);
+    assert_cuda_coverage(
+        &table, separate_allocations, separate_allocation_sizes,
+        G_N_ELEMENTS(separate_allocations), CXL_TYPE2_CUDA_COVERAGE_CROSS,
+        CXL_TYPE2_CUDA_REJECTION_CROSS_ALLOCATION, 0x2000);
+    assert_cuda_coverage(
+        &table, overflow_destinations, overflow_sizes,
+        G_N_ELEMENTS(overflow_destinations), CXL_TYPE2_CUDA_COVERAGE_UNKNOWN,
+        CXL_TYPE2_CUDA_REJECTION_DESTINATION_OVERFLOW, 0);
+    assert_cuda_coverage(
+        &table, missing_destinations, missing_sizes,
+        G_N_ELEMENTS(missing_destinations), CXL_TYPE2_CUDA_COVERAGE_UNKNOWN,
+        CXL_TYPE2_CUDA_REJECTION_ALLOCATION_MISSING, 0x100);
+    cxl_type2_cuda_allocation_table_destroy(&table);
+}
+
+static void test_cuda_command_roles_use_generated_authority(void)
+{
+    CXLType2CudaCommandRole role = cxl_type2_cuda_command_role(
+        CXL_GPU_CMD_MEM_COPY_2D_DTOD);
+
+    g_assert_true(role & CXL_TYPE2_CUDA_COMMAND_READER);
+    g_assert_true(role & CXL_TYPE2_CUDA_COMMAND_WRITER);
+    g_assert_cmpstr(cxl_type2_cuda_command_role_name(role), ==,
+                    "reader+writer");
+    g_assert_cmpint(cxl_type2_cuda_command_role(CXL_GPU_CMD_MEM_ALLOC), ==,
+                    CXL_TYPE2_CUDA_COMMAND_LIFECYCLE);
+    g_assert_cmpstr(cxl_type2_cuda_command_role_name(
+                        cxl_type2_cuda_command_role(0xff)),
+                    ==, "unknown");
+}
+
+static void test_cuda_opcode_summary_wire_and_conservation(void)
+{
+    uint64_t command_counts[256] = { 0 };
+    char records[CXL_TYPE2_CUDA_OPCODE_RECORDS_CAPACITY];
+    CXLType2CudaOpcodeSummary summary;
+
+    command_counts[CXL_GPU_CMD_MEM_ALLOC] = 2;
+    command_counts[CXL_GPU_CMD_MEM_COPY_DTOH] = 4;
+    command_counts[CXL_GPU_CMD_MEM_COPY_DTOD] = 3;
+    command_counts[CXL_GPU_CMD_LAUNCH_KERNEL] = 1;
+    command_counts[CXL_GPU_CMD_STREAM_SYNC] = 5;
+    g_assert_true(cxl_type2_cuda_opcode_summary_build(
+        command_counts, records, sizeof(records), &summary));
+    g_assert_cmpstr(
+        records, ==,
+        "0x20:lifecycle:2:0:incomplete;"
+        "0x23:reader:4:0:incomplete;"
+        "0x24:reader+writer:3:0:incomplete;"
+        "0x40:unknown:1:0:incomplete;"
+        "0x52:lifecycle:5:0:incomplete");
+    g_assert_cmpuint(summary.reader_commands, ==, 7);
+    g_assert_cmpuint(summary.writer_commands, ==, 3);
+    g_assert_cmpuint(summary.lifecycle_commands, ==, 7);
+    g_assert_cmpuint(summary.no_change_commands, ==, 0);
+    g_assert_cmpuint(summary.unknown_commands, ==, 1);
+    g_assert_cmpuint(summary.estimated_materialize_bytes, ==, 0);
+    g_assert_false(summary.estimated_materialize_complete);
+    g_assert_cmphex(summary.first_incomplete_command, ==,
+                    CXL_GPU_CMD_MEM_ALLOC);
+}
+
+static void test_cuda_opcode_summary_empty_and_bounded(void)
+{
+    uint64_t command_counts[256] = { 0 };
+    char records[CXL_TYPE2_CUDA_OPCODE_RECORDS_CAPACITY];
+    CXLType2CudaOpcodeSummary summary;
+
+    g_assert_true(cxl_type2_cuda_opcode_summary_build(
+        command_counts, records, sizeof(records), &summary));
+    g_assert_cmpstr(records, ==, "none");
+    g_assert_true(summary.estimated_materialize_complete);
+    command_counts[CXL_GPU_CMD_MEM_ALLOC] = 1;
+    g_assert_false(cxl_type2_cuda_opcode_summary_build(
+        command_counts, records, sizeof("none"), &summary));
+    g_assert_cmpstr(records, ==, "none");
+
+    memset(command_counts, 0, sizeof(command_counts));
+    command_counts[CXL_GPU_CMD_MEM_COPY_DTOH] = UINT64_MAX;
+    command_counts[CXL_GPU_CMD_MEM_COPY_DTOD] = 1;
+    g_assert_false(cxl_type2_cuda_opcode_summary_build(
+        command_counts, records, sizeof(records), &summary));
+    g_assert_cmpuint(summary.reader_commands, ==, UINT64_MAX);
+}
+
 static void test_direct_registration_tile_bounds(void)
 {
     const uint64_t mib = 1024 * 1024;
@@ -865,6 +1067,18 @@ int main(int argc, char **argv)
                     test_direct_copy_span_adjacency);
     g_test_add_func("/cxl/type2/direct/batch-destination-independence",
                     test_direct_batch_destinations_are_independent);
+    g_test_add_func("/cxl/type2/direct/allocation-lifecycle-epoch",
+                    test_cuda_allocation_lifecycle_and_epoch);
+    g_test_add_func("/cxl/type2/direct/allocation-invalid-state",
+                    test_cuda_allocation_rejects_invalid_state);
+    g_test_add_func("/cxl/type2/direct/destination-union-coverage",
+                    test_cuda_destination_union_coverage);
+    g_test_add_func("/cxl/type2/direct/generated-command-roles",
+                    test_cuda_command_roles_use_generated_authority);
+    g_test_add_func("/cxl/type2/direct/opcode-summary-wire",
+                    test_cuda_opcode_summary_wire_and_conservation);
+    g_test_add_func("/cxl/type2/direct/opcode-summary-bounds",
+                    test_cuda_opcode_summary_empty_and_bounded);
     g_test_add_func("/cxl/type2/direct/registration-tile-bounds",
                     test_direct_registration_tile_bounds);
     g_test_add_func("/cxl/type2/direct/cross-case-epoch",

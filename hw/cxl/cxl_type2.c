@@ -832,6 +832,7 @@ int cxl_type2_hetgpu_init(CXLType2State *ct2d, Error **errp)
 
     ct2d->gpu_info.passthrough_enabled = true;
     ct2d->gpu_info.gpu_mem_size = hetgpu->props.total_memory;
+    cxl_type2_cuda_allocation_table_reset(&ct2d->cuda_allocations);
 
     qemu_log("CXL Type2: hetGPU initialized - Backend: %s, Device: %s\n",
              hetgpu_get_backend_name(hetgpu->backend),
@@ -2947,6 +2948,86 @@ static void cxl_type2_log_interval_summary(
              next_operation, ledger->first_error ? ledger->first_error : "none");
 }
 
+static void cxl_type2_cuda_classifier_reject(
+    CXLType2State *ct2d, CXLType2CudaClassifierStatus status,
+    CXLType2CudaRejectionReason reason, uint32_t command,
+    bool command_valid)
+{
+    if (ct2d->paired_case.classifier_status ==
+            CXL_TYPE2_CUDA_CLASSIFIER_AVAILABLE ||
+        status == CXL_TYPE2_CUDA_CLASSIFIER_CONTRADICTED) {
+        ct2d->paired_case.classifier_status = status;
+    }
+    if (ct2d->paired_case.first_rejection_reason ==
+        CXL_TYPE2_CUDA_REJECTION_NONE) {
+        ct2d->paired_case.first_rejection_reason = reason;
+        ct2d->paired_case.first_rejection_command = command;
+        ct2d->paired_case.first_rejection_command_valid = command_valid;
+    }
+}
+
+static bool cxl_type2_cuda_counter_can_add(uint64_t value, uint64_t addend)
+{
+    return value <= UINT64_MAX - addend;
+}
+
+static void cxl_type2_cuda_record_coverage(
+    CXLType2State *ct2d, const uint64_t *destinations,
+    const size_t *sizes, size_t count)
+{
+    CXLType2CudaCoverageResult result;
+    uint64_t *batches;
+    uint64_t *bytes;
+
+    cxl_type2_cuda_destination_union_classify(
+        &ct2d->cuda_allocations, destinations, sizes, count, &result);
+    switch (result.kind) {
+    case CXL_TYPE2_CUDA_COVERAGE_WHOLE:
+        batches = &ct2d->paired_case.allocation_whole_batches;
+        bytes = &ct2d->paired_case.allocation_whole_bytes;
+        break;
+    case CXL_TYPE2_CUDA_COVERAGE_PARTIAL:
+        batches = &ct2d->paired_case.allocation_partial_batches;
+        bytes = &ct2d->paired_case.allocation_partial_bytes;
+        break;
+    case CXL_TYPE2_CUDA_COVERAGE_CROSS:
+        batches = &ct2d->paired_case.allocation_cross_batches;
+        bytes = &ct2d->paired_case.allocation_cross_bytes;
+        break;
+    case CXL_TYPE2_CUDA_COVERAGE_UNKNOWN:
+        batches = &ct2d->paired_case.allocation_unknown_batches;
+        bytes = &ct2d->paired_case.allocation_unknown_bytes;
+        break;
+    default:
+        g_assert_not_reached();
+    }
+    if (!cxl_type2_cuda_counter_can_add(
+            ct2d->paired_case.allocation_classified_batches, 1) ||
+        !cxl_type2_cuda_counter_can_add(
+            ct2d->paired_case.allocation_classified_bytes, result.bytes) ||
+        !cxl_type2_cuda_counter_can_add(*batches, 1) ||
+        !cxl_type2_cuda_counter_can_add(*bytes, result.bytes)) {
+        cxl_type2_cuda_classifier_reject(
+            ct2d, CXL_TYPE2_CUDA_CLASSIFIER_CONTRADICTED,
+            CXL_TYPE2_CUDA_REJECTION_DESTINATION_OVERFLOW,
+            CXL_GPU_CMD_SOURCE_REGISTER_BATCH_HTOD_DIRECT_ASYNC, true);
+        return;
+    }
+    ct2d->paired_case.allocation_classified_batches++;
+    ct2d->paired_case.allocation_classified_bytes += result.bytes;
+    (*batches)++;
+    *bytes += result.bytes;
+    if (!result.available) {
+        cxl_type2_cuda_classifier_reject(
+            ct2d, CXL_TYPE2_CUDA_CLASSIFIER_UNAVAILABLE, result.reason,
+            CXL_GPU_CMD_SOURCE_REGISTER_BATCH_HTOD_DIRECT_ASYNC, true);
+    } else if (result.reason != CXL_TYPE2_CUDA_REJECTION_NONE) {
+        cxl_type2_cuda_classifier_reject(
+            ct2d, ct2d->paired_case.classifier_status, result.reason,
+            CXL_GPU_CMD_SOURCE_REGISTER_BATCH_HTOD_DIRECT_ASYNC, true);
+    }
+}
+
 static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
 {
     int64_t span_begin_ns = cxl_type2_host_monotonic_ns();
@@ -3044,6 +3125,26 @@ static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
     ct2d->paired_case.active_direct_peak_pending_bytes = 0;
     ct2d->paired_case.active_payload_batches = 0;
     ct2d->paired_case.active_payload_source_bytes = 0;
+    ct2d->paired_case.allocation_classified_batches = 0;
+    ct2d->paired_case.allocation_classified_bytes = 0;
+    ct2d->paired_case.allocation_whole_batches = 0;
+    ct2d->paired_case.allocation_whole_bytes = 0;
+    ct2d->paired_case.allocation_partial_batches = 0;
+    ct2d->paired_case.allocation_partial_bytes = 0;
+    ct2d->paired_case.allocation_cross_batches = 0;
+    ct2d->paired_case.allocation_cross_bytes = 0;
+    ct2d->paired_case.allocation_unknown_batches = 0;
+    ct2d->paired_case.allocation_unknown_bytes = 0;
+    ct2d->paired_case.graph_exec_observed = 0;
+    ct2d->paired_case.graph_all_kernel_flat = 0;
+    ct2d->paired_case.graph_child_or_non_kernel = 0;
+    ct2d->paired_case.graph_incomplete = 0;
+    ct2d->paired_case.classifier_status =
+        CXL_TYPE2_CUDA_CLASSIFIER_AVAILABLE;
+    ct2d->paired_case.first_rejection_reason =
+        CXL_TYPE2_CUDA_REJECTION_NONE;
+    ct2d->paired_case.first_rejection_command = 0;
+    ct2d->paired_case.first_rejection_command_valid = false;
     ct2d->paired_case.active_htod_pool_hits = 0;
     ct2d->paired_case.active_htod_pool_misses = 0;
     ct2d->paired_case.active_htod_driver_allocations = 0;
@@ -3483,6 +3584,40 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
         CXLType2DirectSource *source;
         CXLType2DirectPhysical *physical;
         CXLType2DirectRegistration *registration;
+        CXLType2CudaOpcodeSummary opcode_summary;
+        char opcode_records[CXL_TYPE2_CUDA_OPCODE_RECORDS_CAPACITY];
+        bool opcode_summary_valid;
+        CXLType2CudaClassifierStatus classifier_status =
+            ct2d->paired_case.classifier_status;
+        CXLType2CudaRejectionReason rejection_reason =
+            ct2d->paired_case.first_rejection_reason;
+        uint32_t rejection_command =
+            ct2d->paired_case.first_rejection_command;
+        bool rejection_command_valid =
+            ct2d->paired_case.first_rejection_command_valid;
+        char rejection_command_name[16] = "none";
+
+        opcode_summary_valid = cxl_type2_cuda_opcode_summary_build(
+            command_scope->command_calls, opcode_records,
+            sizeof(opcode_records), &opcode_summary);
+        if (!opcode_summary_valid) {
+            classifier_status = CXL_TYPE2_CUDA_CLASSIFIER_CONTRADICTED;
+        } else if (!opcode_summary.estimated_materialize_complete &&
+                   classifier_status !=
+                       CXL_TYPE2_CUDA_CLASSIFIER_CONTRADICTED) {
+            classifier_status = CXL_TYPE2_CUDA_CLASSIFIER_UNAVAILABLE;
+        }
+        if (rejection_reason == CXL_TYPE2_CUDA_REJECTION_NONE &&
+            !opcode_summary.estimated_materialize_complete) {
+            rejection_reason = CXL_TYPE2_CUDA_REJECTION_OPCODE_UNKNOWN;
+            rejection_command = opcode_summary.first_incomplete_command;
+            rejection_command_valid =
+                opcode_summary.first_incomplete_command_valid;
+        }
+        if (rejection_command_valid) {
+            snprintf(rejection_command_name, sizeof(rejection_command_name),
+                     "0x%02X", rejection_command);
+        }
 
         for (source = ct2d->direct_sources; source; source = source->next) {
             live_sources++;
@@ -3497,7 +3632,7 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             live_registration_groups++;
         }
         qemu_log(
-            "KIMI_DIRECT_SOURCE_SUMMARY schema=direct-source-summary-v10"
+            "KIMI_DIRECT_SOURCE_SUMMARY schema=direct-source-summary-v11"
             " run_binding=%" PRIu64 " case=%s case_epoch=%" PRIu64
             " policy_enabled=%u register_calls=%" PRIu64
             " register_busy_ns=%" PRIu64
@@ -3570,7 +3705,33 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             " payload_batches=%" PRIu64 " payload_source_bytes=%" PRIu64
             " live_sources=%" PRIu64 " live_physicals=%" PRIu64
             " live_registration_groups=%" PRIu64
-            " pending_source_refs=%" PRIu64 " poisoned=%u\n",
+            " pending_source_refs=%" PRIu64 " poisoned=%u"
+            " allocation_live_count=%zu allocation_peak_live_count=%zu"
+            " allocation_next_epoch=%" PRIu64
+            " allocation_classified_batches=%" PRIu64
+            " allocation_classified_bytes=%" PRIu64
+            " allocation_whole_batches=%" PRIu64
+            " allocation_whole_bytes=%" PRIu64
+            " allocation_partial_batches=%" PRIu64
+            " allocation_partial_bytes=%" PRIu64
+            " allocation_cross_batches=%" PRIu64
+            " allocation_cross_bytes=%" PRIu64
+            " allocation_unknown_batches=%" PRIu64
+            " allocation_unknown_bytes=%" PRIu64
+            " graph_exec_observed=%" PRIu64
+            " graph_all_kernel_flat=%" PRIu64
+            " graph_child_or_non_kernel=%" PRIu64
+            " graph_incomplete=%" PRIu64
+            " ordinary_reader_commands=%" PRIu64
+            " ordinary_writer_commands=%" PRIu64
+            " ordinary_lifecycle_commands=%" PRIu64
+            " ordinary_no_change_commands=%" PRIu64
+            " ordinary_unknown_commands=%" PRIu64
+            " ordinary_opcode_records=%s"
+            " estimated_materialize_bytes=%" PRIu64
+            " estimated_materialize_complete=%u"
+            " classifier_status=%s first_rejection_reason=%s"
+            " first_rejection_command=%s\n",
             run_binding, cxl_type2_paired_case_name(case_kind), epoch,
             ct2d->cuda_direct_source,
             ct2d->paired_case.active_direct_register_calls,
@@ -3652,7 +3813,32 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             ct2d->paired_case.active_payload_batches,
             ct2d->paired_case.active_payload_source_bytes, live_sources,
             live_physicals, live_registration_groups, source_pending_refs,
-            ct2d->direct_source_poisoned);
+            ct2d->direct_source_poisoned, ct2d->cuda_allocations.count,
+            ct2d->cuda_allocations.peak_count,
+            ct2d->cuda_allocations.next_epoch,
+            ct2d->paired_case.allocation_classified_batches,
+            ct2d->paired_case.allocation_classified_bytes,
+            ct2d->paired_case.allocation_whole_batches,
+            ct2d->paired_case.allocation_whole_bytes,
+            ct2d->paired_case.allocation_partial_batches,
+            ct2d->paired_case.allocation_partial_bytes,
+            ct2d->paired_case.allocation_cross_batches,
+            ct2d->paired_case.allocation_cross_bytes,
+            ct2d->paired_case.allocation_unknown_batches,
+            ct2d->paired_case.allocation_unknown_bytes,
+            ct2d->paired_case.graph_exec_observed,
+            ct2d->paired_case.graph_all_kernel_flat,
+            ct2d->paired_case.graph_child_or_non_kernel,
+            ct2d->paired_case.graph_incomplete,
+            opcode_summary.reader_commands, opcode_summary.writer_commands,
+            opcode_summary.lifecycle_commands,
+            opcode_summary.no_change_commands,
+            opcode_summary.unknown_commands, opcode_records,
+            opcode_summary.estimated_materialize_bytes,
+            opcode_summary.estimated_materialize_complete,
+            cxl_type2_cuda_classifier_status_name(classifier_status),
+            cxl_type2_cuda_rejection_reason_name(rejection_reason),
+            rejection_command_name);
     }
 
     cxl_type2_log_command_scope_summary(run_binding, case_kind, epoch, "case",
@@ -5060,6 +5246,8 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
     HetGPUDevicePtr *destinations = NULL;
     const void **hosts = NULL;
     size_t *sizes = NULL;
+    uint64_t *logical_destinations = NULL;
+    size_t *logical_sizes = NULL;
     size_t failed_span = SIZE_MAX;
     int result = CXL_GPU_SUCCESS;
 
@@ -5077,6 +5265,20 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
         goto out;
     }
     spans = g_array_new(false, false, sizeof(CXLType2DirectSpan));
+    if (source_override) {
+        logical_destinations = g_try_new(uint64_t, range_count);
+        logical_sizes = g_try_new(size_t, range_count);
+        if (!logical_destinations || !logical_sizes) {
+            g_free(logical_destinations);
+            g_free(logical_sizes);
+            logical_destinations = NULL;
+            logical_sizes = NULL;
+            cxl_type2_cuda_classifier_reject(
+                ct2d, CXL_TYPE2_CUDA_CLASSIFIER_UNAVAILABLE,
+                CXL_TYPE2_CUDA_REJECTION_ALLOCATION_MISSING,
+                CXL_GPU_CMD_SOURCE_REGISTER_BATCH_HTOD_DIRECT_ASYNC, true);
+        }
+    }
     /* Resolve every source and range before the first Driver enqueue. */
     for (uint64_t i = 0; i < range_count; i++) {
         memcpy(&resolved[i].wire,
@@ -5088,6 +5290,10 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
             *fail_index = i;
             result = CXL_GPU_ERROR_INVALID_VALUE;
             goto out;
+        }
+        if (logical_destinations) {
+            logical_destinations[i] = resolved[i].wire.destination;
+            logical_sizes[i] = resolved[i].wire.size;
         }
     }
 
@@ -5192,6 +5398,10 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
         result = CXL_GPU_ERROR_INVALID_VALUE;
         goto out;
     }
+    if (source_override && logical_destinations) {
+        cxl_type2_cuda_record_coverage(
+            ct2d, logical_destinations, logical_sizes, range_count);
+    }
     /* Let each ready prefix run while the host registers the next range. */
     for (size_t slice_start = 0, boundary = 0; boundary <= spans->len;
          boundary++) {
@@ -5273,6 +5483,8 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
     g_assert(*logical_enqueued == range_count);
     *fail_index = SIZE_MAX;
 out:
+    g_free(logical_sizes);
+    g_free(logical_destinations);
     g_free(sizes);
     g_free(hosts);
     g_free(destinations);
@@ -5950,6 +6162,7 @@ static HetGPUError cxl_type2_reset_formal_backend(CXLType2State *ct2d,
                                   ct2d);
     ct2d->gpu_info.passthrough_enabled = true;
     ct2d->gpu_info.gpu_mem_size = hetgpu->props.total_memory;
+    cxl_type2_cuda_allocation_table_reset(&ct2d->cuda_allocations);
     cxl_type2_log_kimi_case_stage(run_binding, case_kind, epoch,
                                   "formal_backend_reset", "end", HETGPU_SUCCESS,
                                   true);
@@ -6693,6 +6906,13 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             err = hetgpu_malloc(hetgpu, size, HETGPU_MEM_DEFAULT, &dev_ptr);
             if (err == HETGPU_SUCCESS) {
                 ct2d->gpu_cmd.results[0] = dev_ptr;
+                if (!cxl_type2_cuda_allocation_record(
+                        &ct2d->cuda_allocations, dev_ptr, size, NULL)) {
+                    cxl_type2_cuda_classifier_reject(
+                        ct2d, CXL_TYPE2_CUDA_CLASSIFIER_UNAVAILABLE,
+                        CXL_TYPE2_CUDA_REJECTION_ALLOCATION_MISSING,
+                        CXL_GPU_CMD_MEM_ALLOC, true);
+                }
             } else {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_OUT_OF_MEMORY;
             }
@@ -6715,6 +6935,12 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             err = hetgpu_free(hetgpu, dev_ptr);
             if (err != HETGPU_SUCCESS) {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            } else if (!cxl_type2_cuda_allocation_forget(
+                           &ct2d->cuda_allocations, dev_ptr)) {
+                cxl_type2_cuda_classifier_reject(
+                    ct2d, CXL_TYPE2_CUDA_CLASSIFIER_UNAVAILABLE,
+                    CXL_TYPE2_CUDA_REJECTION_ALLOCATION_MISSING,
+                    CXL_GPU_CMD_MEM_FREE, true);
             }
         }
         /* Fallback: no-op for simple allocator */
@@ -9241,6 +9467,16 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
     }
 
 complete:
+    if (ct2d->paired_case.active_case != CXL_GPU_CASE_NONE &&
+        cmd == CXL_GPU_CMD_GRAPH_INSTANTIATE &&
+        ct2d->gpu_cmd.cmd_result == CXL_GPU_SUCCESS) {
+        ct2d->paired_case.graph_exec_observed++;
+        ct2d->paired_case.graph_incomplete++;
+        cxl_type2_cuda_classifier_reject(
+            ct2d, CXL_TYPE2_CUDA_CLASSIFIER_UNAVAILABLE,
+            CXL_TYPE2_CUDA_REJECTION_GRAPH_INCOMPLETE,
+            CXL_GPU_CMD_GRAPH_INSTANTIATE, true);
+    }
     if (cmd == CXL_GPU_CMD_STREAM_SYNC &&
         ct2d->gpu_cmd.cmd_result == CXL_GPU_SUCCESS) {
         ct2d->paired_case.last_command_was_successful_stream_sync = true;
@@ -9588,6 +9824,7 @@ static void cxl_type2_reset(DeviceState *dev)
     cxl_cstate->bi_control_write = cxl_type2_bi_control_write;
     cxl_cstate->bi_control_opaque = ct2d;
     ct2d->bi_enabled = false;
+    cxl_type2_cuda_allocation_table_reset(&ct2d->cuda_allocations);
 
     if (ct2d->direct_sources || ct2d->direct_physicals ||
         ct2d->direct_registrations) {
@@ -9962,6 +10199,7 @@ static void cxl_type2_exit(PCIDevice *pci_dev)
         cxl_coherent_pool_cleanup_mappings(ct2d);
     }
     cxl_type2_direct_indexes_destroy(ct2d);
+    cxl_type2_cuda_allocation_table_destroy(&ct2d->cuda_allocations);
     (void)cxl_type2_clear_gpu_handles(ct2d, 0, CXL_GPU_CASE_NONE, 0);
 
     /* Cleanup GPU passthrough */

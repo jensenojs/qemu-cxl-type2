@@ -1,5 +1,12 @@
 #include "qemu/osdep.h"
 #include "hw/cxl/cxl_type2_cuda_contract.h"
+#include "hw/cxl/cxl_p2p_dma.h"
+
+static const uint8_t cxl_type2_cuda_command_roles[256] = {
+#define CXL_TYPE2_CUDA_COMMAND_ROLE(command, role) [command] = role,
+#include "hw/cxl/cxl_type2_cuda_command_roles.inc"
+#undef CXL_TYPE2_CUDA_COMMAND_ROLE
+};
 
 static bool cxl_type2_descriptor_reserved_is_zero(
     const CXLGPURAMCommandDescriptor *descriptor)
@@ -301,6 +308,421 @@ uint64_t cxl_gpu_direct_registration_length(
                 : request_end + padding_budget;
     tile_end = MIN(tile_end, limit);
     return tile_end - request_offset;
+}
+
+static size_t cxl_type2_cuda_allocation_lower_bound(
+    const CXLType2CudaAllocationTable *table, uint64_t base)
+{
+    size_t low = 0;
+    size_t high = table->count;
+
+    while (low < high) {
+        size_t middle = low + (high - low) / 2;
+
+        if (table->entries[middle].base < base) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    return low;
+}
+
+void cxl_type2_cuda_allocation_table_init(
+    CXLType2CudaAllocationTable *table)
+{
+    g_assert(table);
+    memset(table, 0, sizeof(*table));
+    table->next_epoch = 1;
+    table->available = true;
+}
+
+void cxl_type2_cuda_allocation_table_reset(
+    CXLType2CudaAllocationTable *table)
+{
+    g_assert(table);
+    table->count = 0;
+    table->peak_count = 0;
+    table->next_epoch = 1;
+    table->available = true;
+}
+
+void cxl_type2_cuda_allocation_table_destroy(
+    CXLType2CudaAllocationTable *table)
+{
+    if (!table) {
+        return;
+    }
+    g_free(table->entries);
+    memset(table, 0, sizeof(*table));
+}
+
+bool cxl_type2_cuda_allocation_record(CXLType2CudaAllocationTable *table,
+                                      uint64_t base, uint64_t size,
+                                      uint64_t *epoch)
+{
+    CXLType2CudaAllocation *resized;
+    size_t position;
+    size_t capacity;
+
+    if (!table || !table->available || !size ||
+        base > UINT64_MAX - size || table->next_epoch == UINT64_MAX) {
+        if (table) {
+            table->available = false;
+        }
+        return false;
+    }
+    position = cxl_type2_cuda_allocation_lower_bound(table, base);
+    if ((position &&
+         table->entries[position - 1].base +
+                 table->entries[position - 1].size > base) ||
+        (position < table->count &&
+         base + size > table->entries[position].base)) {
+        table->available = false;
+        return false;
+    }
+    if (table->count == table->capacity) {
+        capacity = table->capacity ? table->capacity * 2 : 8;
+        if (capacity < table->capacity ||
+            capacity > SIZE_MAX / sizeof(*table->entries)) {
+            table->available = false;
+            return false;
+        }
+        resized = g_try_realloc_n(table->entries, capacity,
+                                  sizeof(*table->entries));
+        if (!resized) {
+            table->available = false;
+            return false;
+        }
+        table->entries = resized;
+        table->capacity = capacity;
+    }
+    memmove(&table->entries[position + 1], &table->entries[position],
+            (table->count - position) * sizeof(*table->entries));
+    table->entries[position] = (CXLType2CudaAllocation) {
+        .base = base,
+        .size = size,
+        .epoch = table->next_epoch++,
+    };
+    table->count++;
+    table->peak_count = MAX(table->peak_count, table->count);
+    if (epoch) {
+        *epoch = table->entries[position].epoch;
+    }
+    return true;
+}
+
+bool cxl_type2_cuda_allocation_forget(CXLType2CudaAllocationTable *table,
+                                      uint64_t base)
+{
+    size_t position;
+
+    if (!table || !table->available) {
+        return false;
+    }
+    position = cxl_type2_cuda_allocation_lower_bound(table, base);
+    if (position == table->count || table->entries[position].base != base) {
+        table->available = false;
+        return false;
+    }
+    memmove(&table->entries[position], &table->entries[position + 1],
+            (table->count - position - 1) * sizeof(*table->entries));
+    table->count--;
+    return true;
+}
+
+typedef struct CXLType2CudaDestinationRange {
+    uint64_t base;
+    uint64_t size;
+} CXLType2CudaDestinationRange;
+
+static int cxl_type2_cuda_destination_range_compare(const void *left,
+                                                    const void *right)
+{
+    const CXLType2CudaDestinationRange *a = left;
+    const CXLType2CudaDestinationRange *b = right;
+
+    return a->base < b->base ? -1 : a->base > b->base;
+}
+
+static void cxl_type2_cuda_coverage_unknown(
+    CXLType2CudaCoverageResult *result,
+    CXLType2CudaRejectionReason reason, bool available)
+{
+    result->kind = CXL_TYPE2_CUDA_COVERAGE_UNKNOWN;
+    result->reason = reason;
+    result->available = available;
+}
+
+void cxl_type2_cuda_destination_union_classify(
+    const CXLType2CudaAllocationTable *table,
+    const uint64_t *destinations, const size_t *sizes, size_t count,
+    CXLType2CudaCoverageResult *result)
+{
+    g_autofree CXLType2CudaDestinationRange *ranges = NULL;
+    size_t allocation_index = 0;
+    size_t active_allocation = SIZE_MAX;
+    uint64_t covered_end = 0;
+    bool whole = true;
+
+    g_assert(result);
+    *result = (CXLType2CudaCoverageResult) {
+        .kind = CXL_TYPE2_CUDA_COVERAGE_UNKNOWN,
+        .reason = CXL_TYPE2_CUDA_REJECTION_ALLOCATION_MISSING,
+    };
+    if (!table || !table->available || !destinations || !sizes || !count ||
+        !table->count) {
+        return;
+    }
+    ranges = g_try_new(CXLType2CudaDestinationRange, count);
+    if (!ranges) {
+        return;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (!sizes[i] || destinations[i] > UINT64_MAX - sizes[i] ||
+            result->bytes > UINT64_MAX - sizes[i]) {
+            cxl_type2_cuda_coverage_unknown(
+                result, CXL_TYPE2_CUDA_REJECTION_DESTINATION_OVERFLOW, true);
+            return;
+        }
+        ranges[i] = (CXLType2CudaDestinationRange) {
+            .base = destinations[i],
+            .size = sizes[i],
+        };
+        result->bytes += sizes[i];
+    }
+    qsort(ranges, count, sizeof(*ranges),
+          cxl_type2_cuda_destination_range_compare);
+    for (size_t i = 1; i < count; i++) {
+        if (ranges[i].base < ranges[i - 1].base + ranges[i - 1].size) {
+            cxl_type2_cuda_coverage_unknown(
+                result, CXL_TYPE2_CUDA_REJECTION_DESTINATION_OVERLAP, true);
+            return;
+        }
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        uint64_t range_end = ranges[i].base + ranges[i].size;
+        size_t first_overlap;
+        size_t overlap_count = 0;
+
+        while (allocation_index < table->count &&
+               table->entries[allocation_index].base +
+                       table->entries[allocation_index].size <= ranges[i].base) {
+            allocation_index++;
+        }
+        first_overlap = allocation_index;
+        while (first_overlap + overlap_count < table->count &&
+               table->entries[first_overlap + overlap_count].base < range_end) {
+            const CXLType2CudaAllocation *allocation =
+                &table->entries[first_overlap + overlap_count];
+
+            if (allocation->base + allocation->size > ranges[i].base) {
+                overlap_count++;
+            } else {
+                first_overlap++;
+            }
+        }
+        if (overlap_count > 1) {
+            result->kind = CXL_TYPE2_CUDA_COVERAGE_CROSS;
+            result->reason = CXL_TYPE2_CUDA_REJECTION_CROSS_ALLOCATION;
+            result->available = true;
+            return;
+        }
+        if (overlap_count != 1) {
+            cxl_type2_cuda_coverage_unknown(
+                result, CXL_TYPE2_CUDA_REJECTION_ALLOCATION_MISSING, true);
+            return;
+        }
+
+        const CXLType2CudaAllocation *allocation =
+            &table->entries[first_overlap];
+        uint64_t allocation_end = allocation->base + allocation->size;
+
+        if (ranges[i].base < allocation->base || range_end > allocation_end) {
+            cxl_type2_cuda_coverage_unknown(
+                result, CXL_TYPE2_CUDA_REJECTION_ALLOCATION_MISSING, true);
+            return;
+        }
+        if (active_allocation != SIZE_MAX &&
+            active_allocation != first_overlap) {
+            result->kind = CXL_TYPE2_CUDA_COVERAGE_CROSS;
+            result->reason = CXL_TYPE2_CUDA_REJECTION_CROSS_ALLOCATION;
+            result->available = true;
+            return;
+        }
+        if (active_allocation == SIZE_MAX) {
+            active_allocation = first_overlap;
+            covered_end = allocation->base;
+        }
+        if (ranges[i].base != covered_end) {
+            whole = false;
+        }
+        covered_end = range_end;
+    }
+    if (active_allocation == SIZE_MAX ||
+        covered_end != table->entries[active_allocation].base +
+                           table->entries[active_allocation].size) {
+        whole = false;
+    }
+    result->kind = whole ? CXL_TYPE2_CUDA_COVERAGE_WHOLE
+                         : CXL_TYPE2_CUDA_COVERAGE_PARTIAL;
+    result->reason = whole ? CXL_TYPE2_CUDA_REJECTION_NONE
+                           : CXL_TYPE2_CUDA_REJECTION_PARTIAL_COVERAGE;
+    result->available = true;
+}
+
+CXLType2CudaCommandRole cxl_type2_cuda_command_role(uint32_t command)
+{
+    if (command >= G_N_ELEMENTS(cxl_type2_cuda_command_roles) ||
+        !cxl_type2_cuda_command_roles[command]) {
+        return CXL_TYPE2_CUDA_COMMAND_UNKNOWN;
+    }
+    return cxl_type2_cuda_command_roles[command];
+}
+
+const char *cxl_type2_cuda_command_role_name(CXLType2CudaCommandRole role)
+{
+    switch (role) {
+    case CXL_TYPE2_CUDA_COMMAND_READER:
+        return "reader";
+    case CXL_TYPE2_CUDA_COMMAND_WRITER:
+        return "writer";
+    case CXL_TYPE2_CUDA_COMMAND_READER_WRITER:
+        return "reader+writer";
+    case CXL_TYPE2_CUDA_COMMAND_LIFECYCLE:
+        return "lifecycle";
+    case CXL_TYPE2_CUDA_COMMAND_NO_CHANGE:
+        return "no-change";
+    case CXL_TYPE2_CUDA_COMMAND_UNKNOWN:
+        return "unknown";
+    default:
+        return "unknown";
+    }
+}
+
+static bool cxl_type2_cuda_opcode_count_add(uint64_t *value,
+                                            uint64_t addend)
+{
+    if (*value > UINT64_MAX - addend) {
+        return false;
+    }
+    *value += addend;
+    return true;
+}
+
+bool cxl_type2_cuda_opcode_summary_build(
+    const uint64_t command_counts[256], char *records,
+    size_t records_capacity, CXLType2CudaOpcodeSummary *summary)
+{
+    size_t used = 0;
+    bool first_record = true;
+    bool valid = true;
+
+    if (!command_counts || !records || records_capacity < sizeof("none") ||
+        !summary) {
+        return false;
+    }
+    memset(summary, 0, sizeof(*summary));
+    records[0] = '\0';
+    summary->estimated_materialize_complete = true;
+    for (uint32_t command = 0; command < 256; command++) {
+        CXLType2CudaCommandRole role;
+        uint64_t count = command_counts[command];
+        int written;
+
+        if (!count) {
+            continue;
+        }
+        role = cxl_type2_cuda_command_role(command);
+        if ((role & CXL_TYPE2_CUDA_COMMAND_READER) &&
+            !cxl_type2_cuda_opcode_count_add(
+                &summary->reader_commands, count)) {
+            valid = false;
+        }
+        if ((role & CXL_TYPE2_CUDA_COMMAND_WRITER) &&
+            !cxl_type2_cuda_opcode_count_add(
+                &summary->writer_commands, count)) {
+            valid = false;
+        }
+        if (role == CXL_TYPE2_CUDA_COMMAND_LIFECYCLE &&
+            !cxl_type2_cuda_opcode_count_add(
+                &summary->lifecycle_commands, count)) {
+            valid = false;
+        }
+        if (role == CXL_TYPE2_CUDA_COMMAND_NO_CHANGE &&
+            !cxl_type2_cuda_opcode_count_add(
+                &summary->no_change_commands, count)) {
+            valid = false;
+        }
+        if (role == CXL_TYPE2_CUDA_COMMAND_UNKNOWN &&
+            !cxl_type2_cuda_opcode_count_add(
+                &summary->unknown_commands, count)) {
+            valid = false;
+        }
+        if (!summary->first_incomplete_command_valid) {
+            summary->first_incomplete_command = command;
+            summary->first_incomplete_command_valid = true;
+        }
+        summary->estimated_materialize_complete = false;
+        written = snprintf(
+            records + used, records_capacity - used,
+            "%s0x%02X:%s:%" PRIu64 ":0:incomplete",
+            first_record ? "" : ";", command,
+            cxl_type2_cuda_command_role_name(role), count);
+        if (written < 0 || (size_t)written >= records_capacity - used) {
+            memcpy(records, "none", sizeof("none"));
+            return false;
+        }
+        used += written;
+        first_record = false;
+    }
+    if (first_record) {
+        memcpy(records, "none", sizeof("none"));
+    }
+    return valid;
+}
+
+const char *cxl_type2_cuda_classifier_status_name(
+    CXLType2CudaClassifierStatus status)
+{
+    switch (status) {
+    case CXL_TYPE2_CUDA_CLASSIFIER_AVAILABLE:
+        return "available";
+    case CXL_TYPE2_CUDA_CLASSIFIER_CONTRADICTED:
+        return "contradicted";
+    case CXL_TYPE2_CUDA_CLASSIFIER_UNAVAILABLE:
+        return "unavailable";
+    default:
+        g_assert_not_reached();
+    }
+}
+
+const char *cxl_type2_cuda_rejection_reason_name(
+    CXLType2CudaRejectionReason reason)
+{
+    switch (reason) {
+    case CXL_TYPE2_CUDA_REJECTION_NONE:
+        return "none";
+    case CXL_TYPE2_CUDA_REJECTION_ALLOCATION_MISSING:
+        return "allocation-missing";
+    case CXL_TYPE2_CUDA_REJECTION_PARTIAL_COVERAGE:
+        return "partial-coverage";
+    case CXL_TYPE2_CUDA_REJECTION_CROSS_ALLOCATION:
+        return "cross-allocation";
+    case CXL_TYPE2_CUDA_REJECTION_DESTINATION_OVERLAP:
+        return "destination-overlap";
+    case CXL_TYPE2_CUDA_REJECTION_DESTINATION_OVERFLOW:
+        return "destination-overflow";
+    case CXL_TYPE2_CUDA_REJECTION_GRAPH_NON_KERNEL:
+        return "graph-non-kernel";
+    case CXL_TYPE2_CUDA_REJECTION_GRAPH_INCOMPLETE:
+        return "graph-incomplete";
+    case CXL_TYPE2_CUDA_REJECTION_OPCODE_UNKNOWN:
+        return "opcode-unknown";
+    default:
+        g_assert_not_reached();
+    }
 }
 
 bool cxl_type2_cuda_mem_info_is_allowed(bool active_case, bool live_context,

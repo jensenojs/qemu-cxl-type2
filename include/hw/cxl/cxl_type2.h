@@ -16,6 +16,7 @@
 #include "hw/cxl/cxl_device.h"
 #include "hw/cxl/cxl_component.h"
 #include "hw/cxl/cxl_hetgpu.h"
+#include "hw/cxl/cxl_type2_cuda_contract.h"
 #include "hw/cxl/cxl_type2_gpu_cmd.h"
 #include "hw/cxl/cxl_type2_coherency.h"
 #include "hw/cxl/cxl_p2p_dma.h"
@@ -427,6 +428,7 @@ typedef struct CXLType2State {
     GHashTable *direct_source_ids;
     uint64_t next_direct_source_id;
     bool direct_source_poisoned;
+    CXLType2CudaAllocationTable cuda_allocations;
 
     struct {
         bool required;
@@ -520,6 +522,24 @@ typedef struct CXLType2State {
         uint64_t active_direct_peak_pending_bytes;
         uint64_t active_payload_batches;
         uint64_t active_payload_source_bytes;
+        uint64_t allocation_classified_batches;
+        uint64_t allocation_classified_bytes;
+        uint64_t allocation_whole_batches;
+        uint64_t allocation_whole_bytes;
+        uint64_t allocation_partial_batches;
+        uint64_t allocation_partial_bytes;
+        uint64_t allocation_cross_batches;
+        uint64_t allocation_cross_bytes;
+        uint64_t allocation_unknown_batches;
+        uint64_t allocation_unknown_bytes;
+        uint64_t graph_exec_observed;
+        uint64_t graph_all_kernel_flat;
+        uint64_t graph_child_or_non_kernel;
+        uint64_t graph_incomplete;
+        CXLType2CudaClassifierStatus classifier_status;
+        CXLType2CudaRejectionReason first_rejection_reason;
+        uint32_t first_rejection_command;
+        bool first_rejection_command_valid;
         uint64_t active_htod_pool_hits;
         uint64_t active_htod_pool_misses;
         uint64_t active_htod_driver_allocations;
