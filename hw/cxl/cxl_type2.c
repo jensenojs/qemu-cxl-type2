@@ -23,6 +23,7 @@
 #include "qemu/timer.h"
 #include "qemu/units.h"
 #include "qapi/error.h"
+#include "exec/target_page.h"
 #include "hw/cxl/cxl.h"
 #include "hw/cxl/cxl_device.h"
 #include "hw/cxl/cxl_component.h"
@@ -38,6 +39,7 @@
 #include "hw/pci/msix.h"
 #include "hw/qdev-properties.h"
 #include "hw/qdev-properties-system.h"
+#include "hw/core/cpu.h"
 #include "hw/virtio/vhost-user-fs.h"
 #include "migration/vmstate.h"
 #include "system/memory.h"
@@ -4496,7 +4498,8 @@ static int cxl_type2_direct_sources_cleanup(CXLType2State *ct2d)
 }
 
 typedef struct CXLType2DirectValidatedRun {
-    CXLGPUSourceRunV1 wire;
+    hwaddr guest_phys_addr;
+    uint64_t length;
     VirtioSharedMemoryMapping *mapping;
     uint64_t generation;
     hwaddr mapping_offset;
@@ -4514,13 +4517,12 @@ static uint32_t cxl_type2_direct_contiguous_run_end(
 
         if (current->mapping != previous->mapping ||
             current->generation != previous->generation ||
-            previous->mapping_offset > UINT64_MAX - previous->wire.length ||
+            previous->mapping_offset > UINT64_MAX - previous->length ||
             current->mapping_offset !=
-                previous->mapping_offset + previous->wire.length ||
-            previous->wire.guest_phys_addr >
-                UINT64_MAX - previous->wire.length ||
-            current->wire.guest_phys_addr !=
-                previous->wire.guest_phys_addr + previous->wire.length) {
+                previous->mapping_offset + previous->length ||
+            previous->guest_phys_addr > UINT64_MAX - previous->length ||
+            current->guest_phys_addr !=
+                previous->guest_phys_addr + previous->length) {
             break;
         }
         end++;
@@ -4575,10 +4577,12 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
     VirtioSharedMemory *shmem;
     MemoryRegion *dax_mr;
     const uint8_t *range_base;
-    const uint8_t *run_base;
+    GArray *resolved_runs = NULL;
+    CXLType2DirectRangeLayout *range_layouts = NULL;
     uint64_t fail_index;
     int result = CXL_GPU_ERROR_INVALID_VALUE;
     int64_t phase_begin_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+    uint64_t target_page_size = qemu_target_page_size();
 
     *failure_stage_out = NULL;
     *failure_index_out = SIZE_MAX;
@@ -4598,6 +4602,10 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
         *failure_stage_out = "case-inactive";
         return CXL_GPU_ERROR_INVALID_VALUE;
     }
+    if (!current_cpu) {
+        *failure_stage_out = "cpu-context-missing";
+        return CXL_GPU_ERROR_INVALID_VALUE;
+    }
     if (!vhost_user_fs_pci_get_dax(ct2d->direct_source_fs, &shmem,
                                    &dax_mr)) {
         *failure_stage_out = "dax-unavailable";
@@ -4612,33 +4620,95 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
         return CXL_GPU_ERROR_INVALID_VALUE;
     }
     range_base = ct2d->gpu_cmd.batch_data + sizeof(header);
-    run_base = range_base +
-               (uint64_t)header.range_count * sizeof(CXLGPUSourceRangeV1);
-    validated = g_new0(CXLType2DirectValidatedRun, header.run_count);
+    resolved_runs = g_array_new(false, false,
+                                sizeof(CXLType2DirectValidatedRun));
+    range_layouts = g_new0(CXLType2DirectRangeLayout, header.range_count);
+    for (uint32_t i = 0; i < header.range_count; i++) {
+        CXLGPUSourceVirtualRangeV1 wire_range;
+        uint64_t cursor;
+        uint64_t remaining;
+
+        memcpy(&wire_range, range_base + (uint64_t)i * sizeof(wire_range),
+               sizeof(wire_range));
+        if (resolved_runs->len > UINT32_MAX) {
+            *failure_stage_out = "run-capacity";
+            *failure_index_out = i;
+            goto out;
+        }
+        range_layouts[i].first_run = resolved_runs->len;
+        range_layouts[i].length = wire_range.length;
+        cursor = wire_range.guest_virtual_address;
+        remaining = wire_range.length;
+        while (remaining) {
+            hwaddr page = cpu_get_phys_page_debug(current_cpu, cursor);
+            uint64_t page_offset = cursor & (target_page_size - 1);
+            uint64_t chunk = MIN(remaining, target_page_size - page_offset);
+            CXLType2DirectValidatedRun run;
+
+            if (page == (hwaddr)-1 || page > UINT64_MAX - page_offset) {
+                *failure_stage_out = "gva-translate";
+                *failure_index_out = i;
+                goto out;
+            }
+            run = (CXLType2DirectValidatedRun) {
+                .guest_phys_addr = page + page_offset,
+                .length = chunk,
+            };
+            if (resolved_runs->len > range_layouts[i].first_run) {
+                CXLType2DirectValidatedRun *previous = &g_array_index(
+                    resolved_runs, CXLType2DirectValidatedRun,
+                    resolved_runs->len - 1);
+
+                if (previous->guest_phys_addr <=
+                        UINT64_MAX - previous->length &&
+                    previous->guest_phys_addr + previous->length ==
+                        run.guest_phys_addr &&
+                    previous->length <= UINT64_MAX - run.length) {
+                    previous->length += run.length;
+                } else {
+                    g_array_append_val(resolved_runs, run);
+                }
+            } else {
+                g_array_append_val(resolved_runs, run);
+            }
+            cursor += chunk;
+            remaining -= chunk;
+        }
+        if (resolved_runs->len - range_layouts[i].first_run > UINT32_MAX) {
+            *failure_stage_out = "run-capacity";
+            *failure_index_out = i;
+            goto out;
+        }
+        range_layouts[i].run_count =
+            resolved_runs->len - range_layouts[i].first_run;
+    }
+    if (resolved_runs->len > UINT32_MAX) {
+        *failure_stage_out = "run-capacity";
+        goto out;
+    }
+    validated = (CXLType2DirectValidatedRun *)resolved_runs->data;
     ct2d->paired_case.active_direct_register_validate_ns +=
         qemu_clock_get_ns(QEMU_CLOCK_HOST) - phase_begin_ns;
     phase_begin_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
 
     /* This pass has no mapping, CUDA, or table side effects. */
-    for (uint32_t i = 0; i < header.run_count; i++) {
+    for (uint32_t i = 0; i < resolved_runs->len; i++) {
         hwaddr translated = 0;
         hwaddr translated_len;
         MemoryRegion *mr;
         VirtioSharedMemoryMapping *mapping;
 
-        memcpy(&validated[i].wire, run_base + (uint64_t)i *
-               sizeof(validated[i].wire), sizeof(validated[i].wire));
-        translated_len = validated[i].wire.length;
+        translated_len = validated[i].length;
         mr = address_space_translate(
-            &address_space_memory, validated[i].wire.guest_phys_addr,
+            &address_space_memory, validated[i].guest_phys_addr,
             &translated, &translated_len, false, MEMTXATTRS_UNSPECIFIED);
-        if (mr != dax_mr || translated_len < validated[i].wire.length) {
+        if (mr != dax_mr || translated_len < validated[i].length) {
             *failure_stage_out = "address-translate";
             *failure_index_out = i;
             goto out;
         }
         mapping = virtio_find_shmem_map(
-            shmem, translated, validated[i].wire.length);
+            shmem, translated, validated[i].length);
         if (!mapping) {
             *failure_stage_out = "mapping-lookup";
             *failure_index_out = i;
@@ -4652,10 +4722,10 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
         for (uint32_t j = 0; j < i; j++) {
             if (validated[j].mapping == mapping &&
                 ranges_overlap(validated[j].mapping_offset,
-                               validated[j].wire.length, translated,
-                               validated[i].wire.length) &&
+                               validated[j].length, translated,
+                               validated[i].length) &&
                 (validated[j].mapping_offset != translated ||
-                 validated[j].wire.length != validated[i].wire.length)) {
+                 validated[j].length != validated[i].length)) {
                 *failure_stage_out = "request-run-overlap";
                 *failure_index_out = i;
                 goto out;
@@ -4671,30 +4741,41 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
 
     source = g_new0(CXLType2DirectSource, 1);
     source->case_epoch = ct2d->paired_case.active_epoch;
-    source->lease_handle = header.lease_handle;
     source->logical_bytes = header.logical_bytes;
-    source->unique_dmap_bytes = header.unique_dmap_bytes;
+    for (uint32_t i = 0; i < resolved_runs->len; i++) {
+        bool duplicate = false;
+
+        for (uint32_t j = 0; j < i; j++) {
+            if (validated[j].mapping == validated[i].mapping &&
+                validated[j].mapping_offset == validated[i].mapping_offset &&
+                validated[j].length == validated[i].length) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) {
+            source->unique_dmap_bytes += validated[i].length;
+        }
+    }
     source->range_count = header.range_count;
-    source->ranges = g_new(CXLGPUSourceRangeV1, header.range_count);
-    memcpy(source->ranges, range_base,
-           (uint64_t)header.range_count * sizeof(*source->ranges));
+    source->ranges = g_steal_pointer(&range_layouts);
     {
         GArray *views = g_array_new(false, false, sizeof(CXLType2DirectRun));
         GPtrArray *pending = g_ptr_array_new();
         GPtrArray *new_groups = g_ptr_array_new();
-        uint32_t *wire_first_view = g_new(uint32_t, header.run_count);
-        uint32_t *wire_view_count = g_new0(uint32_t, header.run_count);
+        uint32_t *wire_first_view = g_new(uint32_t, resolved_runs->len);
+        uint32_t *wire_view_count = g_new0(uint32_t, resolved_runs->len);
         uint64_t pending_padding_bytes = 0;
 
         /* Pin every missing mapping segment before choosing CUDA ranges. */
-        for (uint32_t i = 0; i < header.run_count;) {
+        for (uint32_t i = 0; i < resolved_runs->len;) {
             uint32_t group_end = cxl_type2_direct_contiguous_run_end(
-                validated, header.run_count, i);
+                validated, resolved_runs->len, i);
             hwaddr cursor = validated[i].mapping_offset;
             uint64_t group_length = 0;
 
             for (uint32_t j = i; j < group_end; j++) {
-                group_length += validated[j].wire.length;
+                group_length += validated[j].length;
             }
             while (group_length) {
                 CXLType2DirectPhysical *physical =
@@ -4904,9 +4985,9 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
             first = end;
         }
 
-        for (uint32_t wire = 0; wire < header.run_count; wire++) {
+        for (uint32_t wire = 0; wire < resolved_runs->len; wire++) {
             hwaddr cursor = validated[wire].mapping_offset;
-            uint64_t remaining = validated[wire].wire.length;
+            uint64_t remaining = validated[wire].length;
 
             wire_first_view[wire] = views->len;
             while (remaining) {
@@ -4992,7 +5073,7 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
         source->run_count = views->len;
         source->runs = (CXLType2DirectRun *)g_array_free(views, false);
         for (uint32_t i = 0; i < source->range_count; i++) {
-            const CXLGPUSourceRangeV1 *range = &source->ranges[i];
+            const CXLType2DirectRangeLayout *range = &source->ranges[i];
 
             for (uint32_t j = 1; j < range->run_count; j++) {
                 CXLType2DirectRun *previous =
@@ -5096,7 +5177,7 @@ views_done:
     g_assert(inserted);
     (void)inserted;
     *source_id_out = source->source_id;
-    g_free(validated);
+    g_array_free(resolved_runs, true);
     ct2d->paired_case.active_direct_register_commit_ns +=
         qemu_clock_get_ns(QEMU_CLOCK_HOST) - phase_begin_ns;
     return CXL_GPU_SUCCESS;
@@ -5126,7 +5207,10 @@ out:
         g_free(source->runs);
         g_free(source);
     }
-    g_free(validated);
+    g_free(range_layouts);
+    if (resolved_runs) {
+        g_array_free(resolved_runs, true);
+    }
     return result;
 }
 
@@ -5177,7 +5261,7 @@ static bool cxl_type2_direct_range_is_valid(
 {
     CXLType2DirectSource *source = source_override ? source_override :
         cxl_type2_direct_source_find(ct2d, wire->source_id);
-    CXLGPUSourceRangeV1 *range;
+    CXLType2DirectRangeLayout *range;
     uint64_t skip;
     uint64_t remaining;
 
@@ -5300,7 +5384,7 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
     for (uint64_t i = 0; i < range_count; i++) {
         CXLGPUDirectRangeV1 *wire = &resolved[i].wire;
         CXLType2DirectSource *source = resolved[i].source;
-        CXLGPUSourceRangeV1 *range;
+        CXLType2DirectRangeLayout *range;
         uint64_t skip;
         uint64_t remaining;
         uint64_t copied = 0;

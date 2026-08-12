@@ -123,25 +123,16 @@ typedef struct CXLGPUBatchHtoDRange {
 typedef struct CXLGPUSourceRegisterV1 {
     uint32_t flags;
     uint32_t range_count;
-    uint32_t run_count;
     uint32_t reserved0;
-    uint64_t lease_handle;
+    uint32_t reserved1;
     uint64_t logical_bytes;
-    uint64_t unique_dmap_bytes;
-    uint64_t reserved1;
+    uint64_t reserved2[3];
 } CXLGPUSourceRegisterV1;
 
-typedef struct CXLGPUSourceRangeV1 {
-    uint32_t first_run;
-    uint32_t run_count;
-    uint64_t first_run_byte_offset;
+typedef struct CXLGPUSourceVirtualRangeV1 {
+    uint64_t guest_virtual_address;
     uint64_t length;
-} CXLGPUSourceRangeV1;
-
-typedef struct CXLGPUSourceRunV1 {
-    uint64_t guest_phys_addr;
-    uint64_t length;
-} CXLGPUSourceRunV1;
+} CXLGPUSourceVirtualRangeV1;
 
 typedef struct CXLGPUDirectRangeV1 {
     uint64_t destination;
@@ -158,16 +149,12 @@ _Static_assert(sizeof(CXLGPUBatchHtoDRange) == 24,
                "CXL GPU batch range size mismatch");
 _Static_assert(sizeof(CXLGPUSourceRegisterV1) == 48,
                "CXL GPU source register size mismatch");
-_Static_assert(sizeof(CXLGPUSourceRangeV1) == 24,
-               "CXL GPU source range size mismatch");
-_Static_assert(sizeof(CXLGPUSourceRunV1) == 16,
-               "CXL GPU source run size mismatch");
+_Static_assert(sizeof(CXLGPUSourceVirtualRangeV1) == 16,
+               "CXL GPU source virtual range size mismatch");
 _Static_assert(sizeof(CXLGPUDirectRangeV1) == 40,
                "CXL GPU direct range size mismatch");
-_Static_assert(offsetof(CXLGPUSourceRegisterV1, lease_handle) == 16,
-               "CXL GPU source lease offset mismatch");
-_Static_assert(offsetof(CXLGPUSourceRangeV1, first_run_byte_offset) == 8,
-               "CXL GPU source range offset mismatch");
+_Static_assert(offsetof(CXLGPUSourceRegisterV1, logical_bytes) == 16,
+               "CXL GPU source logical bytes offset mismatch");
 _Static_assert(offsetof(CXLGPUDirectRangeV1, source_offset) == 32,
                "CXL GPU direct source offset mismatch");
 _Static_assert(offsetof(CXLGPUBatchHtoDHeader, payload_bytes) == 16,
@@ -202,7 +189,7 @@ _Static_assert(CXL_GPU_BATCH_DATA_OFFSET >=
 
 /* Magic number */
 #define CXL_GPU_MAGIC               0x43584C32  /* "CXL2" */
-#define CXL_GPU_VERSION             0x00011300  /* v1.19.0: fused direct-source batch */
+#define CXL_GPU_VERSION             0x00011400  /* v1.20.0: QEMU resolves source GVA */
 
 #define CXL_GPU_STREAM_WIRE_NULL       0xffffffffffffffffULL
 #define CXL_GPU_STREAM_WIRE_LEGACY     0xfffffffffffffffeULL
