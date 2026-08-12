@@ -425,9 +425,96 @@ bool cxl_type2_cuda_allocation_forget(CXLType2CudaAllocationTable *table,
         table->available = false;
         return false;
     }
+    if (table->entries[position].consumer_refs) {
+        return false;
+    }
     memmove(&table->entries[position], &table->entries[position + 1],
             (table->count - position - 1) * sizeof(*table->entries));
     table->count--;
+    return true;
+}
+
+CXLType2CudaAllocation *cxl_type2_cuda_allocation_find(
+    CXLType2CudaAllocationTable *table, uint64_t base, uint64_t epoch)
+{
+    size_t position;
+
+    if (!table || !table->available || !epoch) {
+        return NULL;
+    }
+    position = cxl_type2_cuda_allocation_lower_bound(table, base);
+    if (position == table->count || table->entries[position].base != base ||
+        table->entries[position].epoch != epoch) {
+        return NULL;
+    }
+    return &table->entries[position];
+}
+
+bool cxl_type2_cuda_allocation_publish_alias(
+    CXLType2CudaAllocationTable *table, uint64_t base, uint64_t epoch,
+    uint64_t generation, uint64_t device_alias)
+{
+    CXLType2CudaAllocation *allocation =
+        cxl_type2_cuda_allocation_find(table, base, epoch);
+
+    if (!allocation || !generation || !device_alias ||
+        allocation->dax_backed || allocation->consumer_refs) {
+        return false;
+    }
+    allocation->content_generation = generation;
+    allocation->device_alias = device_alias;
+    allocation->dax_backed = true;
+    return true;
+}
+
+bool cxl_type2_cuda_allocation_acquire_alias(
+    CXLType2CudaAllocationTable *table, uint64_t base, uint64_t epoch,
+    uint64_t generation, uint64_t *device_alias)
+{
+    CXLType2CudaAllocation *allocation =
+        cxl_type2_cuda_allocation_find(table, base, epoch);
+
+    if (!allocation || !device_alias || !allocation->dax_backed ||
+        allocation->content_generation != generation ||
+        allocation->consumer_refs == UINT64_MAX) {
+        return false;
+    }
+    allocation->consumer_refs++;
+    *device_alias = allocation->device_alias;
+    return true;
+}
+
+bool cxl_type2_cuda_allocation_release_alias(
+    CXLType2CudaAllocationTable *table, uint64_t base, uint64_t epoch,
+    uint64_t generation)
+{
+    CXLType2CudaAllocation *allocation =
+        cxl_type2_cuda_allocation_find(table, base, epoch);
+
+    if (!allocation || !allocation->dax_backed ||
+        allocation->content_generation != generation ||
+        !allocation->consumer_refs) {
+        return false;
+    }
+    allocation->consumer_refs--;
+    return true;
+}
+
+bool cxl_type2_cuda_allocation_materialize(
+    CXLType2CudaAllocationTable *table, uint64_t base, uint64_t epoch,
+    uint64_t generation)
+{
+    CXLType2CudaAllocation *allocation =
+        cxl_type2_cuda_allocation_find(table, base, epoch);
+
+    if (!allocation || !allocation->dax_backed ||
+        allocation->content_generation != generation ||
+        allocation->consumer_refs) {
+        return false;
+    }
+    allocation->content_generation = 0;
+    allocation->device_alias = 0;
+    allocation->dax_backed = false;
     return true;
 }
 

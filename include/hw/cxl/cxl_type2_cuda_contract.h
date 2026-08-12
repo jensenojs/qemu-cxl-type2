@@ -122,6 +122,10 @@ typedef struct CXLType2CudaAllocation {
     uint64_t base;
     uint64_t size;
     uint64_t epoch;
+    uint64_t content_generation;
+    uint64_t device_alias;
+    uint64_t consumer_refs;
+    bool dax_backed;
 } CXLType2CudaAllocation;
 
 typedef struct CXLType2CudaAllocationTable {
@@ -200,6 +204,20 @@ bool cxl_type2_cuda_allocation_record(CXLType2CudaAllocationTable *table,
                                       uint64_t *epoch);
 bool cxl_type2_cuda_allocation_forget(CXLType2CudaAllocationTable *table,
                                       uint64_t base);
+CXLType2CudaAllocation *cxl_type2_cuda_allocation_find(
+    CXLType2CudaAllocationTable *table, uint64_t base, uint64_t epoch);
+bool cxl_type2_cuda_allocation_publish_alias(
+    CXLType2CudaAllocationTable *table, uint64_t base, uint64_t epoch,
+    uint64_t generation, uint64_t device_alias);
+bool cxl_type2_cuda_allocation_acquire_alias(
+    CXLType2CudaAllocationTable *table, uint64_t base, uint64_t epoch,
+    uint64_t generation, uint64_t *device_alias);
+bool cxl_type2_cuda_allocation_release_alias(
+    CXLType2CudaAllocationTable *table, uint64_t base, uint64_t epoch,
+    uint64_t generation);
+bool cxl_type2_cuda_allocation_materialize(
+    CXLType2CudaAllocationTable *table, uint64_t base, uint64_t epoch,
+    uint64_t generation);
 void cxl_type2_cuda_destination_union_classify(
     const CXLType2CudaAllocationTable *table,
     const uint64_t *destinations, const size_t *sizes, size_t count,

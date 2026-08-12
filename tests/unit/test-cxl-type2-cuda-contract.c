@@ -632,6 +632,39 @@ static void test_cuda_allocation_rejects_invalid_state(void)
     cxl_type2_cuda_allocation_table_destroy(&table);
 }
 
+static void test_cuda_allocation_alias_lifecycle(void)
+{
+    CXLType2CudaAllocationTable table;
+    uint64_t epoch = 0;
+    uint64_t alias = 0;
+
+    cxl_type2_cuda_allocation_table_init(&table);
+    g_assert_true(cxl_type2_cuda_allocation_record(
+        &table, 0x1000, 0x1000, &epoch));
+    g_assert_true(cxl_type2_cuda_allocation_publish_alias(
+        &table, 0x1000, epoch, 7, 0x9000));
+    g_assert_false(cxl_type2_cuda_allocation_publish_alias(
+        &table, 0x1000, epoch, 8, 0xa000));
+    g_assert_false(cxl_type2_cuda_allocation_acquire_alias(
+        &table, 0x1000, epoch, 6, &alias));
+    g_assert_true(cxl_type2_cuda_allocation_acquire_alias(
+        &table, 0x1000, epoch, 7, &alias));
+    g_assert_cmphex(alias, ==, 0x9000);
+    g_assert_false(cxl_type2_cuda_allocation_forget(&table, 0x1000));
+    g_assert_false(cxl_type2_cuda_allocation_materialize(
+        &table, 0x1000, epoch, 7));
+    g_assert_true(cxl_type2_cuda_allocation_release_alias(
+        &table, 0x1000, epoch, 7));
+    g_assert_true(cxl_type2_cuda_allocation_materialize(
+        &table, 0x1000, epoch, 7));
+    g_assert_false(cxl_type2_cuda_allocation_acquire_alias(
+        &table, 0x1000, epoch, 7, &alias));
+    g_assert_true(cxl_type2_cuda_allocation_forget(&table, 0x1000));
+    g_assert_false(cxl_type2_cuda_allocation_publish_alias(
+        &table, 0x1000, epoch, 9, 0xb000));
+    cxl_type2_cuda_allocation_table_destroy(&table);
+}
+
 static void test_cuda_destination_union_coverage(void)
 {
     CXLType2CudaAllocationTable table;
@@ -1045,6 +1078,8 @@ int main(int argc, char **argv)
                     test_cuda_allocation_lifecycle_and_epoch);
     g_test_add_func("/cxl/type2/direct/allocation-invalid-state",
                     test_cuda_allocation_rejects_invalid_state);
+    g_test_add_func("/cxl/type2/direct/allocation-alias-lifecycle",
+                    test_cuda_allocation_alias_lifecycle);
     g_test_add_func("/cxl/type2/direct/destination-union-coverage",
                     test_cuda_destination_union_coverage);
     g_test_add_func("/cxl/type2/direct/generated-command-roles",
