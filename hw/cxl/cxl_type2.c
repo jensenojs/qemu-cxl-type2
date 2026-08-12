@@ -9047,6 +9047,8 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             void *stream = NULL;
 
             ct2d->gpu_cmd.results[0] = SIZE_MAX;
+            ct2d->gpu_cmd.results[1] = 0;
+            ct2d->gpu_cmd.results[2] = 0;
             if (!hetgpu->initialized || !ct2d->gpu_cmd.batch_data ||
                 range_count > UINT64_MAX / sizeof(CXLGPUDirectRangeV1) ||
                 register_bytes > CXL_GPU_BATCH_DATA_SIZE ||
