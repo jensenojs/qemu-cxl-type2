@@ -77,7 +77,6 @@ extern int LZ4_decompress_safe(const char *src, char *dst,
 
 #define CXL_CUDA_MEMHOSTREGISTER_PORTABLE 0x01U
 #define CXL_CUDA_MEMHOSTREGISTER_DEVICEMAP 0x02U
-#define CXL_CUDA_MEMHOSTREGISTER_READ_ONLY 0x08U
 #define CXL_CUDA_DEVICE_ATTRIBUTE_CAN_MAP_HOST_MEMORY 19
 
 static int64_t cxl_type2_host_monotonic_ns(void)
@@ -2517,8 +2516,7 @@ static int cxl_coherent_map_device(CXLType2State *ct2d, uint64_t offset,
     }
     result = hetgpu_cuda_mem_host_register(
         hetgpu, host_ptr, mapped_bytes,
-        CXL_CUDA_MEMHOSTREGISTER_PORTABLE | CXL_CUDA_MEMHOSTREGISTER_DEVICEMAP |
-            CXL_CUDA_MEMHOSTREGISTER_READ_ONLY);
+        CXL_CUDA_MEMHOSTREGISTER_PORTABLE | CXL_CUDA_MEMHOSTREGISTER_DEVICEMAP);
     if (result != CXL_GPU_SUCCESS) {
         return result;
     }
@@ -4262,9 +4260,7 @@ static int cxl_type2_direct_registration_ensure(
     begin_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
     result = hetgpu_cuda_mem_host_register(
         &ct2d->gpu_info.hetgpu_state, registration->host_address,
-        registration->length,
-        CXL_CUDA_MEMHOSTREGISTER_PORTABLE |
-            CXL_CUDA_MEMHOSTREGISTER_READ_ONLY);
+        registration->length, CXL_CUDA_MEMHOSTREGISTER_PORTABLE);
     ct2d->paired_case.active_direct_physical_register_calls++;
     ct2d->paired_case.active_direct_physical_register_ns +=
         qemu_clock_get_ns(QEMU_CLOCK_HOST) - begin_ns;
