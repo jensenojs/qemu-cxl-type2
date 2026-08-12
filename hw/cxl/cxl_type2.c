@@ -3005,6 +3005,33 @@ incomplete:
         CXL_GPU_CMD_GRAPH_INSTANTIATE, true);
 }
 
+static void cxl_type2_cuda_observe_graph_param(CXLType2State *ct2d,
+                                               const void *value,
+                                               size_t size)
+{
+    uint64_t pointer;
+
+    if (size != sizeof(pointer)) {
+        return;
+    }
+    ct2d->paired_case.graph_pointer_sized_params++;
+    memcpy(&pointer, value, sizeof(pointer));
+    for (size_t i = 0; i < ct2d->cuda_allocations.count; i++) {
+        const CXLType2CudaAllocation *allocation =
+            &ct2d->cuda_allocations.entries[i];
+
+        if (pointer < allocation->base ||
+            pointer - allocation->base >= allocation->size) {
+            continue;
+        }
+        ct2d->paired_case.graph_allocation_pointer_params++;
+        if (pointer == allocation->base) {
+            ct2d->paired_case.graph_allocation_base_params++;
+        }
+        return;
+    }
+}
+
 static CXLType2CudaCoverageKind cxl_type2_cuda_record_coverage(
     CXLType2State *ct2d, const uint64_t *destinations,
     const size_t *sizes, size_t count, uint64_t *classified_bytes)
@@ -3179,6 +3206,9 @@ static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
     ct2d->paired_case.graph_all_kernel_flat = 0;
     ct2d->paired_case.graph_child_or_non_kernel = 0;
     ct2d->paired_case.graph_incomplete = 0;
+    ct2d->paired_case.graph_pointer_sized_params = 0;
+    ct2d->paired_case.graph_allocation_pointer_params = 0;
+    ct2d->paired_case.graph_allocation_base_params = 0;
     ct2d->paired_case.classifier_status =
         CXL_TYPE2_CUDA_CLASSIFIER_AVAILABLE;
     ct2d->paired_case.first_rejection_reason =
@@ -3672,7 +3702,7 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             live_registration_groups++;
         }
         qemu_log(
-            "KIMI_DIRECT_SOURCE_SUMMARY schema=direct-source-summary-v12"
+            "KIMI_DIRECT_SOURCE_SUMMARY schema=direct-source-summary-v13"
             " run_binding=%" PRIu64 " case=%s case_epoch=%" PRIu64
             " policy_enabled=%u register_calls=%" PRIu64
             " register_busy_ns=%" PRIu64
@@ -3764,6 +3794,9 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             " graph_all_kernel_flat=%" PRIu64
             " graph_child_or_non_kernel=%" PRIu64
             " graph_incomplete=%" PRIu64
+            " graph_pointer_sized_params=%" PRIu64
+            " graph_allocation_pointer_params=%" PRIu64
+            " graph_allocation_base_params=%" PRIu64
             " ordinary_reader_commands=%" PRIu64
             " ordinary_writer_commands=%" PRIu64
             " ordinary_lifecycle_commands=%" PRIu64
@@ -3874,6 +3907,9 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             ct2d->paired_case.graph_all_kernel_flat,
             ct2d->paired_case.graph_child_or_non_kernel,
             ct2d->paired_case.graph_incomplete,
+            ct2d->paired_case.graph_pointer_sized_params,
+            ct2d->paired_case.graph_allocation_pointer_params,
+            ct2d->paired_case.graph_allocation_base_params,
             opcode_summary.reader_commands, opcode_summary.writer_commands,
             opcode_summary.lifecycle_commands,
             opcode_summary.no_change_commands,
@@ -7880,6 +7916,8 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                     break;
                 }
                 args[i] = ct2d->gpu_cmd.data + layout->offsets[i];
+                cxl_type2_cuda_observe_graph_param(
+                    ct2d, args[i], layout->sizes[i]);
             }
             if (ct2d->gpu_cmd.cmd_result != CXL_GPU_SUCCESS) {
                 break;

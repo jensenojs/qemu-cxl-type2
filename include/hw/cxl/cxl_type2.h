@@ -544,6 +544,9 @@ typedef struct CXLType2State {
         uint64_t graph_all_kernel_flat;
         uint64_t graph_child_or_non_kernel;
         uint64_t graph_incomplete;
+        uint64_t graph_pointer_sized_params;
+        uint64_t graph_allocation_pointer_params;
+        uint64_t graph_allocation_base_params;
         CXLType2CudaClassifierStatus classifier_status;
         CXLType2CudaRejectionReason first_rejection_reason;
         uint32_t first_rejection_command;
