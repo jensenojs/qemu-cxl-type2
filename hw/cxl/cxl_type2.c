@@ -2959,6 +2959,52 @@ static bool cxl_type2_cuda_counter_can_add(uint64_t value, uint64_t addend)
     return value <= UINT64_MAX - addend;
 }
 
+static void cxl_type2_cuda_classify_graph(CXLType2State *ct2d,
+                                          HetGPUGraph graph)
+{
+    HetGPUState *hetgpu = &ct2d->gpu_info.hetgpu_state;
+    g_autofree HetGPUGraphNode *nodes = NULL;
+    size_t count = 0;
+
+    ct2d->paired_case.graph_exec_observed++;
+    if (hetgpu_cuda_graph_get_nodes(hetgpu, graph, NULL, &count) !=
+            CXL_GPU_SUCCESS ||
+        !count) {
+        goto incomplete;
+    }
+    nodes = g_try_new(HetGPUGraphNode, count);
+    if (!nodes || hetgpu_cuda_graph_get_nodes(hetgpu, graph, nodes, &count) !=
+                      CXL_GPU_SUCCESS ||
+        !count) {
+        goto incomplete;
+    }
+    for (size_t i = 0; i < count; i++) {
+        int node_type = -1;
+
+        if (hetgpu_cuda_graph_node_get_type(hetgpu, nodes[i], &node_type) !=
+            CXL_GPU_SUCCESS) {
+            goto incomplete;
+        }
+        if (node_type != 0) {
+            ct2d->paired_case.graph_child_or_non_kernel++;
+            cxl_type2_cuda_classifier_reject(
+                ct2d, CXL_TYPE2_CUDA_CLASSIFIER_UNAVAILABLE,
+                CXL_TYPE2_CUDA_REJECTION_GRAPH_NON_KERNEL,
+                CXL_GPU_CMD_GRAPH_INSTANTIATE, true);
+            return;
+        }
+    }
+    ct2d->paired_case.graph_all_kernel_flat++;
+    return;
+
+incomplete:
+    ct2d->paired_case.graph_incomplete++;
+    cxl_type2_cuda_classifier_reject(
+        ct2d, CXL_TYPE2_CUDA_CLASSIFIER_UNAVAILABLE,
+        CXL_TYPE2_CUDA_REJECTION_GRAPH_INCOMPLETE,
+        CXL_GPU_CMD_GRAPH_INSTANTIATE, true);
+}
+
 static CXLType2CudaCoverageKind cxl_type2_cuda_record_coverage(
     CXLType2State *ct2d, const uint64_t *destinations,
     const size_t *sizes, size_t count, uint64_t *classified_bytes)
@@ -8079,6 +8125,10 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 ct2d->gpu_cmd.graph_execs[graph_exec_id] = graph_exec;
                 ct2d->gpu_cmd.results[0] = graph_exec_id;
                 ct2d->gpu_cmd.num_graph_execs++;
+                if (ct2d->paired_case.active_case != CXL_GPU_CASE_NONE) {
+                    cxl_type2_cuda_classify_graph(
+                        ct2d, ct2d->gpu_cmd.graphs[graph_id_raw]);
+                }
             }
         }
         break;
@@ -9556,16 +9606,6 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
     }
 
 complete:
-    if (ct2d->paired_case.active_case != CXL_GPU_CASE_NONE &&
-        cmd == CXL_GPU_CMD_GRAPH_INSTANTIATE &&
-        ct2d->gpu_cmd.cmd_result == CXL_GPU_SUCCESS) {
-        ct2d->paired_case.graph_exec_observed++;
-        ct2d->paired_case.graph_incomplete++;
-        cxl_type2_cuda_classifier_reject(
-            ct2d, CXL_TYPE2_CUDA_CLASSIFIER_UNAVAILABLE,
-            CXL_TYPE2_CUDA_REJECTION_GRAPH_INCOMPLETE,
-            CXL_GPU_CMD_GRAPH_INSTANTIATE, true);
-    }
     if (cmd == CXL_GPU_CMD_STREAM_SYNC &&
         ct2d->gpu_cmd.cmd_result == CXL_GPU_SUCCESS) {
         ct2d->paired_case.last_command_was_successful_stream_sync = true;
