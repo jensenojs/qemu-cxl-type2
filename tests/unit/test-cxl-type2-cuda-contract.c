@@ -16,12 +16,9 @@ typedef struct CoherentUnmapCounter {
     unsigned int synchronize_calls;
     unsigned int htod_calls_queries;
     unsigned int unregister_calls;
-    unsigned int pointer_queries;
     int synchronize_result;
     uint64_t htod_calls;
     int unregister_result;
-    int query_result;
-    uint64_t queried_alias;
 } CoherentUnmapCounter;
 
 static int coherent_unmap_synchronize(void *opaque)
@@ -48,32 +45,20 @@ static int coherent_unmap_unregister(void *opaque)
     return counter->unregister_result;
 }
 
-static int coherent_unmap_query(void *opaque, uint64_t device_alias)
-{
-    CoherentUnmapCounter *counter = opaque;
-
-    counter->pointer_queries++;
-    counter->queried_alias = device_alias;
-    return counter->query_result;
-}
-
 static const CXLType2CoherentUnmapOps coherent_unmap_ops = {
     .synchronize = coherent_unmap_synchronize,
     .htod_calls = coherent_unmap_htod_calls,
     .unregister_host = coherent_unmap_unregister,
-    .query_memory_type = coherent_unmap_query,
 };
 
 static int run_coherent_unmap(CoherentUnmapCounter *counter,
                               bool host_registered, uint64_t stored_alias,
                               uint64_t requested_alias, uint64_t calls_at_map,
-                              uint64_t *htod_delta, int *query_status,
-                              bool *mapping_invalidated)
+                              uint64_t *htod_delta, bool *mapping_invalidated)
 {
     return cxl_type2_coherent_unmap_execute(
         host_registered, stored_alias, requested_alias, calls_at_map,
-        &coherent_unmap_ops, counter, htod_delta, query_status,
-        mapping_invalidated);
+        &coherent_unmap_ops, counter, htod_delta, mapping_invalidated);
 }
 
 static uint8_t *valid_batch_payload(uint64_t *payload_bytes)
@@ -903,67 +888,25 @@ static void test_per_thread_stream_uses_stable_qemu_handle(void)
         CXL_GPU_STREAM_WIRE_PER_THREAD, NULL, &stream));
 }
 
-static void test_coherent_unmap_accepts_exact_invalid_value(void)
+static void test_coherent_unmap_unregisters_exact_mapping(void)
 {
     const uint64_t alias = UINT64_C(0x12340000);
     CoherentUnmapCounter counter = {
         .synchronize_result = CXL_GPU_SUCCESS,
         .htod_calls = 17,
         .unregister_result = CXL_GPU_SUCCESS,
-        .query_result = CXL_GPU_ERROR_INVALID_VALUE,
     };
     uint64_t htod_delta = UINT64_MAX;
-    int query_status = CXL_GPU_ERROR_UNKNOWN;
     bool invalidated = false;
 
     g_assert_cmpint(run_coherent_unmap(&counter, true, alias, alias, 17,
-                                       &htod_delta, &query_status,
-                                       &invalidated),
+                                       &htod_delta, &invalidated),
                     ==, CXL_GPU_SUCCESS);
     g_assert_cmpuint(htod_delta, ==, 0);
-    g_assert_cmpint(query_status, ==, CXL_GPU_ERROR_INVALID_VALUE);
     g_assert_true(invalidated);
     g_assert_cmpuint(counter.synchronize_calls, ==, 1);
     g_assert_cmpuint(counter.htod_calls_queries, ==, 1);
     g_assert_cmpuint(counter.unregister_calls, ==, 1);
-    g_assert_cmpuint(counter.pointer_queries, ==, 1);
-    g_assert_cmphex(counter.queried_alias, ==, alias);
-}
-
-static void test_coherent_unmap_rejects_other_query_results(void)
-{
-    const uint64_t alias = UINT64_C(0x12340000);
-    const int query_results[] = {
-        CXL_GPU_SUCCESS,
-        CXL_GPU_ERROR_INVALID_CONTEXT,
-        CXL_GPU_ERROR_UNKNOWN,
-    };
-    const int expected_results[] = {
-        CXL_GPU_ERROR_INVALID_VALUE,
-        CXL_GPU_ERROR_INVALID_CONTEXT,
-        CXL_GPU_ERROR_UNKNOWN,
-    };
-
-    for (size_t i = 0; i < G_N_ELEMENTS(query_results); i++) {
-        CoherentUnmapCounter counter = {
-            .synchronize_result = CXL_GPU_SUCCESS,
-            .htod_calls = 17,
-            .unregister_result = CXL_GPU_SUCCESS,
-            .query_result = query_results[i],
-        };
-        uint64_t htod_delta = UINT64_MAX;
-        int query_status = CXL_GPU_ERROR_UNKNOWN;
-        bool invalidated = false;
-
-        g_assert_cmpint(run_coherent_unmap(&counter, true, alias, alias, 17,
-                                           &htod_delta, &query_status,
-                                           &invalidated),
-                        ==, expected_results[i]);
-        g_assert_cmpint(query_status, ==, query_results[i]);
-        g_assert_true(invalidated);
-        g_assert_cmpuint(counter.unregister_calls, ==, 1);
-        g_assert_cmpuint(counter.pointer_queries, ==, 1);
-    }
 }
 
 static void test_coherent_unmap_rejects_identity_before_driver(void)
@@ -971,26 +914,21 @@ static void test_coherent_unmap_rejects_identity_before_driver(void)
     const uint64_t alias = UINT64_C(0x12340000);
     CoherentUnmapCounter counter = { 0 };
     uint64_t htod_delta = UINT64_MAX;
-    int query_status = CXL_GPU_SUCCESS;
     bool invalidated = true;
 
     g_assert_cmpint(run_coherent_unmap(&counter, true, alias, alias + 1, 0,
-                                       &htod_delta, &query_status,
-                                       &invalidated),
+                                       &htod_delta, &invalidated),
                     ==, CXL_GPU_ERROR_INVALID_VALUE);
     g_assert_false(invalidated);
     g_assert_cmpuint(counter.synchronize_calls, ==, 0);
     g_assert_cmpuint(counter.unregister_calls, ==, 0);
-    g_assert_cmpuint(counter.pointer_queries, ==, 0);
 
     g_assert_cmpint(run_coherent_unmap(&counter, false, 0, alias, 0,
-                                       &htod_delta, &query_status,
-                                       &invalidated),
+                                       &htod_delta, &invalidated),
                     ==, CXL_GPU_ERROR_INVALID_VALUE);
     g_assert_false(invalidated);
     g_assert_cmpuint(counter.synchronize_calls, ==, 0);
     g_assert_cmpuint(counter.unregister_calls, ==, 0);
-    g_assert_cmpuint(counter.pointer_queries, ==, 0);
 }
 
 static void test_coherent_unmap_preserves_mapping_before_unregister(void)
@@ -1000,12 +938,10 @@ static void test_coherent_unmap_preserves_mapping_before_unregister(void)
         .synchronize_result = CXL_GPU_ERROR_UNKNOWN,
     };
     uint64_t htod_delta;
-    int query_status;
     bool invalidated;
 
     g_assert_cmpint(run_coherent_unmap(&counter, true, alias, alias, 17,
-                                       &htod_delta, &query_status,
-                                       &invalidated),
+                                       &htod_delta, &invalidated),
                     ==, CXL_GPU_ERROR_UNKNOWN);
     g_assert_false(invalidated);
     g_assert_cmpuint(counter.unregister_calls, ==, 0);
@@ -1015,8 +951,7 @@ static void test_coherent_unmap_preserves_mapping_before_unregister(void)
         .htod_calls = 18,
     };
     g_assert_cmpint(run_coherent_unmap(&counter, true, alias, alias, 17,
-                                       &htod_delta, &query_status,
-                                       &invalidated),
+                                       &htod_delta, &invalidated),
                     ==, CXL_GPU_ERROR_INVALID_VALUE);
     g_assert_false(invalidated);
     g_assert_cmpuint(counter.unregister_calls, ==, 0);
@@ -1027,12 +962,10 @@ static void test_coherent_unmap_preserves_mapping_before_unregister(void)
         .unregister_result = CXL_GPU_ERROR_INVALID_VALUE,
     };
     g_assert_cmpint(run_coherent_unmap(&counter, true, alias, alias, 17,
-                                       &htod_delta, &query_status,
-                                       &invalidated),
+                                       &htod_delta, &invalidated),
                     ==, CXL_GPU_ERROR_INVALID_VALUE);
     g_assert_false(invalidated);
     g_assert_cmpuint(counter.unregister_calls, ==, 1);
-    g_assert_cmpuint(counter.pointer_queries, ==, 0);
 }
 
 int main(int argc, char **argv)
@@ -1100,10 +1033,8 @@ int main(int argc, char **argv)
                     test_stream_sync_reason_protocol_boundary);
     g_test_add_func("/cxl/type2/stream/per-thread-stable-handle",
                     test_per_thread_stream_uses_stable_qemu_handle);
-    g_test_add_func("/cxl/type2/coherent-unmap/exact-invalid-value",
-                    test_coherent_unmap_accepts_exact_invalid_value);
-    g_test_add_func("/cxl/type2/coherent-unmap/query-errors",
-                    test_coherent_unmap_rejects_other_query_results);
+    g_test_add_func("/cxl/type2/coherent-unmap/exact-mapping",
+                    test_coherent_unmap_unregisters_exact_mapping);
     g_test_add_func("/cxl/type2/coherent-unmap/identity",
                     test_coherent_unmap_rejects_identity_before_driver);
     g_test_add_func("/cxl/type2/coherent-unmap/pre-unregister-failures",
