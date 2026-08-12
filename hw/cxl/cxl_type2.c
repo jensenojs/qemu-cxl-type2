@@ -2959,9 +2959,9 @@ static bool cxl_type2_cuda_counter_can_add(uint64_t value, uint64_t addend)
     return value <= UINT64_MAX - addend;
 }
 
-static void cxl_type2_cuda_record_coverage(
+static CXLType2CudaCoverageKind cxl_type2_cuda_record_coverage(
     CXLType2State *ct2d, const uint64_t *destinations,
-    const size_t *sizes, size_t count)
+    const size_t *sizes, size_t count, uint64_t *classified_bytes)
 {
     CXLType2CudaCoverageResult result;
     uint64_t *batches;
@@ -2969,6 +2969,9 @@ static void cxl_type2_cuda_record_coverage(
 
     cxl_type2_cuda_destination_union_classify(
         &ct2d->cuda_allocations, destinations, sizes, count, &result);
+    if (classified_bytes) {
+        *classified_bytes = result.bytes;
+    }
     switch (result.kind) {
     case CXL_TYPE2_CUDA_COVERAGE_WHOLE:
         batches = &ct2d->paired_case.allocation_whole_batches;
@@ -2999,7 +3002,7 @@ static void cxl_type2_cuda_record_coverage(
             ct2d, CXL_TYPE2_CUDA_CLASSIFIER_CONTRADICTED,
             CXL_TYPE2_CUDA_REJECTION_DESTINATION_OVERFLOW,
             CXL_GPU_CMD_SOURCE_REGISTER_BATCH_HTOD_DIRECT_ASYNC, true);
-        return;
+        return result.kind;
     }
     ct2d->paired_case.allocation_classified_batches++;
     ct2d->paired_case.allocation_classified_bytes += result.bytes;
@@ -3014,6 +3017,7 @@ static void cxl_type2_cuda_record_coverage(
             ct2d, ct2d->paired_case.classifier_status, result.reason,
             CXL_GPU_CMD_SOURCE_REGISTER_BATCH_HTOD_DIRECT_ASYNC, true);
     }
+    return result.kind;
 }
 
 static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
@@ -3117,6 +3121,8 @@ static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
     ct2d->paired_case.allocation_classified_bytes = 0;
     ct2d->paired_case.allocation_whole_batches = 0;
     ct2d->paired_case.allocation_whole_bytes = 0;
+    ct2d->paired_case.allocation_whole_single_span_batches = 0;
+    ct2d->paired_case.allocation_whole_single_span_bytes = 0;
     ct2d->paired_case.allocation_partial_batches = 0;
     ct2d->paired_case.allocation_partial_bytes = 0;
     ct2d->paired_case.allocation_cross_batches = 0;
@@ -3620,7 +3626,7 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             live_registration_groups++;
         }
         qemu_log(
-            "KIMI_DIRECT_SOURCE_SUMMARY schema=direct-source-summary-v11"
+            "KIMI_DIRECT_SOURCE_SUMMARY schema=direct-source-summary-v12"
             " run_binding=%" PRIu64 " case=%s case_epoch=%" PRIu64
             " policy_enabled=%u register_calls=%" PRIu64
             " register_busy_ns=%" PRIu64
@@ -3700,6 +3706,8 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             " allocation_classified_bytes=%" PRIu64
             " allocation_whole_batches=%" PRIu64
             " allocation_whole_bytes=%" PRIu64
+            " allocation_whole_single_span_batches=%" PRIu64
+            " allocation_whole_single_span_bytes=%" PRIu64
             " allocation_partial_batches=%" PRIu64
             " allocation_partial_bytes=%" PRIu64
             " allocation_cross_batches=%" PRIu64
@@ -3808,6 +3816,8 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
             ct2d->paired_case.allocation_classified_bytes,
             ct2d->paired_case.allocation_whole_batches,
             ct2d->paired_case.allocation_whole_bytes,
+            ct2d->paired_case.allocation_whole_single_span_batches,
+            ct2d->paired_case.allocation_whole_single_span_bytes,
             ct2d->paired_case.allocation_partial_batches,
             ct2d->paired_case.allocation_partial_bytes,
             ct2d->paired_case.allocation_cross_batches,
@@ -5467,8 +5477,21 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
         goto out;
     }
     if (source_override && logical_destinations) {
-        cxl_type2_cuda_record_coverage(
-            ct2d, logical_destinations, logical_sizes, range_count);
+        uint64_t classified_bytes = 0;
+        CXLType2CudaCoverageKind coverage = cxl_type2_cuda_record_coverage(
+            ct2d, logical_destinations, logical_sizes, range_count,
+            &classified_bytes);
+
+        if (coverage == CXL_TYPE2_CUDA_COVERAGE_WHOLE && spans->len == 1 &&
+            cxl_type2_cuda_counter_can_add(
+                ct2d->paired_case.allocation_whole_single_span_batches, 1) &&
+            cxl_type2_cuda_counter_can_add(
+                ct2d->paired_case.allocation_whole_single_span_bytes,
+                classified_bytes)) {
+            ct2d->paired_case.allocation_whole_single_span_batches++;
+            ct2d->paired_case.allocation_whole_single_span_bytes +=
+                classified_bytes;
+        }
     }
     /* Let each ready prefix run while the host registers the next range. */
     for (size_t slice_start = 0, boundary = 0; boundary <= spans->len;

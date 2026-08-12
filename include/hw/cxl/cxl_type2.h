@@ -532,6 +532,8 @@ typedef struct CXLType2State {
         uint64_t allocation_classified_bytes;
         uint64_t allocation_whole_batches;
         uint64_t allocation_whole_bytes;
+        uint64_t allocation_whole_single_span_batches;
+        uint64_t allocation_whole_single_span_bytes;
         uint64_t allocation_partial_batches;
         uint64_t allocation_partial_bytes;
         uint64_t allocation_cross_batches;
