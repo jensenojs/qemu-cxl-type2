@@ -4,7 +4,7 @@
   lfs: false
 
 .qemu-cxl-type2-component-tools: &qemu-cxl-type2-component-tools
-  image: docker.cnb.cool/gevico.online/jensen/cxl-lab@sha256:df9050e0657134935975448d83dbe354b174a13a87e64b2c2991d23cfaa50f15
+  image: docker.cnb.cool/gevico.online/jensen/cxl-lab@sha256:a5b85e57aab3bc711902c2044aae7b3ade87fa18b8ea1f81759995c8924ba26c
   volumes:
     - qemu-cxl-type2-build-cache:/cache/qemu-cxl-type2/ccache:copy-on-write
 
