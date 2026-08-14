@@ -9,14 +9,16 @@ fi
 readonly PAYLOAD=$(realpath "$1")
 readonly EVIDENCE=$2
 readonly QEMU=$PAYLOAD/bin/qemu-system-x86_64
+readonly RUNTIME=$PAYLOAD/lib
 
 [[ -x $QEMU ]]
+[[ -f $RUNTIME/libcapstone.so.4 && -f $RUNTIME/libaio.so.1t64 ]]
 mkdir -p "$EVIDENCE"
-"$QEMU" --version >"$EVIDENCE/version.txt"
-"$QEMU" -device help >"$EVIDENCE/device-help.txt"
+LD_LIBRARY_PATH=$RUNTIME "$QEMU" --version >"$EVIDENCE/version.txt"
+LD_LIBRARY_PATH=$RUNTIME "$QEMU" -device help >"$EVIDENCE/device-help.txt"
 grep -Fq 'cxl-type2' "$EVIDENCE/device-help.txt"
 set +e
-timeout 3 "$QEMU" \
+timeout 3 env LD_LIBRARY_PATH="$RUNTIME" "$QEMU" \
     -accel tcg,thread=multi \
     -cpu max \
     -S \
@@ -35,7 +37,7 @@ set -e
 printf 'paused_boot=pass\n' >"$EVIDENCE/paused-boot.txt"
 file "$QEMU" >"$EVIDENCE/file.txt"
 readelf -d "$QEMU" >"$EVIDENCE/readelf-dynamic.txt"
-ldd "$QEMU" >"$EVIDENCE/ldd.txt"
+LD_LIBRARY_PATH=$RUNTIME ldd "$QEMU" >"$EVIDENCE/ldd.txt"
 if grep -Fq 'not found' "$EVIDENCE/ldd.txt"; then
     printf 'error: unresolved QEMU dynamic dependency\n' >&2
     exit 1

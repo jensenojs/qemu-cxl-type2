@@ -77,7 +77,7 @@ readonly INDEX_HETGPU=$(git -C "$ROOT" ls-files -s subprojects/hetGPU | awk '{pr
 }
 
 mkdir "$WORK" "$PAYLOAD"
-mkdir -p "$BUILD" "$PAYLOAD/bin" "$PAYLOAD/libexec/qemu" "$PAYLOAD/share/qemu" "$PAYLOAD/evidence/cuda-api" "$WORK/evidence"
+mkdir -p "$BUILD" "$PAYLOAD/bin" "$PAYLOAD/lib" "$PAYLOAD/libexec/qemu" "$PAYLOAD/share/qemu" "$PAYLOAD/evidence/cuda-api" "$WORK/evidence"
 
 python3 "$ROOT/tests/test_component_artifact.py"
 ccache --show-stats | tee "$WORK/evidence/ccache-before.txt"
@@ -91,6 +91,14 @@ ccache --show-stats | tee "$WORK/evidence/ccache-after.txt"
 readonly QEMU=$BUILD/qemu-system-x86_64
 [[ -x $QEMU ]]
 install -m 0755 "$QEMU" "$PAYLOAD/bin/qemu-system-x86_64"
+for library in libcapstone.so.4 libaio.so.1t64; do
+    library_path=$(ldconfig -p | awk -v name="$library" '$1 == name { print $NF; exit }')
+    [[ -n $library_path && -f $library_path ]] || {
+        printf 'error: required QEMU runtime library is unavailable: %s\n' "$library" >&2
+        exit 1
+    }
+    install -m 0644 "$library_path" "$PAYLOAD/lib/$library"
+done
 install -m 0755 "$BUILD/contrib/plugins/libhotblocks.so" \
     "$PAYLOAD/libexec/qemu/libhotblocks.so"
 install -m 0644 "$ROOT/hw/cxl/cxl_type2.c" "$PAYLOAD/evidence/cuda-api/cxl_type2.c"

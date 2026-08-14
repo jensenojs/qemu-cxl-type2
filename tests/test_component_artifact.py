@@ -101,6 +101,8 @@ class ComponentArtifactTest(unittest.TestCase):
                     "mode": "0644",
                 },
                 {"path": "bin/qemu-system-x86_64", "type": "file", "mode": "0755"},
+                {"path": "lib/libaio.so.1t64", "type": "file", "mode": "0644"},
+                {"path": "lib/libcapstone.so.4", "type": "file", "mode": "0644"},
                 {"path": "libexec/qemu/libhotblocks.so", "type": "file", "mode": "0755"},
                 {"path": "share/qemu/bios-256k.bin", "type": "file", "mode": "0644"},
                 {"path": "share/qemu/kvmvapic.bin", "type": "file", "mode": "0644"},

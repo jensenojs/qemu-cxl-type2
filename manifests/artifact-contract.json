@@ -16,5 +16,5 @@
   "archive_media_type": "application/vnd.gevico.cxl.component.layer.v1.tar+zstd",
   "manifest_media_type": "application/vnd.gevico.cxl.component.manifest.v1+json",
   "payload_policy": "component-owned-files-only",
-  "runtime_dependencies": "provided-by-consumer-image"
+  "runtime_dependencies": "component-private-libraries-in-payload"
 }
