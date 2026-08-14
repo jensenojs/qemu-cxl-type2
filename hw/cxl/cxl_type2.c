@@ -4974,6 +4974,23 @@ static gint cxl_type2_direct_physical_host_compare(gconstpointer a,
         (uintptr_t)left->host_address, (uintptr_t)right->host_address);
 }
 
+static void cxl_type2_log_direct_source_register_failure(
+    CXLType2State *ct2d, const char *failure_stage, uint64_t failure_index,
+    int result, uint64_t payload_bytes)
+{
+    qemu_log(
+        "KIMI_DIRECT_SOURCE_REGISTER_FAILURE"
+        " schema=direct-source-register-failure-v1"
+        " run_binding=%" PRIu64 " case=%s case_epoch=%" PRIu64
+        " call_id=%" PRIu64 " stage=%s index_valid=%u"
+        " index=%" PRIu64 " result=%d payload_bytes=%" PRIu64 "\n",
+        ct2d->paired_case.run_binding,
+        cxl_type2_paired_case_name(ct2d->paired_case.active_case),
+        ct2d->paired_case.active_epoch, ct2d->gpu_cmd.call_id,
+        failure_stage ? failure_stage : "unknown", failure_index != SIZE_MAX,
+        failure_index == SIZE_MAX ? 0 : failure_index, result, payload_bytes);
+}
+
 static int cxl_type2_direct_source_register(CXLType2State *ct2d,
                                             uint64_t payload_bytes,
                                             uint64_t *source_id_out,
@@ -9457,20 +9474,8 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 ct2d->gpu_cmd.results[0] = source_id;
                 ct2d->paired_case.active_direct_register_calls++;
             } else {
-                qemu_log(
-                    "KIMI_DIRECT_SOURCE_REGISTER_FAILURE"
-                    " schema=direct-source-register-failure-v1"
-                    " run_binding=%" PRIu64 " case=%s case_epoch=%" PRIu64
-                    " call_id=%" PRIu64 " stage=%s index_valid=%u"
-                    " index=%" PRIu64 " result=%d payload_bytes=%" PRIu64
-                    "\n",
-                    ct2d->paired_case.run_binding,
-                    cxl_type2_paired_case_name(
-                        ct2d->paired_case.active_case),
-                    ct2d->paired_case.active_epoch, ct2d->gpu_cmd.call_id,
-                    failure_stage ? failure_stage : "unknown",
-                    failure_index != SIZE_MAX,
-                    failure_index == SIZE_MAX ? 0 : failure_index,
+                cxl_type2_log_direct_source_register_failure(
+                    ct2d, failure_stage, failure_index,
                     ct2d->gpu_cmd.cmd_result, ct2d->gpu_cmd.params[0]);
             }
         }
@@ -9516,6 +9521,9 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 ct2d, register_bytes, &source_id, &failure_stage, &fail_idx);
             if (ct2d->gpu_cmd.cmd_result != CXL_GPU_SUCCESS) {
                 ct2d->gpu_cmd.results[0] = fail_idx;
+                cxl_type2_log_direct_source_register_failure(
+                    ct2d, failure_stage, fail_idx,
+                    ct2d->gpu_cmd.cmd_result, register_bytes);
                 break;
             }
             CXLType2DirectSource *source = cxl_type2_direct_source_find(
