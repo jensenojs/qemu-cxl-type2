@@ -126,13 +126,60 @@ typedef struct CXLType2CudaAllocation {
     bool dax_backed;
 } CXLType2CudaAllocation;
 
+typedef enum CXLType2CudaGenerationBoundary {
+    CXL_TYPE2_CUDA_GENERATION_OPEN,
+    CXL_TYPE2_CUDA_GENERATION_POPULATION,
+    CXL_TYPE2_CUDA_GENERATION_RELEASE,
+} CXLType2CudaGenerationBoundary;
+
+typedef struct CXLType2CudaGenerationRecord {
+    uint64_t allocation_base;
+    uint64_t epoch;
+    uint64_t generation;
+    uint64_t unique_visible_population_bytes;
+    uint64_t direct_consumer_count;
+    uint64_t gpu_local_consumer_count;
+    uint64_t prefetch_count;
+    uint64_t prefetch_requested_bytes;
+    uint64_t prefetch_enqueue_wall_ns;
+    uint64_t promotion_count;
+    uint64_t promotion_bytes;
+    uint64_t promotion_wall_ns;
+    uint64_t first_consumer_call_id;
+    uint64_t last_consumer_call_id;
+    uint32_t first_consumer_opcode;
+    uint32_t last_consumer_opcode;
+    bool file_backed_system_uva;
+    bool consumer_observed;
+    bool prefetch_completion_available;
+    CXLType2CudaGenerationBoundary next_boundary;
+} CXLType2CudaGenerationRecord;
+
+typedef struct CXLType2CudaPopulationInterval {
+    size_t generation_index;
+    uint64_t begin;
+    uint64_t end;
+} CXLType2CudaPopulationInterval;
+
+typedef struct CXLType2CudaAllocationIdentity {
+    uint64_t base;
+    uint64_t epoch;
+} CXLType2CudaAllocationIdentity;
+
 typedef struct CXLType2CudaAllocationTable {
     CXLType2CudaAllocation *entries;
     size_t count;
     size_t capacity;
     size_t peak_count;
     uint64_t next_epoch;
+    CXLType2CudaGenerationRecord *generations;
+    size_t generation_count;
+    size_t generation_capacity;
+    CXLType2CudaPopulationInterval *population_intervals;
+    size_t population_interval_count;
+    size_t population_interval_capacity;
     bool available;
+    const char *first_generation_error;
 } CXLType2CudaAllocationTable;
 
 typedef enum CXLType2CudaCoverageKind {
@@ -216,6 +263,22 @@ bool cxl_type2_cuda_allocation_release_alias(
 bool cxl_type2_cuda_allocation_materialize(
     CXLType2CudaAllocationTable *table, uint64_t base, uint64_t epoch,
     uint64_t generation);
+bool cxl_type2_cuda_generation_population_complete(
+    CXLType2CudaAllocationTable *table, uint64_t destination, uint64_t size);
+bool cxl_type2_cuda_generation_consume(
+    CXLType2CudaAllocationTable *table,
+    const CXLType2CudaAllocationIdentity *identities, size_t count,
+    uint32_t opcode, uint64_t call_id);
+bool cxl_type2_cuda_generation_prefetch_enqueue(
+    CXLType2CudaAllocationTable *table, uint64_t address, uint64_t size,
+    uint64_t enqueue_wall_ns);
+bool cxl_type2_cuda_generation_release(CXLType2CudaAllocationTable *table,
+                                       uint64_t base);
+bool cxl_type2_cuda_allocation_identity_for_address(
+    const CXLType2CudaAllocationTable *table, uint64_t address,
+    CXLType2CudaAllocationIdentity *identity);
+const char *cxl_type2_cuda_generation_boundary_name(
+    CXLType2CudaGenerationBoundary boundary);
 void cxl_type2_cuda_destination_union_classify(
     const CXLType2CudaAllocationTable *table,
     const uint64_t *destinations, const size_t *sizes, size_t count,

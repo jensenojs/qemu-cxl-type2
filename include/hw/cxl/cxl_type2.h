@@ -435,6 +435,8 @@ typedef struct CXLType2State {
     uint64_t next_direct_source_id;
     bool direct_source_poisoned;
     CXLType2CudaAllocationTable cuda_allocations;
+    GPtrArray *graph_exec_generation_consumers;
+    const char *generation_reuse_error;
 
     struct {
         bool required;

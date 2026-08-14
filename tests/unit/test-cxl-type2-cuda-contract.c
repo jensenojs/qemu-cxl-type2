@@ -650,6 +650,61 @@ static void test_cuda_allocation_alias_lifecycle(void)
     cxl_type2_cuda_allocation_table_destroy(&table);
 }
 
+static void test_cuda_generation_reuse_lifecycle(void)
+{
+    CXLType2CudaAllocationTable table;
+    CXLType2CudaAllocationIdentity duplicate_refs[2];
+    uint64_t epoch = 0;
+
+    cxl_type2_cuda_allocation_table_init(&table);
+    g_assert_true(cxl_type2_cuda_allocation_record(
+        &table, 0x1000, 0x1000, &epoch));
+    duplicate_refs[0] = (CXLType2CudaAllocationIdentity) {
+        .base = 0x1000,
+        .epoch = epoch,
+    };
+    duplicate_refs[1] = duplicate_refs[0];
+
+    g_assert_true(cxl_type2_cuda_generation_population_complete(
+        &table, 0x1000, 0x800));
+    g_assert_true(cxl_type2_cuda_generation_population_complete(
+        &table, 0x1400, 0x800));
+    g_assert_cmpuint(table.generation_count, ==, 1);
+    g_assert_cmpuint(table.generations[0].unique_visible_population_bytes,
+                     ==, 0xc00);
+    g_assert_true(cxl_type2_cuda_generation_consume(
+        &table, duplicate_refs, G_N_ELEMENTS(duplicate_refs),
+        CXL_GPU_CMD_LAUNCH_KERNEL, 17));
+    g_assert_cmpuint(table.generations[0].gpu_local_consumer_count, ==, 1);
+    g_assert_cmpuint(table.generations[0].first_consumer_call_id, ==, 17);
+
+    g_assert_true(cxl_type2_cuda_generation_population_complete(
+        &table, 0x1800, 0x400));
+    g_assert_cmpuint(table.generation_count, ==, 2);
+    g_assert_cmpint(table.generations[0].next_boundary, ==,
+                    CXL_TYPE2_CUDA_GENERATION_POPULATION);
+    g_assert_cmpuint(table.generations[1].generation, ==, 2);
+    g_assert_cmpuint(table.generations[1].unique_visible_population_bytes,
+                     ==, 0x400);
+    g_assert_true(cxl_type2_cuda_generation_prefetch_enqueue(
+        &table, 0x1800, 0x200, 31));
+    g_assert_cmpuint(table.generations[1].prefetch_count, ==, 1);
+    g_assert_false(table.generations[1].prefetch_completion_available);
+
+    g_assert_true(cxl_type2_cuda_allocation_forget(&table, 0x1000));
+    g_assert_cmpint(table.generations[1].next_boundary, ==,
+                    CXL_TYPE2_CUDA_GENERATION_RELEASE);
+    g_assert_cmpstr(cxl_type2_cuda_generation_boundary_name(
+                        table.generations[1].next_boundary),
+                    ==, "release");
+    g_assert_false(cxl_type2_cuda_generation_population_complete(
+        &table, 0x1800, 0x1000));
+    g_assert_false(table.available);
+    g_assert_cmpstr(table.first_generation_error, ==,
+                    "population-allocation-missing");
+    cxl_type2_cuda_allocation_table_destroy(&table);
+}
+
 static void test_cuda_destination_union_coverage(void)
 {
     CXLType2CudaAllocationTable table;
@@ -1013,6 +1068,8 @@ int main(int argc, char **argv)
                     test_cuda_allocation_rejects_invalid_state);
     g_test_add_func("/cxl/type2/direct/allocation-alias-lifecycle",
                     test_cuda_allocation_alias_lifecycle);
+    g_test_add_func("/cxl/type2/direct/generation-reuse-lifecycle",
+                    test_cuda_generation_reuse_lifecycle);
     g_test_add_func("/cxl/type2/direct/destination-union-coverage",
                     test_cuda_destination_union_coverage);
     g_test_add_func("/cxl/type2/direct/generated-command-roles",

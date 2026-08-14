@@ -344,7 +344,10 @@ void cxl_type2_cuda_allocation_table_reset(
     table->count = 0;
     table->peak_count = 0;
     table->next_epoch = 1;
+    table->generation_count = 0;
+    table->population_interval_count = 0;
     table->available = true;
+    table->first_generation_error = NULL;
 }
 
 void cxl_type2_cuda_allocation_table_destroy(
@@ -354,7 +357,171 @@ void cxl_type2_cuda_allocation_table_destroy(
         return;
     }
     g_free(table->entries);
+    g_free(table->generations);
+    g_free(table->population_intervals);
     memset(table, 0, sizeof(*table));
+}
+
+static CXLType2CudaAllocation *cxl_type2_cuda_allocation_containing(
+    CXLType2CudaAllocationTable *table, uint64_t address, uint64_t size)
+{
+    size_t position;
+
+    if (!table || !table->available || !size || address > UINT64_MAX - size) {
+        return NULL;
+    }
+    position = cxl_type2_cuda_allocation_lower_bound(table, address);
+    if (position < table->count && table->entries[position].base == address) {
+        CXLType2CudaAllocation *allocation = &table->entries[position];
+
+        return size <= allocation->size ? allocation : NULL;
+    }
+    if (!position) {
+        return NULL;
+    }
+    CXLType2CudaAllocation *allocation = &table->entries[position - 1];
+
+    return address >= allocation->base &&
+           address - allocation->base <= allocation->size &&
+           size <= allocation->size - (address - allocation->base)
+               ? allocation
+               : NULL;
+}
+
+static void cxl_type2_cuda_generation_fail(
+    CXLType2CudaAllocationTable *table, const char *reason)
+{
+    table->available = false;
+    if (!table->first_generation_error) {
+        table->first_generation_error = reason;
+    }
+}
+
+static CXLType2CudaGenerationRecord *cxl_type2_cuda_generation_current(
+    CXLType2CudaAllocationTable *table, CXLType2CudaAllocation *allocation,
+    bool population)
+{
+    CXLType2CudaGenerationRecord *record = NULL;
+    CXLType2CudaGenerationRecord *resized;
+    size_t capacity;
+    uint64_t next_generation = 1;
+
+    for (size_t i = table->generation_count; i > 0; i--) {
+        CXLType2CudaGenerationRecord *candidate = &table->generations[i - 1];
+
+        if (candidate->allocation_base != allocation->base ||
+            candidate->epoch != allocation->epoch) {
+            continue;
+        }
+        next_generation = candidate->generation + 1;
+        if (candidate->next_boundary == CXL_TYPE2_CUDA_GENERATION_OPEN) {
+            record = candidate;
+        }
+        break;
+    }
+    if (record && (!population || (!record->consumer_observed &&
+                                    record->prefetch_count == 0))) {
+        record->file_backed_system_uva = allocation->dax_backed;
+        return record;
+    }
+    if (record) {
+        record->next_boundary = CXL_TYPE2_CUDA_GENERATION_POPULATION;
+    }
+    if (next_generation == 0) {
+        cxl_type2_cuda_generation_fail(table, "generation-overflow");
+        return NULL;
+    }
+    if (table->generation_count == table->generation_capacity) {
+        capacity = table->generation_capacity
+                       ? table->generation_capacity * 2
+                       : 16;
+        if (capacity < table->generation_capacity ||
+            capacity > SIZE_MAX / sizeof(*table->generations)) {
+            cxl_type2_cuda_generation_fail(table,
+                                           "generation-capacity-overflow");
+            return NULL;
+        }
+        resized = g_try_realloc_n(table->generations, capacity,
+                                  sizeof(*table->generations));
+        if (!resized) {
+            cxl_type2_cuda_generation_fail(table,
+                                           "generation-allocation-failed");
+            return NULL;
+        }
+        table->generations = resized;
+        table->generation_capacity = capacity;
+    }
+    record = &table->generations[table->generation_count++];
+    *record = (CXLType2CudaGenerationRecord) {
+        .allocation_base = allocation->base,
+        .epoch = allocation->epoch,
+        .generation = next_generation,
+        .file_backed_system_uva = allocation->dax_backed,
+        .prefetch_completion_available = true,
+        .next_boundary = CXL_TYPE2_CUDA_GENERATION_OPEN,
+    };
+    return record;
+}
+
+static bool cxl_type2_cuda_population_interval_add(
+    CXLType2CudaAllocationTable *table, size_t generation_index,
+    uint64_t begin, uint64_t end)
+{
+    CXLType2CudaGenerationRecord *record =
+        &table->generations[generation_index];
+    uint64_t merged_begin = begin;
+    uint64_t merged_end = end;
+    size_t index = 0;
+
+    while (index < table->population_interval_count) {
+        CXLType2CudaPopulationInterval *interval =
+            &table->population_intervals[index];
+
+        if (interval->generation_index != generation_index ||
+            interval->end < merged_begin || merged_end < interval->begin) {
+            index++;
+            continue;
+        }
+        merged_begin = MIN(merged_begin, interval->begin);
+        merged_end = MAX(merged_end, interval->end);
+        record->unique_visible_population_bytes -=
+            interval->end - interval->begin;
+        memmove(interval, interval + 1,
+                (table->population_interval_count - index - 1) *
+                    sizeof(*interval));
+        table->population_interval_count--;
+    }
+    if (table->population_interval_count ==
+        table->population_interval_capacity) {
+        size_t capacity = table->population_interval_capacity
+                              ? table->population_interval_capacity * 2
+                              : 16;
+        CXLType2CudaPopulationInterval *resized;
+
+        if (capacity < table->population_interval_capacity ||
+            capacity > SIZE_MAX / sizeof(*table->population_intervals)) {
+            cxl_type2_cuda_generation_fail(table,
+                                           "population-capacity-overflow");
+            return false;
+        }
+        resized = g_try_realloc_n(table->population_intervals, capacity,
+                                  sizeof(*table->population_intervals));
+        if (!resized) {
+            cxl_type2_cuda_generation_fail(table,
+                                           "population-allocation-failed");
+            return false;
+        }
+        table->population_intervals = resized;
+        table->population_interval_capacity = capacity;
+    }
+    table->population_intervals[table->population_interval_count++] =
+        (CXLType2CudaPopulationInterval) {
+            .generation_index = generation_index,
+            .begin = merged_begin,
+            .end = merged_end,
+        };
+    record->unique_visible_population_bytes += merged_end - merged_begin;
+    return true;
 }
 
 bool cxl_type2_cuda_allocation_record(CXLType2CudaAllocationTable *table,
@@ -428,6 +595,9 @@ bool cxl_type2_cuda_allocation_forget(CXLType2CudaAllocationTable *table,
     if (table->entries[position].consumer_refs) {
         return false;
     }
+    if (!cxl_type2_cuda_generation_release(table, base)) {
+        return false;
+    }
     memmove(&table->entries[position], &table->entries[position + 1],
             (table->count - position - 1) * sizeof(*table->entries));
     table->count--;
@@ -464,6 +634,15 @@ bool cxl_type2_cuda_allocation_publish_alias(
     allocation->content_generation = generation;
     allocation->device_alias = device_alias;
     allocation->dax_backed = true;
+    for (size_t i = table->generation_count; i > 0; i--) {
+        CXLType2CudaGenerationRecord *record = &table->generations[i - 1];
+
+        if (record->allocation_base == base && record->epoch == epoch &&
+            record->next_boundary == CXL_TYPE2_CUDA_GENERATION_OPEN) {
+            record->file_backed_system_uva = true;
+            break;
+        }
+    }
     return true;
 }
 
@@ -516,6 +695,175 @@ bool cxl_type2_cuda_allocation_materialize(
     allocation->device_alias = 0;
     allocation->dax_backed = false;
     return true;
+}
+
+bool cxl_type2_cuda_generation_population_complete(
+    CXLType2CudaAllocationTable *table, uint64_t destination, uint64_t size)
+{
+    CXLType2CudaAllocation *allocation =
+        cxl_type2_cuda_allocation_containing(table, destination, size);
+    CXLType2CudaGenerationRecord *record;
+    size_t generation_index;
+
+    if (!allocation) {
+        if (table) {
+            cxl_type2_cuda_generation_fail(table,
+                                           "population-allocation-missing");
+        }
+        return false;
+    }
+    record = cxl_type2_cuda_generation_current(table, allocation, true);
+    if (!record) {
+        return false;
+    }
+    generation_index = record - table->generations;
+    return cxl_type2_cuda_population_interval_add(
+        table, generation_index, destination - allocation->base,
+        destination - allocation->base + size);
+}
+
+bool cxl_type2_cuda_allocation_identity_for_address(
+    const CXLType2CudaAllocationTable *table, uint64_t address,
+    CXLType2CudaAllocationIdentity *identity)
+{
+    CXLType2CudaAllocation *allocation;
+
+    if (!identity) {
+        return false;
+    }
+    allocation = cxl_type2_cuda_allocation_containing(
+        (CXLType2CudaAllocationTable *)table, address, 1);
+    if (!allocation) {
+        return false;
+    }
+    *identity = (CXLType2CudaAllocationIdentity) {
+        .base = allocation->base,
+        .epoch = allocation->epoch,
+    };
+    return true;
+}
+
+bool cxl_type2_cuda_generation_consume(
+    CXLType2CudaAllocationTable *table,
+    const CXLType2CudaAllocationIdentity *identities, size_t count,
+    uint32_t opcode, uint64_t call_id)
+{
+    for (size_t i = 0; i < count; i++) {
+        CXLType2CudaAllocation *allocation;
+        CXLType2CudaGenerationRecord *record;
+        bool duplicate = false;
+
+        for (size_t j = 0; j < i; j++) {
+            if (identities[j].base == identities[i].base &&
+                identities[j].epoch == identities[i].epoch) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            continue;
+        }
+        allocation = cxl_type2_cuda_allocation_find(
+            table, identities[i].base, identities[i].epoch);
+        if (!allocation) {
+            cxl_type2_cuda_generation_fail(table,
+                                           "consumer-allocation-missing");
+            return false;
+        }
+        record = cxl_type2_cuda_generation_current(table, allocation, false);
+        if (!record ||
+            (allocation->dax_backed
+                 ? record->direct_consumer_count == UINT64_MAX
+                 : record->gpu_local_consumer_count == UINT64_MAX)) {
+            cxl_type2_cuda_generation_fail(table, "consumer-count-overflow");
+            return false;
+        }
+        if (allocation->dax_backed) {
+            record->direct_consumer_count++;
+        } else {
+            record->gpu_local_consumer_count++;
+        }
+        if (!record->consumer_observed) {
+            record->first_consumer_opcode = opcode;
+            record->first_consumer_call_id = call_id;
+            record->consumer_observed = true;
+        }
+        record->last_consumer_opcode = opcode;
+        record->last_consumer_call_id = call_id;
+    }
+    return true;
+}
+
+bool cxl_type2_cuda_generation_prefetch_enqueue(
+    CXLType2CudaAllocationTable *table, uint64_t address, uint64_t size,
+    uint64_t enqueue_wall_ns)
+{
+    CXLType2CudaAllocation *allocation =
+        cxl_type2_cuda_allocation_containing(table, address, size);
+    CXLType2CudaGenerationRecord *record;
+
+    if (!allocation) {
+        if (table) {
+            cxl_type2_cuda_generation_fail(table,
+                                           "prefetch-allocation-missing");
+        }
+        return false;
+    }
+    record = cxl_type2_cuda_generation_current(table, allocation, false);
+    if (!record || record->prefetch_count == UINT64_MAX ||
+        record->prefetch_requested_bytes > UINT64_MAX - size ||
+        record->prefetch_enqueue_wall_ns > UINT64_MAX - enqueue_wall_ns) {
+        cxl_type2_cuda_generation_fail(table, "prefetch-cost-overflow");
+        return false;
+    }
+    record->prefetch_count++;
+    record->prefetch_requested_bytes += size;
+    record->prefetch_enqueue_wall_ns += enqueue_wall_ns;
+    record->prefetch_completion_available = false;
+    return true;
+}
+
+bool cxl_type2_cuda_generation_release(CXLType2CudaAllocationTable *table,
+                                       uint64_t base)
+{
+    size_t position;
+    CXLType2CudaAllocation *allocation;
+
+    if (!table || !table->available) {
+        return false;
+    }
+    position = cxl_type2_cuda_allocation_lower_bound(table, base);
+    if (position == table->count || table->entries[position].base != base) {
+        cxl_type2_cuda_generation_fail(table, "release-allocation-missing");
+        return false;
+    }
+    allocation = &table->entries[position];
+    for (size_t i = table->generation_count; i > 0; i--) {
+        CXLType2CudaGenerationRecord *record = &table->generations[i - 1];
+
+        if (record->allocation_base == allocation->base &&
+            record->epoch == allocation->epoch &&
+            record->next_boundary == CXL_TYPE2_CUDA_GENERATION_OPEN) {
+            record->next_boundary = CXL_TYPE2_CUDA_GENERATION_RELEASE;
+            break;
+        }
+    }
+    return true;
+}
+
+const char *cxl_type2_cuda_generation_boundary_name(
+    CXLType2CudaGenerationBoundary boundary)
+{
+    switch (boundary) {
+    case CXL_TYPE2_CUDA_GENERATION_OPEN:
+        return "open";
+    case CXL_TYPE2_CUDA_GENERATION_POPULATION:
+        return "population";
+    case CXL_TYPE2_CUDA_GENERATION_RELEASE:
+        return "release";
+    default:
+        return "invalid";
+    }
 }
 
 typedef struct CXLType2CudaDestinationRange {
