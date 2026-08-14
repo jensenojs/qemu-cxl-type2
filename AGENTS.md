@@ -21,7 +21,22 @@ cxl-lab binds exact QEMU bytes into one formal run.
 
 本仓把BAR2协议转化为设备状态、命令完成与backend调用。guest shim拥有请求编码，Concordia拥有CUDA/NVIDIA执行语义；QEMU负责这两者之间可观察的设备边界。
 
-项目目标、正确性层级与实时工程入口由`/home/jensen/Projects/cxl-memsim/AGENTS.md`定义。跨组件exact source从`cxl-lab/manifests/sources.lock.json`读取。本机活跃云端组件checkout是`/home/jensen/Projects/cxl-cloud/qemu-cxl-type2/`；`/home/jensen/Projects/qemu-cxl-type2/`保留既有本地构建现场。
+项目目标、正确性层级与实时工程入口由工作区根`AGENTS.md`定义。跨组件exact source从`cxl-lab/manifests/sources.lock.json`读取。默认开发checkout使用`main`；任务确需隔离时才由工作区owner创建linked worktree，文档与合同不得保存机器绝对路径。
+
+## Development Component Boundary
+
+QEMU源码、组件输出和完整实验是三个连续边界：
+
+```text
+source + build-profile
+  -> component build -> payload + manifest
+  -> local component-output or OCI fresh pull
+  -> cxl-lab InputSet -> experiment
+```
+
+artifact contract中的`development_execution`让cxl-lab调用本仓唯一的`run_local_component.sh`。cxl-lab提供持久build slot、共享compiler cache与fresh execution；本仓入口串联`build_component.sh`和`package_component.sh`，输出manifest、payload与archive。CNB调用同一build/package owner，再由`publish_component.sh`传输并fresh pull。不得从build slot手抄binary或把其中的可变文件登记为component output。
+
+source commit变化时继续使用同一worktree对应的native build slot，让Meson/Ninja决定增量重建；profile、contract或canonical worktree变化时由cxl-lab派生不同slot。build slot失败保持现场，不删除、不复制、不切换到仓内旧build。local component output或fresh-pulled OCI只证明QEMU payload由声明输入产生并通过组件gate；它不证明guest启动、Type-2 realized、CUDA正确性或TPS。
 
 ## 控制仓回链
 

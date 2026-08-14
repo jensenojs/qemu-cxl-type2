@@ -35,16 +35,33 @@ $:
         - name: build and validate QEMU Type-2
           timeout: 12h
           script: |
-            bash scripts/build_component.sh
+            git submodule update --init --depth 1 subprojects/hetGPU
+            mkdir -p "$PWD/.work/component/native-build" "$PWD/.work/component/outputs"
+            bash scripts/build_component.sh \
+              --profile "$PWD/manifests/build-profile.json" \
+              --build-root "$PWD/.work/component/native-build" \
+              --work-dir "$PWD/.work/component/build" \
+              --cache-dir "$CCACHE_DIR" \
+              --payload-dir "$PWD/.work/component/outputs/payload"
+            bash scripts/package_component.sh \
+              --payload-dir "$PWD/.work/component/outputs/payload" \
+              --source-commit "$(git rev-parse HEAD)" \
+              --work-dir "$PWD/.work/component/package" \
+              --manifest-out "$PWD/.work/component/outputs/manifest.json" \
+              --archive-out "$PWD/.work/component/outputs/component.tar.zst"
         - name: publish QEMU Type-2 component
           script: |
-            bash scripts/publish_component.sh "$PWD/.work/component/payload"
+            bash scripts/publish_component.sh \
+              --manifest "$PWD/.work/component/outputs/manifest.json" \
+              --archive "$PWD/.work/component/outputs/component.tar.zst" \
+              --work-dir "$PWD/.work/component/publish" \
+              --candidate-out "$PWD/.work/component/candidate.json"
         - name: recover and verify published QEMU Type-2 component
           script: |
             bash scripts/pull_component.sh \
               --container-runtime docker \
               --work-dir "$PWD/.work/component/pull" \
-              "$PWD/.work/component/publish/candidate.json" \
+              "$PWD/.work/component/candidate.json" \
               "$PWD/.work/component/verified"
 
   # Pull the candidate artifact by digest into an empty directory and verify every file.

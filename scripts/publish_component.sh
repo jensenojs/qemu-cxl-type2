@@ -1,17 +1,52 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 1 ]]; then
-    printf 'usage: %s PAYLOAD_DIR\n' "$0" >&2
-    exit 2
+usage() {
+    printf 'usage: %s --manifest EXISTING_FILE --archive EXISTING_FILE --work-dir ABSENT_PATH --candidate-out ABSENT_PATH\n' "$0"
+}
+
+if [[ ${1:-} == --help ]]; then usage; exit 0; fi
+if [[ ${1:-} == --hint ]]; then
+    printf 'agent_hint=self=scripts/publish_component.sh\nagent_hint=boundary=pushes verified artifact bytes; does not build or package them\n'
+    exit 0
 fi
 
+manifest_arg= archive_arg= work_arg= candidate_arg=
+while (( $# )); do
+    case "$1" in
+        --manifest|--archive|--work-dir|--candidate-out)
+            (( $# >= 2 )) || { usage >&2; exit 2; }
+            case "$1" in
+                --manifest) manifest_arg=$2 ;;
+                --archive) archive_arg=$2 ;;
+                --work-dir) work_arg=$2 ;;
+                --candidate-out) candidate_arg=$2 ;;
+            esac
+            shift 2 ;;
+        *) usage >&2; exit 2 ;;
+    esac
+done
+[[ -n $manifest_arg && -n $archive_arg && -n $work_arg && -n $candidate_arg ]] || { usage >&2; exit 2; }
+[[ $manifest_arg == /* && $archive_arg == /* && $work_arg == /* && $candidate_arg == /* ]] || { printf 'paths must be absolute\n' >&2; exit 2; }
+[[ -f $manifest_arg && ! -L $manifest_arg && -f $archive_arg && ! -L $archive_arg ]] || { printf 'manifest and archive must be existing non-symlink files\n' >&2; exit 2; }
+for path in "$work_arg" "$candidate_arg"; do
+    [[ ! -e $path && ! -L $path ]] || { printf 'output path must not exist: %s\n' "$path" >&2; exit 2; }
+    [[ -d $(dirname "$path") && ! -L $(dirname "$path") ]] || { printf 'output parent must be an existing non-symlink directory\n' >&2; exit 2; }
+done
+
 readonly ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-readonly PAYLOAD=$(realpath "$1")
-readonly PROFILE=${ROOT}/manifests/build-profile.json
 readonly CONTRACT=${ROOT}/manifests/artifact-contract.json
-readonly WORK=${ROOT}/.work/component/publish
-readonly SOURCE_COMMIT=$(git -C "$ROOT" rev-parse HEAD)
+readonly MANIFEST=$(realpath "$manifest_arg")
+readonly ARCHIVE=$(realpath "$archive_arg")
+readonly WORK=$(realpath -m "$work_arg")
+readonly CANDIDATE_OUT=$(realpath -m "$candidate_arg")
+case "$ROOT/" in "$WORK/"*) printf 'work path cannot be an ancestor of the repository\n' >&2; exit 2;; esac
+[[ $WORK != "$ROOT" ]] || { printf 'work path cannot equal repository root\n' >&2; exit 2; }
+python3 - "$WORK" "$CANDIDATE_OUT" <<'PY'
+import os, sys
+if os.stat(os.path.dirname(sys.argv[1])).st_dev != os.stat(os.path.dirname(sys.argv[2])).st_dev:
+    raise SystemExit("publish work and candidate output must share one filesystem")
+PY
 
 readarray -t contract < <(python3 - "$CONTRACT" <<'PY'
 import json, sys
@@ -31,33 +66,32 @@ if [[ -n ${CNB_DOCKER_REGISTRY:-} || -n ${CNB_REPO_SLUG_LOWERCASE:-} ]]; then
     [[ $CNB_REPOSITORY == "$REPOSITORY" ]]
 fi
 
-rm -rf "$WORK"
-mkdir -p "$WORK"
-python3 "$ROOT/scripts/component_artifact.py" create-manifest \
-    --payload "$PAYLOAD" \
-    --profile "$PROFILE" \
-    --contract "$CONTRACT" \
-    --source-commit "$SOURCE_COMMIT" \
-    --output "$WORK/manifest.json"
-
-find "$PAYLOAD" -mindepth 1 \( -type f -o -type l \) -printf '%P\0' |
-    LC_ALL=C sort -z >"$WORK/archive-files.list"
-
-for run in 1 2; do
-    tar --format=posix --directory="$PAYLOAD" --no-recursion \
-        --mtime=@0 --owner=0 --group=0 --numeric-owner \
-        --pax-option=delete=atime,delete=ctime --null \
-        --files-from="$WORK/archive-files.list" \
-        -cf "$WORK/component-${run}.tar"
-    zstd -q -T1 -19 -f "$WORK/component-${run}.tar" \
-        -o "$WORK/component-${run}.tar.zst"
-done
-
-cmp "$WORK/component-1.tar.zst" "$WORK/component-2.tar.zst"
-mv "$WORK/component-1.tar.zst" "$WORK/component.tar.zst"
+mkdir "$WORK"
+cp "$MANIFEST" "$WORK/manifest.json"
+cp "$ARCHIVE" "$WORK/component.tar.zst"
+python3 - "$WORK/manifest.json" "$CONTRACT" <<'PY'
+import json, sys
+manifest=json.load(open(sys.argv[1]))
+contract=json.load(open(sys.argv[2]))
+expected=(contract["component"], contract["source_repository"], contract["toolchain_image"])
+actual=(manifest.get("component"), manifest.get("source",{}).get("repository"), manifest.get("build",{}).get("toolchain_image"))
+if actual != expected:
+    raise SystemExit(f"manifest identity does not match artifact contract: actual={actual!r} expected={expected!r}")
+PY
+zstd -q -d "$WORK/component.tar.zst" -o "$WORK/component.tar"
 python3 "$ROOT/scripts/component_artifact.py" verify-archive \
-    --archive "$WORK/component-1.tar" \
+    --archive "$WORK/component.tar" \
     --manifest "$WORK/manifest.json"
+
+readarray -t identity < <(python3 - "$WORK/manifest.json" <<'PY'
+import json, sys
+m=json.load(open(sys.argv[1]))
+print(m["source"]["commit"])
+print(m["build"]["profile_sha256"])
+PY
+)
+readonly SOURCE_COMMIT=${identity[0]}
+readonly PROFILE_SHA256=${identity[1]}
 
 readonly ORAS_BIN=${WORK}/oras
 oras_container=$(docker create "$ORAS_IMAGE")
@@ -82,22 +116,19 @@ readonly REFERENCE=${REPOSITORY}:${TAG}
 digest=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["digest"])' \
     "$WORK/push.json")
 [[ $digest == sha256:* ]]
-archive_sha256=$(sha256sum "$WORK/component.tar.zst" | awk '{print $1}')
-manifest_sha256=$(sha256sum "$WORK/manifest.json" | awk '{print $1}')
-profile_sha256=$(python3 - "$PROFILE" <<'PY'
-import hashlib, json, sys
-value=json.load(open(sys.argv[1]))
-data=(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
-print(hashlib.sha256(data).hexdigest())
-PY
-)
-
-python3 - "$REPOSITORY" "$digest" "$SOURCE_COMMIT" "$profile_sha256" \
-    "$archive_sha256" "$manifest_sha256" >"$WORK/candidate.json" <<'PY'
+archive_sha256=$(sha256sum "$ARCHIVE" | awk '{print $1}')
+manifest_sha256=$(sha256sum "$MANIFEST" | awk '{print $1}')
+python3 - "$REPOSITORY" "$digest" "$SOURCE_COMMIT" "$PROFILE_SHA256" \
+    "$archive_sha256" "$manifest_sha256" "$WORK/candidate.json" <<'PY'
 import json, sys
 keys=("repository","digest","source_commit","profile_sha256","archive_sha256","manifest_sha256")
-json.dump(dict(zip(keys,sys.argv[1:])),sys.stdout,indent=2,sort_keys=True)
-print()
+with open(sys.argv[7], "w", encoding="utf-8") as stream:
+    json.dump(dict(zip(keys,sys.argv[1:7])),stream,indent=2,sort_keys=True)
+    stream.write("\n")
+PY
+python3 - "$WORK/candidate.json" "$CANDIDATE_OUT" <<'PY'
+import os, sys
+os.replace(sys.argv[1], sys.argv[2])
 PY
 
 printf 'component_publish=pass\n'
@@ -105,7 +136,7 @@ printf 'artifact_reference=%s@%s\n' "$REPOSITORY" "$digest"
 printf 'archive_sha256=%s\n' "$archive_sha256"
 printf 'manifest_sha256=%s\n' "$manifest_sha256"
 printf '%s\n' '=== CNB_OUTPUT_BEGIN component-candidate ==='
-python3 - "$WORK/candidate.json" <<'PY'
+python3 - "$CANDIDATE_OUT" <<'PY'
 import json, sys
 candidate=json.load(open(sys.argv[1]))
 json.dump({

@@ -1,12 +1,55 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+usage() {
+    printf 'usage: %s --profile PROFILE --build-root EXISTING_PATH --work-dir ABSENT_PATH --cache-dir EXISTING_PATH --payload-dir ABSENT_PATH\n' "$0"
+}
+
+if [[ ${1:-} == --help ]]; then usage; exit 0; fi
+if [[ ${1:-} == --hint ]]; then
+    printf 'agent_hint=self=scripts/build_component.sh\nagent_hint=boundary=builds and verifies one QEMU payload; persistent native build state is caller-owned\n'
+    exit 0
+fi
+
+profile_arg= build_root_arg= work_arg= cache_arg= payload_arg=
+while (( $# )); do
+    case "$1" in
+        --profile|--build-root|--work-dir|--cache-dir|--payload-dir)
+            (( $# >= 2 )) || { usage >&2; exit 2; }
+            case "$1" in
+                --profile) profile_arg=$2 ;;
+                --build-root) build_root_arg=$2 ;;
+                --work-dir) work_arg=$2 ;;
+                --cache-dir) cache_arg=$2 ;;
+                --payload-dir) payload_arg=$2 ;;
+            esac
+            shift 2 ;;
+        *) usage >&2; exit 2 ;;
+    esac
+done
+[[ -n $profile_arg && -n $build_root_arg && -n $work_arg && -n $cache_arg && -n $payload_arg ]] || { usage >&2; exit 2; }
+[[ $profile_arg == /* && $build_root_arg == /* && $work_arg == /* && $cache_arg == /* && $payload_arg == /* ]] || {
+    printf 'paths must be absolute\n' >&2
+    exit 2
+}
+
 readonly ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-readonly PROFILE=$ROOT/manifests/build-profile.json
-readonly WORK=$ROOT/.work/component
-readonly BUILD=$WORK/build
-readonly PAYLOAD=$WORK/payload
-: "${CCACHE_DIR:?CCACHE_DIR must name the CNB compiler-cache volume}"
+readonly PROFILE=$(realpath "$profile_arg")
+[[ $PROFILE == "$ROOT/manifests/build-profile.json" ]] || { printf 'profile does not match the component contract\n' >&2; exit 2; }
+[[ -d $build_root_arg && ! -L $build_root_arg ]] || { printf 'build root must be an existing non-symlink directory\n' >&2; exit 2; }
+[[ -d $cache_arg && ! -L $cache_arg ]] || { printf 'cache directory must be an existing non-symlink directory\n' >&2; exit 2; }
+for path in "$work_arg" "$payload_arg"; do
+    [[ ! -e $path && ! -L $path ]] || { printf 'output path must not exist: %s\n' "$path" >&2; exit 2; }
+    [[ -d $(dirname "$path") && ! -L $(dirname "$path") ]] || { printf 'output parent must be an existing non-symlink directory: %s\n' "$path" >&2; exit 2; }
+done
+readonly BUILD_ROOT=$(realpath "$build_root_arg")
+readonly WORK=$(realpath -m "$work_arg")
+readonly BUILD=$BUILD_ROOT/build
+readonly PAYLOAD=$(realpath -m "$payload_arg")
+readonly CCACHE_DIR=$(realpath "$cache_arg")
+case "$ROOT/" in "$BUILD_ROOT/"*|"$WORK/"*|"$PAYLOAD/"*) printf 'output path cannot be an ancestor of the repository\n' >&2; exit 2;; esac
+[[ $BUILD_ROOT != "$ROOT" && $WORK != "$ROOT" && $PAYLOAD != "$ROOT" ]] || { printf 'output path cannot equal repository root\n' >&2; exit 2; }
+export CCACHE_DIR
 export CCACHE_BASEDIR=$ROOT
 
 [[ -z $(git -C "$ROOT" status --porcelain=v1 --untracked-files=all) ]] || {
@@ -27,12 +70,13 @@ readonly HETGPU_COMMIT=${profile[0]}
 readonly PARALLEL=${profile[1]}
 readonly INDEX_HETGPU=$(git -C "$ROOT" ls-files -s subprojects/hetGPU | awk '{print $2}')
 [[ $INDEX_HETGPU == "$HETGPU_COMMIT" ]]
+[[ -e $ROOT/subprojects/hetGPU/.git ]] || { printf 'required hetGPU gitlink is not materialized\n' >&2; exit 1; }
+[[ $(git -C "$ROOT/subprojects/hetGPU" rev-parse HEAD) == "$HETGPU_COMMIT" ]] || {
+    printf 'materialized hetGPU commit does not match build profile\n' >&2
+    exit 1
+}
 
-git -C "$ROOT" submodule update --init --depth 1 subprojects/hetGPU
-[[ $(git -C "$ROOT/subprojects/hetGPU" rev-parse HEAD) == "$HETGPU_COMMIT" ]]
-
-[[ $WORK == "$ROOT/.work/component" ]]
-rm -rf "$WORK"
+mkdir "$WORK" "$PAYLOAD"
 mkdir -p "$BUILD" "$PAYLOAD/bin" "$PAYLOAD/libexec/qemu" "$PAYLOAD/share/qemu" "$PAYLOAD/evidence/cuda-api" "$WORK/evidence"
 
 python3 "$ROOT/tests/test_component_artifact.py"

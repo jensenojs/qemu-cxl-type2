@@ -281,7 +281,7 @@ guest和QEMU对协议的定义必须一致：
 
 ### 2D DtoD描述符的stream语义
 
-共享描述符协议当前常量版本为`2`。它与CXLMemSim guest shim配对：`CXL_GPU_CMD_MEM_COPY_2D_DTOD`在`PARAM6`携带`stream_wire`。QEMU接受版本`1..2`；版本`2`且该字段能解析为非sentinel stream时，调用`hetgpu_memcpy2d_dtod_async()`，由动态加载的`cuMemcpy2DAsync_v2`在该stream上提交copy。
+共享描述符协议当前常量版本为`3`。它与CXLMemSim guest shim配对：版本2让`CXL_GPU_CMD_MEM_COPY_2D_DTOD`在`PARAM6`携带`stream_wire`；版本3还让`STREAM_SYNC`在`PARAM1`携带public API、blocking DtoH drain或memset emulation drain来源。QEMU把版本1/2的sync解释为public API，并拒绝版本3中的未知来源。
 
 版本`1`、sentinel stream或无法解析的stream保持既有`hetgpu_memcpy2d_dtod()`同步路径。这个分支保留旧shim兼容性，也使缺失的stream信息保持可见：它不会被推断为任意异步stream。
 
@@ -367,6 +367,36 @@ current run manifest消费新QEMU digest
 ```
 
 [`manifests/build-profile.json`](manifests/build-profile.json)定义configure与输出；[`manifests/artifact-contract.json`](manifests/artifact-contract.json)定义payload；[`manifests/artifacts/qemu-cxl-type2.json`](manifests/artifacts/qemu-cxl-type2.json)保存当前已晋升制品。会变化的commit与digest由这些manifest持续维护。
+
+### 本地开发与正式制品的边界
+
+本地和CNB应消费同一份source、profile和payload合同。工作目录和传输方式可以不同，组件语义不能分叉：
+
+```text
+qemu-cxl-type2 source + build profile
+                  |
+                  v
+       QEMU component build
+       qemu-system-x86_64 + firmware + manifest
+                  |
+          +-------+-------+
+          |               |
+      local output     OCI publish + fresh pull
+          |               |
+          +-------+-------+
+                  v
+cxl-lab InputSet: qemu-cxl-type2 component-output
+                  |
+                  +-- type2-guest component-output
+                  +-- cxlmemsim component-output
+                  +-- concordia component-output
+                  v
+           experiment compose/run
+```
+
+[`manifests/artifact-contract.json`](manifests/artifact-contract.json)的`development_execution`把本地受管入口固定为[`scripts/run_local_component.sh`](scripts/run_local_component.sh)。cxl-lab为它挂载持久build slot、共享compiler cache和fresh execution；该入口调用[`scripts/build_component.sh`](scripts/build_component.sh)生成并验证payload，再调用[`scripts/package_component.sh`](scripts/package_component.sh)生成manifest与确定性archive。每次execution都是新的，native build tree只由owner派生的slot复用。
+
+CNB调用同一个build/package边界，再由[`scripts/publish_component.sh`](scripts/publish_component.sh)和[`scripts/pull_component.sh`](scripts/pull_component.sh)发布、恢复并验证。两种来源进入InputSet后共用同一个experiment declaration、adapter、collector和oracle。当前参数以从cxl-lab执行的`uv run python scripts/harness.py workspace run-component --help`和各脚本`--help`为准；不得手抄slot中的`qemu-system-x86_64`路径。
 
 ## 常用源码入口
 
