@@ -310,6 +310,41 @@ uint64_t cxl_gpu_direct_registration_length(
     return tile_end - request_offset;
 }
 
+bool cxl_gpu_direct_page_registration_span(
+    uint64_t mapping_offset, uint64_t mapping_length,
+    uint64_t request_offset, uint64_t request_length,
+    uint64_t following_offset, uint64_t page_size,
+    uint64_t *registration_offset, uint64_t *registration_length)
+{
+    uint64_t mapping_end;
+    uint64_t request_end;
+    uint64_t aligned_end;
+
+    if (!mapping_length || !request_length || !page_size ||
+        (page_size & (page_size - 1)) || !registration_offset ||
+        !registration_length ||
+        mapping_offset > UINT64_MAX - mapping_length ||
+        request_offset < mapping_offset ||
+        request_offset > UINT64_MAX - request_length) {
+        return false;
+    }
+    mapping_end = mapping_offset + mapping_length;
+    request_end = request_offset + request_length;
+    if (request_end > mapping_end || following_offset < request_end ||
+        following_offset > mapping_end ||
+        request_end > UINT64_MAX - (page_size - 1)) {
+        return false;
+    }
+    aligned_end = (request_end + page_size - 1) & ~(page_size - 1);
+    *registration_offset = request_offset & ~(page_size - 1);
+    if (*registration_offset < mapping_offset ||
+        aligned_end > following_offset || aligned_end > mapping_end) {
+        return false;
+    }
+    *registration_length = aligned_end - *registration_offset;
+    return *registration_length != 0;
+}
+
 static size_t cxl_type2_cuda_allocation_lower_bound(
     const CXLType2CudaAllocationTable *table, uint64_t base)
 {

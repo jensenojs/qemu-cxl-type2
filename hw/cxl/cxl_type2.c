@@ -5251,6 +5251,9 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
                     uint64_t pinned_generation;
                     uint64_t following_offset;
                     uint64_t padding_budget = 0;
+                    uint64_t registration_offset;
+                    uint64_t registration_request_length;
+                    uint64_t host_page_size = qemu_real_host_page_size();
                     uint64_t pin_length;
                     void *mapping_host;
 
@@ -5279,9 +5282,21 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
                             ct2d->direct_registration_padding_bytes -
                             pending_padding_bytes;
                     }
+                    if (!cxl_gpu_direct_page_registration_span(
+                            validated[i].mapping->offset,
+                            validated[i].mapping->len, cursor,
+                            segment_length, following_offset, host_page_size,
+                            &registration_offset,
+                            &registration_request_length)) {
+                        result = CXL_GPU_ERROR_INVALID_VALUE;
+                        *failure_stage_out = "registration-page-span";
+                        *failure_index_out = i;
+                        goto view_rollback;
+                    }
                     pin_length = cxl_gpu_direct_registration_length(
                         validated[i].mapping->offset,
-                        validated[i].mapping->len, cursor, segment_length,
+                        validated[i].mapping->len, registration_offset,
+                        registration_request_length,
                         following_offset,
                         ct2d->direct_registration_tile_size,
                         padding_budget);
@@ -5292,7 +5307,8 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
                         goto view_rollback;
                     }
                     if (virtio_shared_memory_pin_range(
-                            shmem, cursor, pin_length, &pinned_mapping,
+                            shmem, registration_offset, pin_length,
+                            &pinned_mapping,
                             &pinned_generation, &mapping_host,
                             cxl_type2_direct_mapping_prepare_revoke,
                             ct2d) != 0) {
@@ -5319,7 +5335,7 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
                     physical->generation = pinned_generation;
                     physical->last_case_epoch =
                         ct2d->paired_case.active_epoch;
-                    physical->mapping_offset = cursor;
+                    physical->mapping_offset = registration_offset;
                     physical->length = pin_length;
                     physical->padding_bytes = pin_length - segment_length;
                     physical->host_address = mapping_host;

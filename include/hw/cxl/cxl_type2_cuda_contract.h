@@ -115,6 +115,11 @@ uint64_t cxl_gpu_direct_registration_length(
     uint64_t request_offset, uint64_t request_length,
     uint64_t following_offset, uint64_t tile_size,
     uint64_t padding_budget);
+bool cxl_gpu_direct_page_registration_span(
+    uint64_t mapping_offset, uint64_t mapping_length,
+    uint64_t request_offset, uint64_t request_length,
+    uint64_t following_offset, uint64_t page_size,
+    uint64_t *registration_offset, uint64_t *registration_length);
 
 typedef struct CXLType2CudaAllocation {
     uint64_t base;

@@ -864,6 +864,28 @@ static void test_direct_registration_tile_bounds(void)
                      ==, 0);
 }
 
+static void test_direct_registration_page_span(void)
+{
+    uint64_t offset = 0;
+    uint64_t length = 0;
+
+    g_assert_true(cxl_gpu_direct_page_registration_span(
+        0x1000, 0x4000, 0x1800, 0x1001, 0x5000, 0x1000, &offset,
+        &length));
+    g_assert_cmphex(offset, ==, 0x1000);
+    g_assert_cmphex(length, ==, 0x2000);
+
+    g_assert_false(cxl_gpu_direct_page_registration_span(
+        0x1000, 0x4000, 0x1800, 0x1001, 0x2801, 0x1000, &offset,
+        &length));
+    g_assert_false(cxl_gpu_direct_page_registration_span(
+        0x1800, 0x3800, 0x1800, 0x100, 0x5000, 0x1000, &offset,
+        &length));
+    g_assert_false(cxl_gpu_direct_page_registration_span(
+        0, UINT64_MAX, UINT64_MAX - 1, 1, UINT64_MAX, 0x1000, &offset,
+        &length));
+}
+
 static void test_direct_cross_case_epoch(void)
 {
     g_assert_false(cxl_gpu_direct_epoch_is_cross_case(0, 2));
@@ -1080,6 +1102,8 @@ int main(int argc, char **argv)
                     test_cuda_opcode_summary_empty_and_bounded);
     g_test_add_func("/cxl/type2/direct/registration-tile-bounds",
                     test_direct_registration_tile_bounds);
+    g_test_add_func("/cxl/type2/direct/registration-page-span",
+                    test_direct_registration_page_span);
     g_test_add_func("/cxl/type2/direct/cross-case-epoch",
                     test_direct_cross_case_epoch);
     g_test_add_func("/cxl/type2/stream/progress-classification",
