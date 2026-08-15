@@ -158,6 +158,17 @@ class ComponentArtifactTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             artifact.verify_archive(archive, manifest([file_entry("bin/server", b"right")]), None)
 
+    def test_formal_backend_load_failure_stops_before_symbol_lookup(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "hw/cxl/cxl_hetgpu.c").read_text()
+        load = source.index("g_cuda_lib_handle = dlopen(lib_path, RTLD_NOW | RTLD_GLOBAL);")
+        formal_failure = source.index("if (formal_case_strict && !g_cuda_lib_handle)", load)
+        symbol_lookup = source.index("if (g_cuda_lib_handle)", formal_failure)
+        rejected = source[formal_failure:symbol_lookup]
+
+        self.assertIn("formal library load failed path=%s dlerror=%s", rejected)
+        self.assertIn("return HETGPU_ERROR_NO_DEVICE;", rejected)
+
 
 if __name__ == "__main__":
     unittest.main()

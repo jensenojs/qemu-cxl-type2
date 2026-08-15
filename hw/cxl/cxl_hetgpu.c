@@ -448,6 +448,14 @@ static HetGPUError hetgpu_init_internal(HetGPUState *state,
 
     if (!g_cuda_lib_initialized) {
         g_cuda_lib_handle = dlopen(lib_path, RTLD_NOW | RTLD_GLOBAL);
+        if (formal_case_strict && !g_cuda_lib_handle) {
+            const char *load_error = dlerror();
+
+            qemu_log("CXL hetGPU: formal library load failed path=%s dlerror=%s\n",
+                     lib_path, load_error ? load_error : "(none)");
+            qemu_mutex_unlock(&g_cuda_mutex);
+            return HETGPU_ERROR_NO_DEVICE;
+        }
         if (!formal_case_strict && !g_cuda_lib_handle) {
             fprintf(stderr, "CXL hetGPU: FAILED to load library: %s\n", dlerror());
             fprintf(stderr, "CXL hetGPU: Trying alternate path /usr/lib64/libcuda.so\n");
