@@ -329,7 +329,7 @@ static void test_batch_wire_layout_and_validation(void)
     uint8_t *payload = valid_batch_payload(&payload_bytes);
     CXLGPUBatchHtoDRange range;
 
-    g_assert_cmphex(CXL_GPU_VERSION, ==, UINT64_C(0x00011300));
+    g_assert_cmphex(CXL_GPU_VERSION, ==, UINT64_C(0x00011400));
     g_assert_cmphex(CXL_GPU_CMD_SOURCE_REGISTER_BATCH_HTOD_DIRECT_ASYNC,
                     ==, 0x35);
     g_assert_cmphex(CXL_GPU_CMD_MEM_COPY_DTOD_ASYNC, ==, 0x2f);
@@ -423,50 +423,25 @@ static void test_direct_source_wire_validation(void)
 {
     CXLGPUSourceRegisterV1 header = {
         .range_count = 2,
-        .run_count = 2,
-        .lease_handle = 7,
         .logical_bytes = 228,
-        .unique_dmap_bytes = 8192,
     };
-    CXLGPUSourceRangeV1 ranges[] = {
-        { .first_run = 0, .run_count = 1,
-          .first_run_byte_offset = 16, .length = 100 },
-        { .first_run = 1, .run_count = 1,
-          .first_run_byte_offset = 0, .length = 128 },
+    CXLGPUSourceVirtualRangeV1 ranges[] = {
+        { .guest_virtual_address = 0x10010, .length = 100 },
+        { .guest_virtual_address = 0x20000, .length = 128 },
     };
-    CXLGPUSourceRunV1 runs[] = {
-        { .guest_phys_addr = 0x10000, .length = 4096 },
-        { .guest_phys_addr = 0x20000, .length = 4096 },
-    };
-    uint8_t payload[sizeof(header) + sizeof(ranges) + sizeof(runs)] = { 0 };
+    uint8_t payload[sizeof(header) + sizeof(ranges)] = { 0 };
     CXLGPUSourceRegisterV1 parsed;
     uint64_t fail_index;
 
     memcpy(payload, &header, sizeof(header));
     memcpy(payload + sizeof(header), ranges, sizeof(ranges));
-    memcpy(payload + sizeof(header) + sizeof(ranges), runs, sizeof(runs));
     g_assert_true(cxl_gpu_source_register_validate(
         payload, sizeof(payload), sizeof(payload), &parsed, &fail_index));
     g_assert_cmpuint(parsed.logical_bytes, ==, 228);
     g_assert_cmpuint(fail_index, ==, SIZE_MAX);
 
-    header.lease_handle = 0;
-    memcpy(payload, &header, sizeof(header));
-    g_assert_false(cxl_gpu_source_register_validate(
-        payload, sizeof(payload), sizeof(payload), &parsed, &fail_index));
-
-    header.lease_handle = 7;
-    ranges[0].length = 4096;
-    memcpy(payload, &header, sizeof(header));
+    ranges[1].guest_virtual_address = UINT64_MAX - 63;
     memcpy(payload + sizeof(header), ranges, sizeof(ranges));
-    g_assert_false(cxl_gpu_source_register_validate(
-        payload, sizeof(payload), sizeof(payload), &parsed, &fail_index));
-    g_assert_cmpuint(fail_index, ==, 0);
-
-    ranges[0].length = 100;
-    runs[1].guest_phys_addr = 0x10080;
-    memcpy(payload + sizeof(header), ranges, sizeof(ranges));
-    memcpy(payload + sizeof(header) + sizeof(ranges), runs, sizeof(runs));
     g_assert_false(cxl_gpu_source_register_validate(
         payload, sizeof(payload), sizeof(payload), &parsed, &fail_index));
     g_assert_cmpuint(fail_index, ==, 1);

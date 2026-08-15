@@ -169,20 +169,6 @@ class ComponentArtifactTest(unittest.TestCase):
         self.assertIn("formal library load failed path=%s dlerror=%s", rejected)
         self.assertIn("return HETGPU_ERROR_NO_DEVICE;", rejected)
 
-    def test_direct_source_consumes_gpa_before_dax_admission(self) -> None:
-        root = Path(__file__).resolve().parents[1]
-        source = (root / "hw/cxl/cxl_type2.c").read_text()
-        register = source.index("static int cxl_type2_direct_source_register")
-        admission = source.index("address_space_translate(", register)
-        commit = source.index("source = g_new0(CXLType2DirectSource, 1);", admission)
-        consumed = source[register:commit]
-
-        self.assertIn("CXLGPUSourceRunV1 wire_run", consumed)
-        self.assertIn("validated[i].guest_phys_addr = wire_run.guest_phys_addr", consumed)
-        self.assertIn("mr != dax_mr", consumed)
-        self.assertIn('"address-translate"', consumed)
-        self.assertNotIn("cpu_get_phys_page_debug", consumed)
-
 
 if __name__ == "__main__":
     unittest.main()

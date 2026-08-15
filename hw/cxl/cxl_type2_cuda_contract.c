@@ -1377,11 +1377,8 @@ bool cxl_gpu_source_register_validate(const uint8_t *payload,
 {
     CXLGPUSourceRegisterV1 header;
     const uint8_t *range_base;
-    const uint8_t *run_base;
     uint64_t ranges_bytes;
-    uint64_t runs_bytes;
     uint64_t logical_bytes = 0;
-    uint64_t unique_bytes = 0;
 
     if (!payload || !header_out || !fail_index ||
         payload_bytes < sizeof(header) || payload_bytes > payload_capacity) {
@@ -1390,90 +1387,30 @@ bool cxl_gpu_source_register_validate(const uint8_t *payload,
     *fail_index = SIZE_MAX;
     memcpy(&header, payload, sizeof(header));
     if (header.flags || header.reserved0 || header.reserved1 ||
-        !header.lease_handle || !header.range_count || !header.run_count ||
-        header.range_count > UINT32_MAX || header.run_count > UINT32_MAX ||
+        header.reserved2[0] || header.reserved2[1] || header.reserved2[2] ||
+        !header.range_count ||
         header.range_count >
             (payload_bytes - sizeof(header)) /
-                sizeof(CXLGPUSourceRangeV1)) {
+                sizeof(CXLGPUSourceVirtualRangeV1)) {
         return false;
     }
-    ranges_bytes = (uint64_t)header.range_count * sizeof(CXLGPUSourceRangeV1);
-    if (header.run_count >
-        (payload_bytes - sizeof(header) - ranges_bytes) /
-            sizeof(CXLGPUSourceRunV1)) {
-        return false;
-    }
-    runs_bytes = (uint64_t)header.run_count * sizeof(CXLGPUSourceRunV1);
-    if (sizeof(header) + ranges_bytes + runs_bytes != payload_bytes) {
+    ranges_bytes = (uint64_t)header.range_count *
+                   sizeof(CXLGPUSourceVirtualRangeV1);
+    if (sizeof(header) + ranges_bytes != payload_bytes) {
         return false;
     }
     range_base = payload + sizeof(header);
-    run_base = range_base + ranges_bytes;
-
-    for (uint64_t i = 0; i < header.run_count; i++) {
-        CXLGPUSourceRunV1 run;
-        bool duplicate = false;
-
-        memcpy(&run, run_base + i * sizeof(run), sizeof(run));
-        if (!run.length || run.guest_phys_addr > UINT64_MAX - run.length) {
-            *fail_index = i;
-            return false;
-        }
-        for (uint64_t j = 0; j < i; j++) {
-            CXLGPUSourceRunV1 previous;
-
-            memcpy(&previous, run_base + j * sizeof(previous),
-                   sizeof(previous));
-            if (run.guest_phys_addr == previous.guest_phys_addr &&
-                run.length == previous.length) {
-                duplicate = true;
-                break;
-            }
-            if (run.guest_phys_addr <
-                    previous.guest_phys_addr + previous.length &&
-                previous.guest_phys_addr < run.guest_phys_addr + run.length) {
-                *fail_index = i;
-                return false;
-            }
-        }
-        if (!duplicate) {
-            if (unique_bytes > UINT64_MAX - run.length) {
-                *fail_index = i;
-                return false;
-            }
-            unique_bytes += run.length;
-        }
-    }
-    if (unique_bytes != header.unique_dmap_bytes) {
-        return false;
-    }
 
     for (uint64_t i = 0; i < header.range_count; i++) {
-        CXLGPUSourceRangeV1 range;
-        uint64_t available = 0;
+        CXLGPUSourceVirtualRangeV1 range;
 
         memcpy(&range, range_base + i * sizeof(range), sizeof(range));
-        if (!range.run_count || !range.length ||
-            range.first_run >= header.run_count ||
-            range.run_count > header.run_count - range.first_run) {
+        if (!range.guest_virtual_address || !range.length ||
+            range.guest_virtual_address > UINT64_MAX - range.length) {
             *fail_index = i;
             return false;
         }
-        for (uint64_t j = 0; j < range.run_count; j++) {
-            CXLGPUSourceRunV1 run;
-            uint64_t offset = j ? 0 : range.first_run_byte_offset;
-
-            memcpy(&run, run_base +
-                   (range.first_run + j) * sizeof(run), sizeof(run));
-            if (offset >= run.length || available > UINT64_MAX -
-                                              (run.length - offset)) {
-                *fail_index = i;
-                return false;
-            }
-            available += run.length - offset;
-        }
-        if (range.length > available ||
-            logical_bytes > UINT64_MAX - range.length) {
+        if (logical_bytes > UINT64_MAX - range.length) {
             *fail_index = i;
             return false;
         }

@@ -239,13 +239,19 @@ typedef struct CXLType2DirectRun {
     uint64_t length;
 } CXLType2DirectRun;
 
+typedef struct CXLType2DirectRangeLayout {
+    uint32_t first_run;
+    uint32_t run_count;
+    uint64_t first_run_byte_offset;
+    uint64_t length;
+} CXLType2DirectRangeLayout;
+
 typedef struct CXLType2DirectSource {
     uint64_t source_id;
     uint64_t case_epoch;
-    uint64_t lease_handle;
     uint64_t logical_bytes;
     uint64_t unique_dmap_bytes;
-    CXLGPUSourceRangeV1 *ranges;
+    CXLType2DirectRangeLayout *ranges;
     CXLType2DirectRun *runs;
     uint32_t range_count;
     uint32_t run_count;
