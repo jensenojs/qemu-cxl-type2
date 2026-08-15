@@ -393,7 +393,8 @@ static HetGPUError hetgpu_init_internal(HetGPUState *state,
                                         HetGPUBackendType backend,
                                         int device_index,
                                         const char *hetgpu_lib_path,
-                                        bool formal_case_strict)
+                                        bool formal_case_strict,
+                                        bool require_kimi_hooks)
 {
     if (!state) {
         return HETGPU_ERROR_INVALID_VALUE;
@@ -633,7 +634,7 @@ static HetGPUError hetgpu_init_internal(HetGPUState *state,
 
     qemu_mutex_unlock(&g_cuda_mutex);
 
-    if (formal_case_strict &&
+    if (require_kimi_hooks &&
         (!state->kimi_case_begin_v2 || !state->kimi_case_end_v2)) {
         qemu_log("CXL hetGPU: formal Kimi case symbols are missing "
                  "begin=%p end=%p\n",
@@ -801,14 +802,23 @@ HetGPUError hetgpu_init(HetGPUState *state, HetGPUBackendType backend,
                         int device_index, const char *hetgpu_lib_path)
 {
     return hetgpu_init_internal(state, backend, device_index, hetgpu_lib_path,
-                                false);
+                                false, false);
 }
 
 HetGPUError hetgpu_init_formal(HetGPUState *state, HetGPUBackendType backend,
                                int device_index, const char *hetgpu_lib_path)
 {
     return hetgpu_init_internal(state, backend, device_index, hetgpu_lib_path,
-                                true);
+                                true, true);
+}
+
+HetGPUError hetgpu_init_capability(HetGPUState *state,
+                                   HetGPUBackendType backend,
+                                   int device_index,
+                                   const char *hetgpu_lib_path)
+{
+    return hetgpu_init_internal(state, backend, device_index, hetgpu_lib_path,
+                                true, false);
 }
 
 HetGPUError hetgpu_reset_formal(HetGPUState *state, HetGPUBackendType backend,

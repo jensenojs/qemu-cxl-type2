@@ -650,6 +650,161 @@ static void test_cuda_allocation_alias_lifecycle(void)
     cxl_type2_cuda_allocation_table_destroy(&table);
 }
 
+static CXLType2CudaAliasSource alias_source(int fd,
+                                            const struct stat *source_stat,
+                                            uint64_t file_offset,
+                                            uint64_t destination_offset,
+                                            uint64_t length,
+                                            uint64_t generation)
+{
+    return (CXLType2CudaAliasSource) {
+        .fd = fd,
+        .file_offset = file_offset,
+        .destination_offset = destination_offset,
+        .length = length,
+        .mapping_generation = generation,
+        .logical_cxl_offset = UINT64_C(0x10000000) + destination_offset,
+        .stat_device = source_stat->st_dev,
+        .stat_inode = source_stat->st_ino,
+        .stat_size = source_stat->st_size,
+        .stat_mode = source_stat->st_mode,
+        .readonly = true,
+    };
+}
+
+static void test_cuda_pageable_alias_composite_remap(void)
+{
+    CXLType2CudaAllocationTable table;
+    CXLType2CudaAliasSource sources[4];
+    g_autofree char *path = NULL;
+    g_autofree uint8_t *file_bytes = NULL;
+    GError *error = NULL;
+    struct stat source_stat;
+    size_t page_size = qemu_real_host_page_size();
+    uint64_t logical_bytes = 3 * page_size - 32;
+    uint64_t epoch = 0;
+    uint64_t alias_one = 0;
+    uint64_t alias_two = 0;
+    const char *reason = NULL;
+    int fd;
+    pid_t child;
+    int status;
+
+    fd = g_file_open_tmp("cxl-pageable-alias-XXXXXX", &path, &error);
+    g_assert_no_error(error);
+    g_assert_cmpint(fd, >=, 0);
+    g_assert_cmpint(ftruncate(fd, 5 * page_size), ==, 0);
+    file_bytes = g_malloc(5 * page_size);
+    for (size_t i = 0; i < 5 * page_size; i++) {
+        file_bytes[i] = (i * 17 + 3) & 0xff;
+    }
+    g_assert_cmpint(pwrite(fd, file_bytes, 5 * page_size, 0), ==,
+                    5 * page_size);
+    g_assert_cmpint(fstat(fd, &source_stat), ==, 0);
+
+    sources[0] = alias_source(fd, &source_stat, 32, 0,
+                              page_size - 64, 1);
+    sources[1] = alias_source(fd, &source_stat, 2 * page_size + 17,
+                              page_size - 64, 128, 1);
+    sources[2] = alias_source(fd, &source_stat, 3 * page_size + 64,
+                              page_size + 64, page_size - 64, 1);
+    sources[3] = alias_source(fd, &source_stat, 4 * page_size,
+                              2 * page_size, page_size, 1);
+
+    cxl_type2_cuda_allocation_table_init(&table);
+    g_assert_true(cxl_type2_cuda_allocation_record(
+        &table, UINT64_C(0x100000), 3 * page_size, &epoch));
+    g_assert_true(cxl_type2_cuda_allocation_map_pageable_alias(
+        &table, UINT64_C(0x100000), epoch, 1, sources,
+        G_N_ELEMENTS(sources), logical_bytes, 32, &alias_one, &reason));
+    g_assert_null(reason);
+    g_assert_cmpuint(table.entries[0].pageable_alias->file_mapped_bytes,
+                     ==, page_size);
+    g_assert_cmpuint(
+        table.entries[0].pageable_alias->derived_boundary_pages, ==, 2);
+    g_assert_cmpuint(
+        table.entries[0].pageable_alias->derived_boundary_copy_bytes,
+        ==, 2 * page_size);
+    g_assert_nonnull(table.entries[0].pageable_alias->owned_reservation);
+    g_assert_cmpuint(
+        table.entries[0].pageable_alias->owned_reservation_size,
+        ==, 5 * page_size);
+    g_assert_cmpuint(
+        table.entries[0].pageable_alias->boundary_composition_wall_ns,
+        >, 0);
+
+    child = fork();
+    g_assert_cmpint(child, >=, 0);
+    if (child == 0) {
+        /* Volatile forces the readonly mapping to receive a real store. */
+        *(volatile uint8_t *)(uintptr_t)alias_one ^= 1;
+        _exit(0);
+    }
+    g_assert_cmpint(waitpid(child, &status, 0), ==, child);
+    g_assert_true(WIFSIGNALED(status));
+    g_assert_true(WTERMSIG(status) == SIGSEGV || WTERMSIG(status) == SIGBUS);
+
+    child = fork();
+    g_assert_cmpint(child, >=, 0);
+    if (child == 0) {
+        uint8_t *sentinel =
+            table.entries[0].pageable_alias->owned_reservation;
+
+        *sentinel = 1;
+        _exit(0);
+    }
+    g_assert_cmpint(waitpid(child, &status, 0), ==, child);
+    g_assert_true(WIFSIGNALED(status));
+    g_assert_true(WTERMSIG(status) == SIGSEGV || WTERMSIG(status) == SIGBUS);
+
+    g_assert_true(cxl_type2_cuda_allocation_acquire_pageable_alias(
+        &table, UINT64_C(0x100000), epoch, 1,
+        CXL_TYPE2_CUDA_ALIAS_NORMAL, &alias_two));
+    g_assert_cmphex(alias_two, ==, alias_one);
+    g_assert_false(cxl_type2_cuda_allocation_map_pageable_alias(
+        &table, UINT64_C(0x100000), epoch, 2, sources,
+        G_N_ELEMENTS(sources), logical_bytes, 32, &alias_two, &reason));
+    g_assert_cmpstr(reason, ==, "alias-consumer-in-flight");
+    g_assert_true(cxl_type2_cuda_allocation_release_pageable_alias(
+        &table, UINT64_C(0x100000), epoch, 1,
+        CXL_TYPE2_CUDA_ALIAS_NORMAL));
+
+    g_assert_true(cxl_type2_cuda_allocation_bind_graph_alias(
+        &table, UINT64_C(0x100000), epoch, alias_one));
+    g_assert_true(cxl_type2_cuda_allocation_acquire_pageable_alias(
+        &table, UINT64_C(0x100000), epoch, 1,
+        CXL_TYPE2_CUDA_ALIAS_GRAPH, &alias_two));
+    g_assert_true(cxl_type2_cuda_allocation_release_pageable_alias(
+        &table, UINT64_C(0x100000), epoch, 1,
+        CXL_TYPE2_CUDA_ALIAS_GRAPH));
+
+    for (size_t i = 0; i < 5 * page_size; i++) {
+        file_bytes[i] ^= 0xa5;
+    }
+    g_assert_cmpint(pwrite(fd, file_bytes, 5 * page_size, 0), ==,
+                    5 * page_size);
+    for (size_t i = 0; i < G_N_ELEMENTS(sources); i++) {
+        sources[i].mapping_generation = 2;
+    }
+    reason = NULL;
+    g_assert_true(cxl_type2_cuda_allocation_map_pageable_alias(
+        &table, UINT64_C(0x100000), epoch, 2, sources,
+        G_N_ELEMENTS(sources), logical_bytes, 32, &alias_two, &reason));
+    g_assert_null(reason);
+    g_assert_cmphex(alias_two, ==, alias_one);
+    g_assert_false(cxl_type2_cuda_allocation_drop_pageable_alias(
+        &table, UINT64_C(0x100000), epoch, 2));
+    g_assert_true(cxl_type2_cuda_allocation_unbind_graph_alias(
+        &table, UINT64_C(0x100000), epoch, alias_two));
+    g_assert_true(cxl_type2_cuda_allocation_drop_pageable_alias(
+        &table, UINT64_C(0x100000), epoch, 2));
+    g_assert_true(cxl_type2_cuda_allocation_forget(
+        &table, UINT64_C(0x100000)));
+    cxl_type2_cuda_allocation_table_destroy(&table);
+    close(fd);
+    g_assert_cmpint(unlink(path), ==, 0);
+}
+
 static void test_cuda_generation_reuse_lifecycle(void)
 {
     CXLType2CudaAllocationTable table;
@@ -1090,6 +1245,8 @@ int main(int argc, char **argv)
                     test_cuda_allocation_rejects_invalid_state);
     g_test_add_func("/cxl/type2/direct/allocation-alias-lifecycle",
                     test_cuda_allocation_alias_lifecycle);
+    g_test_add_func("/cxl/type2/direct/pageable-alias-composite-remap",
+                    test_cuda_pageable_alias_composite_remap);
     g_test_add_func("/cxl/type2/direct/generation-reuse-lifecycle",
                     test_cuda_generation_reuse_lifecycle);
     g_test_add_func("/cxl/type2/direct/destination-union-coverage",

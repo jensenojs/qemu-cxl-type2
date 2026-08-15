@@ -311,6 +311,10 @@ HetGPUError hetgpu_init(HetGPUState *state, HetGPUBackendType backend,
                         int device_index, const char *hetgpu_lib_path);
 HetGPUError hetgpu_init_formal(HetGPUState *state, HetGPUBackendType backend,
                                int device_index, const char *hetgpu_lib_path);
+HetGPUError hetgpu_init_capability(HetGPUState *state,
+                                   HetGPUBackendType backend,
+                                   int device_index,
+                                   const char *hetgpu_lib_path);
 HetGPUError hetgpu_reset_formal(HetGPUState *state, HetGPUBackendType backend,
                                 int device_index, const char *hetgpu_lib_path);
 HetGPUError hetgpu_kimi_case_begin(HetGPUState *state,

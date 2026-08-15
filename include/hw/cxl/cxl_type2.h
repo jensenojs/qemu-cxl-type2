@@ -246,6 +246,11 @@ typedef struct CXLType2DirectRangeLayout {
     uint64_t length;
 } CXLType2DirectRangeLayout;
 
+typedef struct CXLType2MemoryRange {
+    uint64_t offset;
+    uint64_t size;
+} CXLType2MemoryRange;
+
 typedef struct CXLType2DirectSource {
     uint64_t source_id;
     uint64_t case_epoch;
@@ -427,6 +432,18 @@ typedef struct CXLType2State {
     uint64_t direct_registration_padding_limit;
     uint64_t direct_registration_padding_bytes;
     Object *direct_source_fs;
+    struct {
+        uint64_t offset;
+        uint64_t size;
+    } model_aperture;
+    struct {
+        char *output;
+        char *fixture;
+        char *mode;
+        uint64_t file_offset;
+        uint64_t shmem_offset;
+        uint64_t length;
+    } model_alias_gate;
     CXLType2DirectPhysical *direct_physicals;
     CXLType2DirectRegistration *direct_registrations;
     GTree *direct_physical_ranges;
@@ -695,5 +712,12 @@ int cxl_type2_hetgpu_free(CXLType2State *ct2d, uint64_t dev_ptr);
 int cxl_type2_hetgpu_memcpy_htod(CXLType2State *ct2d, uint64_t dst, const void *src, size_t size);
 int cxl_type2_hetgpu_memcpy_dtoh(CXLType2State *ct2d, void *dst, uint64_t src, size_t size);
 int cxl_type2_hetgpu_sync(CXLType2State *ct2d);
+
+bool cxl_type2_model_aperture_access(CXLType2State *ct2d, uint64_t offset,
+                                     uint64_t size, bool is_write,
+                                     uint64_t *latency_ns,
+                                     const char **reason);
+size_t cxl_type2_vfio_dma_ranges(const CXLType2State *ct2d,
+                                 CXLType2MemoryRange ranges[2]);
 
 #endif /* CXL_TYPE2_H */

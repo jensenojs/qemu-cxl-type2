@@ -9,11 +9,15 @@ fi
 readonly PAYLOAD=$(realpath "$1")
 readonly EVIDENCE=$2
 readonly QEMU=$PAYLOAD/bin/qemu-system-x86_64
+readonly APERTURE_GATE=$PAYLOAD/bin/run_cxl_actual_aperture_gate.sh
 readonly RUNTIME=$PAYLOAD/lib
 
 [[ -x $QEMU ]]
+[[ -x $APERTURE_GATE ]]
 [[ -f $RUNTIME/libcapstone.so.4 && -f $RUNTIME/libaio.so.1t64 ]]
 mkdir -p "$EVIDENCE"
+bash -n "$APERTURE_GATE"
+"$APERTURE_GATE" --help >"$EVIDENCE/actual-aperture-gate-help.txt"
 LD_LIBRARY_PATH=$RUNTIME "$QEMU" --version >"$EVIDENCE/version.txt"
 LD_LIBRARY_PATH=$RUNTIME "$QEMU" -device help >"$EVIDENCE/device-help.txt"
 grep -Fq 'cxl-type2' "$EVIDENCE/device-help.txt"

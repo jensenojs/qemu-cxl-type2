@@ -114,6 +114,10 @@ typedef void (*VirtioSharedMemoryPrepareRevokeFn)(
  * @len: Size of the mapping
  * @fd: Duplicated file descriptor used while installing this mapping
  * @fd_offset: Offset in @fd backing the shared-memory window range
+ * @source_device: Device identity captured from @fd at construction
+ * @source_inode: Inode identity captured from @fd at construction
+ * @source_size: File size captured from @fd at construction
+ * @source_mode: File mode captured from @fd at construction
  * @allow_write: Whether the file mapping is writable
  * @generation: Identity of the installed backing generation
  * @source_pins: External users that require this backing to remain installed
@@ -133,6 +137,10 @@ struct VirtioSharedMemoryMapping {
     uint64_t len;
     int fd;
     uint64_t fd_offset;
+    uint64_t source_device;
+    uint64_t source_inode;
+    uint64_t source_size;
+    uint32_t source_mode;
     bool allow_write;
     uint64_t generation;
     uint64_t source_pins;
@@ -450,6 +458,24 @@ int virtio_shared_memory_pin_range(
     VirtioSharedMemoryMapping **mapping, uint64_t *generation,
     void **host_address, VirtioSharedMemoryPrepareRevokeFn prepare_revoke,
     void *prepare_revoke_opaque);
+
+/**
+ * virtio_shared_memory_mapping_dup_source() - Copy a pinned source view
+ * @mapping: Installed and pinned mapping
+ * @generation: Generation returned by virtio_shared_memory_pin_range()
+ * @fd: Returns a caller-owned duplicate of the source file descriptor
+ * @fd_offset: Returns the source file offset
+ * @length: Returns the complete source range length
+ *
+ * The mapping must remain pinned while this function runs. The returned file
+ * descriptor keeps the open-file identity alive after the transient mapping
+ * pin is released. The function rejects generation, revoke, and stat drift.
+ *
+ * Returns: 0 on success, or a negative errno value.
+ */
+int virtio_shared_memory_mapping_dup_source(
+    VirtioSharedMemoryMapping *mapping, uint64_t generation, int *fd,
+    uint64_t *fd_offset, uint64_t *length);
 void virtio_shared_memory_unpin(VirtioSharedMemoryMapping *mapping);
 
 /**

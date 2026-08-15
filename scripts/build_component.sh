@@ -91,6 +91,8 @@ ccache --show-stats | tee "$WORK/evidence/ccache-after.txt"
 readonly QEMU=$BUILD/qemu-system-x86_64
 [[ -x $QEMU ]]
 install -m 0755 "$QEMU" "$PAYLOAD/bin/qemu-system-x86_64"
+install -m 0755 "$ROOT/scripts/run_cxl_actual_aperture_gate.sh" \
+    "$PAYLOAD/bin/run_cxl_actual_aperture_gate.sh"
 for library in libcapstone.so.4 libaio.so.1t64; do
     library_path=$(ldconfig -p | awk -v name="$library" '$1 == name { print $NF; exit }')
     [[ -n $library_path && -f $library_path ]] || {

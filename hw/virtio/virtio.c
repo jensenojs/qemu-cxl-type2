@@ -3112,6 +3112,10 @@ static void virtio_shared_memory_mapping_instance_init(Object *obj)
     mapping->len = 0;
     mapping->fd = -1;
     mapping->fd_offset = 0;
+    mapping->source_device = 0;
+    mapping->source_inode = 0;
+    mapping->source_size = 0;
+    mapping->source_mode = 0;
     mapping->allow_write = false;
     mapping->generation = 0;
     mapping->source_pins = 0;
@@ -3138,12 +3142,29 @@ VirtioSharedMemoryMapping *virtio_shared_memory_mapping_new(uint8_t shmid,
                                                             bool allow_write)
 {
     VirtioSharedMemoryMapping *mapping;
+    struct stat source_stat;
+
     if (len == 0) {
         error_report("Shared memory mapping size cannot be zero");
         return NULL;
     }
 
-    fd = dup(fd);
+    if (fd_offset > UINT64_MAX - len) {
+        error_report("VIRTIO Shared Memory file range overflows");
+        return NULL;
+    }
+
+    if (fstat(fd, &source_stat) < 0) {
+        error_report("Failed to stat shared memory fd: %s", strerror(errno));
+        return NULL;
+    }
+    if (source_stat.st_size < 0 ||
+        fd_offset + len > (uint64_t)source_stat.st_size) {
+        error_report("VIRTIO Shared Memory file range exceeds source size");
+        return NULL;
+    }
+
+    fd = qemu_dup(fd);
     if (fd < 0) {
         error_report("Failed to duplicate fd: %s", strerror(errno));
         return NULL;
@@ -3156,6 +3177,10 @@ VirtioSharedMemoryMapping *virtio_shared_memory_mapping_new(uint8_t shmid,
     mapping->len = len;
     mapping->fd = fd;
     mapping->fd_offset = fd_offset;
+    mapping->source_device = source_stat.st_dev;
+    mapping->source_inode = source_stat.st_ino;
+    mapping->source_size = source_stat.st_size;
+    mapping->source_mode = source_stat.st_mode;
     mapping->allow_write = allow_write;
     return mapping;
 }
@@ -3208,9 +3233,6 @@ int virtio_add_shmem_map(VirtioSharedMemory *shmem,
                      strerror(errno));
         return -1;
     }
-    close(mapping->fd);
-    mapping->fd = -1;
-
     mapping->generation = generation;
     mapping->owner = shmem;
 
@@ -3218,6 +3240,43 @@ int virtio_add_shmem_map(VirtioSharedMemory *shmem,
     QTAILQ_INSERT_TAIL(&shmem->mmaps, mapping, link);
     g_tree_insert(shmem->map_index, mapping, mapping);
 
+    return 0;
+}
+
+int virtio_shared_memory_mapping_dup_source(
+    VirtioSharedMemoryMapping *mapping, uint64_t generation, int *fd,
+    uint64_t *fd_offset, uint64_t *length)
+{
+    struct stat source_stat;
+    int duplicate;
+
+    if (!mapping || !fd || !fd_offset || !length || !generation) {
+        return -EINVAL;
+    }
+    if (!mapping->owner || !mapping->source_pins ||
+        mapping->revoke_pending) {
+        return -EBUSY;
+    }
+    if (mapping->generation != generation || mapping->fd < 0) {
+        return -ESTALE;
+    }
+    if (fstat(mapping->fd, &source_stat) < 0) {
+        return -errno;
+    }
+    if ((uint64_t)source_stat.st_dev != mapping->source_device ||
+        (uint64_t)source_stat.st_ino != mapping->source_inode ||
+        source_stat.st_size < 0 ||
+        (uint64_t)source_stat.st_size != mapping->source_size ||
+        (uint32_t)source_stat.st_mode != mapping->source_mode) {
+        return -ESTALE;
+    }
+    duplicate = qemu_dup(mapping->fd);
+    if (duplicate < 0) {
+        return -errno;
+    }
+    *fd = duplicate;
+    *fd_offset = mapping->fd_offset;
+    *length = mapping->len;
     return 0;
 }
 

@@ -30,6 +30,7 @@
 #include "hw/cxl/cxl_cdat.h"
 #include "hw/cxl/cxl_pci.h"
 #include "hw/cxl/cxl_type2.h"
+#include "hw/cxl/cxl_type2_model_alias_gate.h"
 #include "hw/cxl/cxl_hetgpu.h"
 #include "hw/cxl/cxl_type2_gpu_cmd.h"
 #include "hw/cxl/cxl_type2_cuda_contract.h"
@@ -43,6 +44,7 @@
 #include "hw/virtio/vhost-user-fs.h"
 #include "migration/vmstate.h"
 #include "system/memory.h"
+#include "system/runstate.h"
 #include "io/channel-socket.h"
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -118,6 +120,19 @@ static bool cxl_type2_memsim_request(CXLType2State *ct2d, uint8_t op_type,
                                      uint64_t addr, uint64_t size,
                                      const uint8_t *data,
                                      CXLMemSimResponse *resp);
+static bool cxl_type2_fabric_access_allowed(CXLType2State *ct2d, uint64_t addr,
+                                            uint64_t size, bool is_write,
+                                            bool is_atomic);
+
+static bool cxl_type2_range_contains(uint64_t outer_offset,
+                                     uint64_t outer_size,
+                                     uint64_t inner_offset,
+                                     uint64_t inner_size)
+{
+    return outer_size && inner_size && inner_offset >= outer_offset &&
+           inner_offset - outer_offset <= outer_size &&
+           inner_size <= outer_size - (inner_offset - outer_offset);
+}
 
 static bool cxl_type2_bulk_memsim_access(CXLType2State *ct2d, uint8_t op_type,
                                           uint64_t addr, size_t size,
@@ -571,39 +586,105 @@ static int cxl_type2_vfio_device_init(CXLType2State *ct2d, const char *pci_addr,
     return device_fd;
 }
 
-/* Setup DMA mapping for GPU coherent access */
-static int cxl_type2_vfio_dma_map(CXLType2State *ct2d, Error **errp)
+static int cxl_type2_vfio_dma_map_range(CXLType2State *ct2d,
+                                        uint64_t offset, uint64_t size,
+                                        Error **errp)
 {
-    int container_fd;
+    int container_fd = GPOINTER_TO_INT(ct2d->gpu_info.vfio_container);
+    uint8_t *mem_ptr = memory_region_get_ram_ptr(&ct2d->device_mem);
     struct vfio_iommu_type1_dma_map dma_map = {
         .argsz = sizeof(dma_map),
         .flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE,
-        .vaddr = 0,  /* Will be set to device memory */
-        .iova = 0,   /* IO virtual address */
-        .size = 0,   /* Will be set to device memory size */
+        .vaddr = (uint64_t)(mem_ptr + offset),
+        .iova = offset,
+        .size = size,
     };
 
-    container_fd = GPOINTER_TO_INT(ct2d->gpu_info.vfio_container);
+    if (ioctl(container_fd, VFIO_IOMMU_MAP_DMA, &dma_map) < 0) {
+        error_setg(errp,
+                   "Failed to map DMA region IOVA=0x%" PRIx64
+                   " size=0x%" PRIx64 ": %s",
+                   offset, size, strerror(errno));
+        return -1;
+    }
 
-    /* Get device memory pointer */
-    uint8_t *mem_ptr = memory_region_get_ram_ptr(&ct2d->device_mem);
-    if (!mem_ptr) {
+    qemu_log("CXL Type2: DMA mapping configured - IOVA: 0x%" PRIx64
+             ", size: 0x%" PRIx64 "\n", offset, size);
+    return 0;
+}
+
+static void cxl_type2_vfio_dma_unmap_range(CXLType2State *ct2d,
+                                            uint64_t offset, uint64_t size)
+{
+    int container_fd = GPOINTER_TO_INT(ct2d->gpu_info.vfio_container);
+    struct vfio_iommu_type1_dma_unmap dma_unmap = {
+        .argsz = sizeof(dma_unmap),
+        .iova = offset,
+        .size = size,
+    };
+
+    if (size && ioctl(container_fd, VFIO_IOMMU_UNMAP_DMA, &dma_unmap) < 0) {
+        qemu_log("CXL Type2: Warning - Failed to unmap DMA IOVA=0x%" PRIx64
+                 " size=0x%" PRIx64 ": %s\n",
+                 offset, size, strerror(errno));
+    }
+}
+
+size_t cxl_type2_vfio_dma_ranges(const CXLType2State *ct2d,
+                                 CXLType2MemoryRange ranges[2])
+{
+    uint64_t aperture_end;
+    size_t count = 0;
+
+    if (!ct2d->model_aperture.size) {
+        ranges[count++] = (CXLType2MemoryRange) {
+            .size = ct2d->device_mem_size,
+        };
+        return count;
+    }
+
+    aperture_end = ct2d->model_aperture.offset + ct2d->model_aperture.size;
+    if (ct2d->model_aperture.offset) {
+        ranges[count++] = (CXLType2MemoryRange) {
+            .size = ct2d->model_aperture.offset,
+        };
+    }
+    if (aperture_end < ct2d->device_mem_size) {
+        ranges[count++] = (CXLType2MemoryRange) {
+            .offset = aperture_end,
+            .size = ct2d->device_mem_size - aperture_end,
+        };
+    }
+
+    return count;
+}
+
+/*
+ * The model aperture is serviced through the file-backed CXL path. Mapping it
+ * through the ordinary BAR4 DMA backing would create a second physical owner.
+ */
+static int cxl_type2_vfio_dma_map(CXLType2State *ct2d, Error **errp)
+{
+    CXLType2MemoryRange ranges[2];
+    size_t count;
+
+    if (!memory_region_get_ram_ptr(&ct2d->device_mem)) {
         error_setg(errp, "Failed to get device memory pointer");
         return -1;
     }
 
-    dma_map.vaddr = (uint64_t)mem_ptr;
-    dma_map.iova = 0;  /* Map at IOVA 0 */
-    dma_map.size = ct2d->device_mem_size;
-
-    /* Map the device memory for DMA */
-    if (ioctl(container_fd, VFIO_IOMMU_MAP_DMA, &dma_map) < 0) {
-        error_setg(errp, "Failed to map DMA region: %s", strerror(errno));
-        return -1;
+    count = cxl_type2_vfio_dma_ranges(ct2d, ranges);
+    for (size_t i = 0; i < count; i++) {
+        if (cxl_type2_vfio_dma_map_range(ct2d, ranges[i].offset,
+                                         ranges[i].size, errp) < 0) {
+            while (i) {
+                i--;
+                cxl_type2_vfio_dma_unmap_range(ct2d, ranges[i].offset,
+                                                ranges[i].size);
+            }
+            return -1;
+        }
     }
-
-    qemu_log("CXL Type2: DMA mapping configured - IOVA: 0x%llx, Size: %llu MB\n",
-             dma_map.iova, dma_map.size / (1024 * 1024));
 
     return 0;
 }
@@ -802,15 +883,22 @@ int cxl_type2_hetgpu_init(CXLType2State *ct2d, Error **errp)
     fflush(stderr);
 
     /* Initialize hetGPU */
-    err = ct2d->paired_case.required ?
-          hetgpu_init_formal(hetgpu,
-                             ct2d->gpu_info.hetgpu_backend,
-                             ct2d->gpu_info.hetgpu_device_index,
-                             lib_path) :
-          hetgpu_init(hetgpu,
-                      ct2d->gpu_info.hetgpu_backend,
-                      ct2d->gpu_info.hetgpu_device_index,
-                      lib_path);
+    if (ct2d->paired_case.required) {
+        err = hetgpu_init_formal(hetgpu,
+                                 ct2d->gpu_info.hetgpu_backend,
+                                 ct2d->gpu_info.hetgpu_device_index,
+                                 lib_path);
+    } else if (ct2d->model_alias_gate.output) {
+        err = hetgpu_init_capability(hetgpu,
+                                     ct2d->gpu_info.hetgpu_backend,
+                                     ct2d->gpu_info.hetgpu_device_index,
+                                     lib_path);
+    } else {
+        err = hetgpu_init(hetgpu,
+                          ct2d->gpu_info.hetgpu_backend,
+                          ct2d->gpu_info.hetgpu_device_index,
+                          lib_path);
+    }
     if (err != HETGPU_SUCCESS) {
         error_setg(errp, "hetGPU initialization failed: %s",
                    hetgpu_get_error_string(err));
@@ -1051,8 +1139,8 @@ int cxl_type2_gpu_init(CXLType2State *ct2d, Error **errp)
             fflush(stderr);
             return 0;
         }
-        if (ct2d->paired_case.required) {
-            qemu_log("CXL Type2: formal paired mode rejects hetGPU "
+        if (ct2d->paired_case.required || ct2d->model_alias_gate.output) {
+            qemu_log("CXL Type2: strict mode rejects hetGPU "
                      "initialization failure\n");
             return -1;
         }
@@ -1172,18 +1260,14 @@ void cxl_type2_gpu_cleanup(CXLType2State *ct2d)
         qemu_log("CXL Type2: IRQ thread stopped\n");
     }
 
-    /* Unmap DMA regions */
+    /* Unmap the same BAR4 ranges that initialization admitted. */
     if (ct2d->gpu_info.vfio_container) {
-        int container_fd = GPOINTER_TO_INT(ct2d->gpu_info.vfio_container);
-        struct vfio_iommu_type1_dma_unmap dma_unmap = {
-            .argsz = sizeof(dma_unmap),
-            .flags = 0,
-            .iova = 0,
-            .size = ct2d->device_mem_size,
-        };
+        CXLType2MemoryRange ranges[2];
+        size_t count = cxl_type2_vfio_dma_ranges(ct2d, ranges);
 
-        if (ioctl(container_fd, VFIO_IOMMU_UNMAP_DMA, &dma_unmap) < 0) {
-            qemu_log("CXL Type2: Warning - Failed to unmap DMA: %s\n", strerror(errno));
+        for (size_t i = 0; i < count; i++) {
+            cxl_type2_vfio_dma_unmap_range(ct2d, ranges[i].offset,
+                                            ranges[i].size);
         }
     }
 
@@ -1599,6 +1683,48 @@ static bool cxl_type2_memsim_request(CXLType2State *ct2d, uint8_t op_type,
                                         resp);
 }
 
+bool cxl_type2_model_aperture_access(CXLType2State *ct2d, uint64_t offset,
+                                     uint64_t size, bool is_write,
+                                     uint64_t *latency_ns,
+                                     const char **reason)
+{
+    CXLMemSimResponse response;
+
+    if (latency_ns) {
+        *latency_ns = 0;
+    }
+    if (reason) {
+        *reason = NULL;
+    }
+    if (!ct2d || !latency_ns || !reason || !size || size > 64) {
+        if (reason) {
+            *reason = "model-aperture-request-invalid";
+        }
+        return false;
+    }
+    if (!cxl_type2_range_contains(ct2d->model_aperture.offset,
+                                  ct2d->model_aperture.size,
+                                  offset, size)) {
+        *reason = "model-aperture-range-rejected";
+        return false;
+    }
+    if (is_write) {
+        *reason = "model-aperture-readonly";
+        return false;
+    }
+    if (!cxl_type2_fabric_access_allowed(ct2d, offset, size, false, false)) {
+        *reason = "model-aperture-fabric-rejected";
+        return false;
+    }
+    if (!cxl_type2_memsim_request(ct2d, CXL_OP_READ, offset, size, NULL,
+                                  &response)) {
+        *reason = "model-aperture-cxl-read-failed";
+        return false;
+    }
+    *latency_ns = response.latency_ns;
+    return true;
+}
+
 /* ========================================================================
  * Memory Access Handlers with Coherency
  * ======================================================================== */
@@ -1719,10 +1845,6 @@ static void cxl_type2_cache_write(void *opaque, hwaddr addr, uint64_t value, uns
     }
 
 }
-
-static bool cxl_type2_fabric_access_allowed(CXLType2State *ct2d, uint64_t addr,
-                                            uint64_t size, bool is_write,
-                                            bool is_atomic);
 
 static uint64_t cxl_type2_device_mem_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -10570,6 +10692,63 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
         return;
     }
 
+    {
+        size_t host_page_size = qemu_real_host_page_size();
+        uint64_t coherent_pool_size = 256 * MiB;
+        bool gate_requested = ct2d->model_alias_gate.output ||
+                              ct2d->model_alias_gate.fixture ||
+                              ct2d->model_alias_gate.mode ||
+                              ct2d->model_alias_gate.length ||
+                              ct2d->model_alias_gate.file_offset ||
+                              ct2d->model_alias_gate.shmem_offset;
+
+        if (coherent_pool_size > ct2d->device_mem_size / 2) {
+            coherent_pool_size = ct2d->device_mem_size / 4;
+        }
+        if (ct2d->model_aperture.offset && !ct2d->model_aperture.size) {
+            error_setg(errp, "model-aperture-offset requires a nonzero size");
+            return;
+        }
+        if (ct2d->model_aperture.size &&
+            ((ct2d->model_aperture.offset % host_page_size) ||
+             (ct2d->model_aperture.size % host_page_size) ||
+             !cxl_type2_range_contains(0, ct2d->device_mem_size,
+                                       ct2d->model_aperture.offset,
+                                       ct2d->model_aperture.size) ||
+             ct2d->model_aperture.offset + ct2d->model_aperture.size >
+                 ct2d->device_mem_size - coherent_pool_size)) {
+            error_setg(errp, "model aperture must be host-page aligned, "
+                       "inside BAR4, and below the coherent pool");
+            return;
+        }
+        if (gate_requested) {
+            if (!ct2d->model_alias_gate.output ||
+                ct2d->model_alias_gate.output[0] != '/' ||
+                !ct2d->model_alias_gate.fixture ||
+                ct2d->model_alias_gate.fixture[0] != '/' ||
+                !ct2d->model_alias_gate.mode ||
+                (strcmp(ct2d->model_alias_gate.mode, "read") &&
+                 strcmp(ct2d->model_alias_gate.mode, "write-negative")) ||
+                !ct2d->model_alias_gate.length ||
+                (ct2d->model_alias_gate.file_offset % host_page_size) ||
+                (ct2d->model_alias_gate.shmem_offset % host_page_size) ||
+                (ct2d->model_alias_gate.length % host_page_size) ||
+                ct2d->model_alias_gate.length < 10 * host_page_size ||
+                ct2d->model_alias_gate.length > ct2d->model_aperture.size ||
+                !ct2d->direct_source_fs ||
+                ct2d->gpu_info.mode != CXL_TYPE2_GPU_MODE_HETGPU ||
+                ct2d->gpu_info.hetgpu_backend != HETGPU_BACKEND_NVIDIA ||
+                !ct2d->gpu_info.hetgpu_lib_path ||
+                ct2d->gpu_info.hetgpu_lib_path[0] != '/') {
+                error_setg(errp, "model alias gate requires absolute fixture, "
+                           "output and hetgpu-lib paths, an aligned ten-page "
+                           "fixture range inside the model aperture, a DAX "
+                           "direct-source-fs, and explicit NVIDIA hetGPU mode");
+                return;
+            }
+        }
+    }
+
     if (ct2d->paired_case.required) {
         if (!ct2d->paired_case.run_root ||
             ct2d->paired_case.run_root[0] != '/' ||
@@ -10849,6 +11028,13 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
     /* Connect to CXLMemSim. The TCP server protocol is request/response. */
     cxlmemsim_connect(ct2d);
 
+    if (ct2d->model_alias_gate.output) {
+        if (!cxl_type2_model_alias_gate_run(ct2d, errp)) {
+            return;
+        }
+        qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
+    }
+
     qemu_log("CXL Type2: Device realized - Cache: %zu MB, DevMem: %zu MB\n",
              ct2d->cache_size / MiB, ct2d->device_mem_size / MiB);
 }
@@ -10933,6 +11119,22 @@ static const Property cxl_type2_props[] = {
                      direct_registration_padding_limit, 0),
     DEFINE_PROP_LINK("direct-source-fs", CXLType2State, direct_source_fs,
                      TYPE_VHOST_USER_FS_PCI, Object *),
+    DEFINE_PROP_SIZE("model-aperture-offset", CXLType2State,
+                     model_aperture.offset, 0),
+    DEFINE_PROP_SIZE("model-aperture-size", CXLType2State,
+                     model_aperture.size, 0),
+    DEFINE_PROP_STRING("model-alias-gate-output", CXLType2State,
+                       model_alias_gate.output),
+    DEFINE_PROP_STRING("model-alias-gate-fixture", CXLType2State,
+                       model_alias_gate.fixture),
+    DEFINE_PROP_STRING("model-alias-gate-mode", CXLType2State,
+                       model_alias_gate.mode),
+    DEFINE_PROP_SIZE("model-alias-gate-file-offset", CXLType2State,
+                     model_alias_gate.file_offset, 0),
+    DEFINE_PROP_SIZE("model-alias-gate-shmem-offset", CXLType2State,
+                     model_alias_gate.shmem_offset, 0),
+    DEFINE_PROP_SIZE("model-alias-gate-length", CXLType2State,
+                     model_alias_gate.length, 0),
     DEFINE_PROP_UINT64("sn", CXLType2State, sn, 0),
     DEFINE_PROP_PCIE_LINK_SPEED("x-speed", CXLType2State,
                                 speed, PCIE_LINK_SPEED_64),

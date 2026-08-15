@@ -100,6 +100,11 @@ class ComponentArtifactTest(unittest.TestCase):
                     "mode": "0644",
                 },
                 {"path": "bin/qemu-system-x86_64", "type": "file", "mode": "0755"},
+                {
+                    "path": "bin/run_cxl_actual_aperture_gate.sh",
+                    "type": "file",
+                    "mode": "0755",
+                },
                 {"path": "lib/libaio.so.1t64", "type": "file", "mode": "0644"},
                 {"path": "lib/libcapstone.so.4", "type": "file", "mode": "0644"},
                 {"path": "libexec/qemu/libhotblocks.so", "type": "file", "mode": "0755"},

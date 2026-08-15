@@ -39,6 +39,11 @@
       "mode": "0755"
     },
     {
+      "path": "bin/run_cxl_actual_aperture_gate.sh",
+      "type": "file",
+      "mode": "0755"
+    },
+    {
       "path": "lib/libaio.so.1t64",
       "type": "file",
       "mode": "0644"

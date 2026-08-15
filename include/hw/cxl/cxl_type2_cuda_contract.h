@@ -128,8 +128,48 @@ typedef struct CXLType2CudaAllocation {
     uint64_t content_generation;
     uint64_t device_alias;
     uint64_t consumer_refs;
+    uint64_t normal_inflight_refs;
+    uint64_t graph_binding_refs;
+    uint64_t graph_inflight_refs;
+    struct CXLType2CudaPageableAlias *pageable_alias;
+    bool poisoned;
     bool dax_backed;
 } CXLType2CudaAllocation;
+
+typedef struct CXLType2CudaAliasSource {
+    int fd;
+    uint64_t file_offset;
+    uint64_t destination_offset;
+    uint64_t length;
+    uint64_t mapping_generation;
+    uint64_t logical_cxl_offset;
+    uint64_t stat_device;
+    uint64_t stat_inode;
+    uint64_t stat_size;
+    uint32_t stat_mode;
+    bool readonly;
+} CXLType2CudaAliasSource;
+
+typedef struct CXLType2CudaPageableAlias {
+    void *owned_reservation;
+    uint64_t owned_reservation_size;
+    void *reservation;
+    uint64_t reservation_size;
+    uint64_t logical_bytes;
+    uint64_t guard_bytes;
+    uint64_t content_generation;
+    uint64_t file_mapped_bytes;
+    uint64_t derived_boundary_copy_bytes;
+    uint64_t boundary_composition_wall_ns;
+    size_t derived_boundary_pages;
+    CXLType2CudaAliasSource *sources;
+    size_t source_count;
+} CXLType2CudaPageableAlias;
+
+typedef enum CXLType2CudaAliasConsumer {
+    CXL_TYPE2_CUDA_ALIAS_NORMAL,
+    CXL_TYPE2_CUDA_ALIAS_GRAPH,
+} CXLType2CudaAliasConsumer;
 
 typedef enum CXLType2CudaGenerationBoundary {
     CXL_TYPE2_CUDA_GENERATION_OPEN,
@@ -268,6 +308,27 @@ bool cxl_type2_cuda_allocation_release_alias(
 bool cxl_type2_cuda_allocation_materialize(
     CXLType2CudaAllocationTable *table, uint64_t base, uint64_t epoch,
     uint64_t generation);
+bool cxl_type2_cuda_allocation_map_pageable_alias(
+    CXLType2CudaAllocationTable *table, uint64_t base, uint64_t epoch,
+    uint64_t generation, const CXLType2CudaAliasSource *sources,
+    size_t source_count, uint64_t logical_bytes, uint64_t guard_bytes,
+    uint64_t *device_alias, const char **reason);
+bool cxl_type2_cuda_allocation_drop_pageable_alias(
+    CXLType2CudaAllocationTable *table, uint64_t base, uint64_t epoch,
+    uint64_t generation);
+bool cxl_type2_cuda_allocation_bind_graph_alias(
+    CXLType2CudaAllocationTable *table, uint64_t base, uint64_t epoch,
+    uint64_t device_alias);
+bool cxl_type2_cuda_allocation_unbind_graph_alias(
+    CXLType2CudaAllocationTable *table, uint64_t base, uint64_t epoch,
+    uint64_t device_alias);
+bool cxl_type2_cuda_allocation_acquire_pageable_alias(
+    CXLType2CudaAllocationTable *table, uint64_t base, uint64_t epoch,
+    uint64_t generation, CXLType2CudaAliasConsumer consumer,
+    uint64_t *device_alias);
+bool cxl_type2_cuda_allocation_release_pageable_alias(
+    CXLType2CudaAllocationTable *table, uint64_t base, uint64_t epoch,
+    uint64_t generation, CXLType2CudaAliasConsumer consumer);
 bool cxl_type2_cuda_generation_population_complete(
     CXLType2CudaAllocationTable *table, uint64_t destination, uint64_t size);
 bool cxl_type2_cuda_generation_consume(
