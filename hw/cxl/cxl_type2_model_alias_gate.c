@@ -309,12 +309,14 @@ static bool gate_publish(const GateState *state, const CXLType2State *ct2d,
     json_writer_str(writer, "kind", "cxl-type2-model-alias-gate");
     json_writer_str(writer, "mode", ct2d->model_alias_gate.mode);
     json_writer_str(writer, "status", state->first_failure ? "fail" : "pass");
-    json_writer_start_object(writer, "first_failure");
-    state->first_failure ?
-        json_writer_str(writer, "stage", state->first_failure) :
-        json_writer_null(writer, "stage");
-    json_writer_int64(writer, "result", state->first_result);
-    json_writer_end_object(writer);
+    if (state->first_failure) {
+        json_writer_start_object(writer, "first_failure");
+        json_writer_str(writer, "stage", state->first_failure);
+        json_writer_int64(writer, "result", state->first_result);
+        json_writer_end_object(writer);
+    } else {
+        json_writer_null(writer, "first_failure");
+    }
     json_writer_start_array(writer, "predicates");
     for (size_t i = 0; i < state->predicate_count; i++) {
         const GatePredicate *predicate = &state->predicates[i];

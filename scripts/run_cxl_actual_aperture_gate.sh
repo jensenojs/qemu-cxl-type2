@@ -253,7 +253,7 @@ readonly read_result=$work_dir/qemu-read-gate.json
 readonly read_qemu_log=$work_dir/qemu-read.log
 readonly read_virtiofsd_log=$work_dir/virtiofsd-read.log
 run_qemu_gate read "$read_result" "$read_qemu_log" \
-    "$read_virtiofsd_log" "$work_dir/virtiofsd-read.sock"
+    "$read_virtiofsd_log" "$work_dir/r.sock"
 read_qemu_exit=$last_qemu_exit
 read_virtiofsd_exit=$last_virtiofsd_exit
 
@@ -261,7 +261,7 @@ readonly write_result=$work_dir/qemu-write-negative-gate.json
 readonly write_qemu_log=$work_dir/qemu-write-negative.log
 readonly write_virtiofsd_log=$work_dir/virtiofsd-write-negative.log
 run_qemu_gate write-negative "$write_result" "$write_qemu_log" \
-    "$write_virtiofsd_log" "$work_dir/virtiofsd-write-negative.sock"
+    "$write_virtiofsd_log" "$work_dir/w.sock"
 write_qemu_exit=$last_qemu_exit
 write_virtiofsd_exit=$last_virtiofsd_exit
 
