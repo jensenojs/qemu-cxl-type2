@@ -52,6 +52,10 @@ def add_symlink(stream: tarfile.TarFile, name: str, target: str) -> None:
 
 
 class ComponentArtifactTest(unittest.TestCase):
+    def test_component_candidate_descriptor_has_no_schema_version(self) -> None:
+        publish = (Path(__file__).resolve().parents[1] / "scripts/publish_component.sh").read_text()
+        self.assertNotIn('"schema_version"', publish)
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)

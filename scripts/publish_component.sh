@@ -140,7 +140,6 @@ python3 - "$CANDIDATE_OUT" <<'PY'
 import json, sys
 candidate=json.load(open(sys.argv[1]))
 json.dump({
-    "schema_version":1,
     "name":"component-candidate",
     "kind":"component-candidate",
     "transport":"inline-json",
