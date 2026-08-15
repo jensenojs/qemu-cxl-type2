@@ -27,7 +27,6 @@ def file_entry(path: str, content: bytes, mode: int = 0o755) -> dict[str, object
 
 def manifest(files: list[dict[str, object]]) -> dict[str, object]:
     return {
-        "schema_version": 1,
         "component": "fixture",
         "source": {"repository": "https://example.invalid/fixture.git", "commit": "a" * 40},
         "build": {"profile_sha256": "b" * 64, "toolchain_image": "example@sha256:" + "c" * 64},
@@ -52,10 +51,6 @@ def add_symlink(stream: tarfile.TarFile, name: str, target: str) -> None:
 
 
 class ComponentArtifactTest(unittest.TestCase):
-    def test_component_candidate_descriptor_has_no_schema_version(self) -> None:
-        publish = (Path(__file__).resolve().parents[1] / "scripts/publish_component.sh").read_text()
-        self.assertNotIn('"schema_version"', publish)
-
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)

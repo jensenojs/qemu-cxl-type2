@@ -1,5 +1,4 @@
 {
-  "schema_version": 1,
   "component": "qemu-cxl-type2",
   "source_repository": "https://cnb.cool/gevico.online/jensen/qemu-cxl-type2.git",
   "artifact_repository": "docker.cnb.cool/gevico.online/jensen/qemu-cxl-type2",

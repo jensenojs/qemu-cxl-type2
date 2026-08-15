@@ -1,5 +1,4 @@
 {
-  "schema_version": 1,
   "component": "qemu-cxl-type2",
   "target_arch": "amd64",
   "baseline_commit": "49b1a4e0edd7e1605975292fd62b85d2942db80b",

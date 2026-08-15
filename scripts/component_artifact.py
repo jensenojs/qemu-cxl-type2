@@ -16,7 +16,6 @@ from typing import Any
 
 
 MANIFEST_KEYS = {
-    "schema_version",
     "component",
     "source",
     "build",
@@ -208,7 +207,6 @@ def create_manifest(
     verify_profile(payload, profile)
     files, dependencies = payload_facts(payload)
     return {
-        "schema_version": 1,
         "component": contract["component"],
         "source": {
             "repository": contract["source_repository"],
@@ -226,8 +224,6 @@ def create_manifest(
 def validate_manifest(manifest: dict[str, Any]) -> None:
     if set(manifest) != MANIFEST_KEYS:
         fail(f"unexpected manifest fields: {sorted(set(manifest) - MANIFEST_KEYS)}")
-    if manifest["schema_version"] != 1:
-        fail("unsupported manifest schema")
     if not isinstance(manifest["component"], str) or not manifest["component"]:
         fail("invalid component name")
     if not isinstance(manifest["source"], dict) or set(manifest["source"]) != SOURCE_KEYS:
