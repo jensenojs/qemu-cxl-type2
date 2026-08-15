@@ -5750,8 +5750,9 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
                                           void *stream,
                                           CXLType2DirectSource *source_override,
                                           uint64_t *fail_index,
-                                         uint64_t *logical_enqueued,
-                                         uint64_t *fragments_enqueued)
+                                          const char **failure_stage,
+                                          uint64_t *logical_enqueued,
+                                          uint64_t *fragments_enqueued)
 {
     typedef struct CXLType2DirectResolvedRange {
         CXLGPUDirectRangeV1 wire;
@@ -5777,16 +5778,19 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
     size_t failed_span = SIZE_MAX;
     int result = CXL_GPU_SUCCESS;
 
+    *failure_stage = NULL;
     *logical_enqueued = 0;
     *fragments_enqueued = 0;
     if (!ct2d->cuda_direct_source || ct2d->direct_source_poisoned ||
         !cxl_gpu_direct_batch_validate(
             payload, payload_capacity, range_count, payload_bytes,
             fail_index)) {
+        *failure_stage = "batch-validate";
         return CXL_GPU_ERROR_INVALID_VALUE;
     }
     resolved = g_try_new(CXLType2DirectResolvedRange, range_count);
     if (!resolved) {
+        *failure_stage = "batch-allocate";
         result = CXL_GPU_ERROR_OUT_OF_MEMORY;
         goto out;
     }
@@ -5814,6 +5818,7 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
                 ct2d, &resolved[i].wire, source_override,
                 &resolved[i].source)) {
             *fail_index = i;
+            *failure_stage = "range-resolve";
             result = CXL_GPU_ERROR_INVALID_VALUE;
             goto out;
         }
@@ -5899,6 +5904,7 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
     hosts = g_try_new(const void *, spans->len);
     sizes = g_try_new(size_t, spans->len);
     if (!destinations || !hosts || !sizes) {
+        *failure_stage = "batch-allocate";
         result = CXL_GPU_ERROR_OUT_OF_MEMORY;
         goto out;
     }
@@ -5908,6 +5914,7 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
 
         if (span->registration->revoke_pending) {
             *fail_index = span->logical_index;
+            *failure_stage = "registration-revoked";
             result = CXL_GPU_ERROR_INVALID_VALUE;
             goto out;
         }
@@ -5921,6 +5928,7 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
                           ? g_array_index(spans, CXLType2DirectSpan,
                                           failed_span).logical_index
                           : 0;
+        *failure_stage = "destination-overlap";
         result = CXL_GPU_ERROR_INVALID_VALUE;
         goto out;
     }
@@ -5965,6 +5973,7 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
                 if (!span->registration->cuda_registered ||
                     span->registration->revoke_pending) {
                     *fail_index = span->logical_index;
+                    *failure_stage = "registration-not-ready";
                     result = CXL_GPU_ERROR_INVALID_VALUE;
                     goto out;
                 }
@@ -6005,6 +6014,7 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
 
                 *fail_index = g_array_index(
                     spans, CXLType2DirectSpan, failed).logical_index;
+                *failure_stage = "driver-copy-submit";
                 goto out;
             }
         }
@@ -6015,6 +6025,7 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
             ct2d, boundary_span->registration);
         if (result != CXL_GPU_SUCCESS) {
             *fail_index = boundary_span->logical_index;
+            *failure_stage = "physical-register";
             goto out;
         }
         slice_start = boundary;
@@ -9514,6 +9525,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             uint64_t fail_idx = SIZE_MAX;
             uint64_t logical_enqueued = 0;
             uint64_t fragments_enqueued = 0;
+            const char *batch_failure_stage = NULL;
             const char *failure_stage = NULL;
             void *stream = NULL;
 
@@ -9526,11 +9538,17 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 !cxl_type2_stream_from_wire(ct2d, ct2d->gpu_cmd.params[2],
                                             &stream)) {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                cxl_type2_log_direct_source_register_failure(
+                    ct2d, "command-prevalidate", SIZE_MAX,
+                    ct2d->gpu_cmd.cmd_result, register_bytes);
                 break;
             }
             direct_bytes = range_count * sizeof(CXLGPUDirectRangeV1);
             if (direct_bytes > CXL_GPU_BATCH_DATA_SIZE - register_bytes) {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                cxl_type2_log_direct_source_register_failure(
+                    ct2d, "command-prevalidate", SIZE_MAX,
+                    ct2d->gpu_cmd.cmd_result, register_bytes);
                 break;
             }
             ct2d->gpu_cmd.cmd_result = cxl_type2_direct_source_register(
@@ -9551,19 +9569,30 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             ct2d->gpu_cmd.cmd_result = cxl_type2_direct_batch_submit(
                 ct2d, ct2d->gpu_cmd.batch_data + register_bytes,
                 CXL_GPU_BATCH_DATA_SIZE - register_bytes, range_count,
-                direct_bytes, stream, source, &fail_idx, &logical_enqueued,
+                direct_bytes, stream, source, &fail_idx,
+                &batch_failure_stage, &logical_enqueued,
                 &fragments_enqueued);
             ct2d->gpu_cmd.results[0] = fail_idx;
             ct2d->gpu_cmd.results[1] = logical_enqueued;
             ct2d->gpu_cmd.results[2] = fragments_enqueued;
             ct2d->paired_case.active_direct_logical_ranges +=
                 logical_enqueued;
+            if (ct2d->gpu_cmd.cmd_result != CXL_GPU_SUCCESS) {
+                g_assert(batch_failure_stage);
+                cxl_type2_log_direct_source_register_failure(
+                    ct2d, batch_failure_stage, fail_idx,
+                    ct2d->gpu_cmd.cmd_result,
+                    register_bytes + direct_bytes);
+            }
             if (!source->pending_refcount) {
                 int cleanup = cxl_type2_direct_source_unregister(
                     ct2d, source_id);
 
                 if (ct2d->gpu_cmd.cmd_result == CXL_GPU_SUCCESS &&
                     cleanup != CXL_GPU_SUCCESS) {
+                    cxl_type2_log_direct_source_register_failure(
+                        ct2d, "source-cleanup", SIZE_MAX, cleanup,
+                        register_bytes + direct_bytes);
                     ct2d->gpu_cmd.cmd_result = cleanup;
                 }
             }
@@ -9575,6 +9604,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             uint64_t fail_idx = SIZE_MAX;
             uint64_t logical_enqueued = 0;
             uint64_t fragments_enqueued = 0;
+            const char *failure_stage = NULL;
             void *stream = NULL;
 
             ct2d->gpu_cmd.results[0] = SIZE_MAX;
@@ -9591,7 +9621,8 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             ct2d->gpu_cmd.cmd_result = cxl_type2_direct_batch_submit(
                 ct2d, ct2d->gpu_cmd.batch_data, CXL_GPU_BATCH_DATA_SIZE,
                 ct2d->gpu_cmd.params[0], ct2d->gpu_cmd.params[1], stream,
-                NULL, &fail_idx, &logical_enqueued, &fragments_enqueued);
+                NULL, &fail_idx, &failure_stage, &logical_enqueued,
+                &fragments_enqueued);
             ct2d->gpu_cmd.results[0] = fail_idx;
             ct2d->gpu_cmd.results[1] = logical_enqueued;
             ct2d->gpu_cmd.results[2] = fragments_enqueued;
