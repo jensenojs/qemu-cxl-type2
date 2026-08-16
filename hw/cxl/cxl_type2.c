@@ -2817,7 +2817,11 @@ static QDict *cxl_type2_model_supply_event(CXLType2State *ct2d)
                       ct2d->paired_case.active_case));
     cxl_type2_qdict_put_u64(event, "case_epoch",
                             ct2d->paired_case.active_epoch);
-    qdict_put_str(event, "planned_route", ct2d->model_supply.route_text);
+    qdict_put_str(event, "planned_route",
+                  ct2d->model_supply.route ==
+                          CXL_TYPE2_MODEL_SUPPLY_CXL_DIRECT
+                      ? "cxl-direct"
+                      : "selected-htod");
     return event;
 }
 
