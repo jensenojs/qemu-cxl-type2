@@ -127,6 +127,9 @@ static bool cxl_type2_memsim_request(CXLType2State *ct2d, uint8_t op_type,
 static bool cxl_type2_fabric_access_allowed(CXLType2State *ct2d, uint64_t addr,
                                             uint64_t size, bool is_write,
                                             bool is_atomic);
+static bool cxl_type2_register_gpu_handle(void ***handles, size_t *capacity,
+                                          uint32_t *count, void *handle,
+                                          uint32_t *id);
 
 static bool cxl_type2_range_contains(uint64_t outer_offset,
                                      uint64_t outer_size,
@@ -4073,7 +4076,8 @@ cxl_type2_graph_generation_consumers_snapshot(CXLType2State *ct2d,
         const HetGPUParamLayout *layout = NULL;
         CXLType2GraphNodeGenerationConsumers node;
         uint32_t function_id = UINT32_MAX;
-        uint64_t graph_node_token = UINT64_MAX;
+        uint32_t graph_node_id;
+        uint64_t graph_node_token;
         const char *consumer_reason = NULL;
         int node_type = -1;
 
@@ -4098,13 +4102,15 @@ cxl_type2_graph_generation_consumers_snapshot(CXLType2State *ct2d,
                 break;
             }
         }
-        for (uint32_t j = 0; j < ct2d->gpu_cmd.num_graph_nodes; j++) {
-            if (ct2d->gpu_cmd.graph_nodes[j] == nodes[i]) {
-                graph_node_token = j;
-                break;
-            }
+        if (!cxl_type2_register_gpu_handle(
+                &ct2d->gpu_cmd.graph_nodes,
+                &ct2d->gpu_cmd.graph_nodes_capacity,
+                &ct2d->gpu_cmd.num_graph_nodes, nodes[i],
+                &graph_node_id)) {
+            goto failed;
         }
-        if (function_id == UINT32_MAX || graph_node_token == UINT64_MAX ||
+        graph_node_token = graph_node_id;
+        if (function_id == UINT32_MAX ||
             !cxl_type2_model_consumer_validate(
                 ct2d, &ct2d->gpu_cmd.functions[function_id], layout,
                 params.kernel_params, &consumer_reason)) {
