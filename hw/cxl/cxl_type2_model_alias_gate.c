@@ -546,6 +546,7 @@ bool cxl_type2_model_alias_gate_run(CXLType2State *ct2d, Error **errp)
         cxl_type2_cuda_allocation_record(&ct2d->cuda_allocations, base,
                                          total_bytes, &epoch)) {
         uint64_t alias_begin_ns;
+        uint64_t source_call_id = 1;
 
         allocation_recorded = true;
         state.allocation_epoch = epoch;
@@ -555,7 +556,8 @@ bool cxl_type2_model_alias_gate_run(CXLType2State *ct2d, Error **errp)
         alias_begin_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
         if (cxl_type2_cuda_allocation_map_pageable_alias(
                 &ct2d->cuda_allocations, base, epoch, 1, sources,
-                G_N_ELEMENTS(sources), state.logical_bytes,
+                G_N_ELEMENTS(sources), &source_call_id, 1, 0,
+                state.logical_bytes,
                 state.guard_bytes, &alias, &reason)) {
             CXLType2CudaAllocation *allocation =
                 cxl_type2_cuda_allocation_find(&ct2d->cuda_allocations,
@@ -752,10 +754,12 @@ bool cxl_type2_model_alias_gate_run(CXLType2State *ct2d, Error **errp)
                      pinned_generation, page_size);
         reason = NULL;
         uint64_t alias_begin_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        uint64_t source_call_id = 2;
 
         if (graph_bound && cxl_type2_cuda_allocation_map_pageable_alias(
                 &ct2d->cuda_allocations, base, epoch, 2, sources,
-                G_N_ELEMENTS(sources), state.logical_bytes,
+                G_N_ELEMENTS(sources), &source_call_id, 1, 0,
+                state.logical_bytes,
                 state.guard_bytes, &state.alias_address_generation_two,
                 &reason) &&
             state.alias_address_generation_two ==

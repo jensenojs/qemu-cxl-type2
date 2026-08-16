@@ -23,6 +23,10 @@
 #include "qemu/timer.h"
 #include "qemu/units.h"
 #include "qapi/error.h"
+#include "qobject/qdict.h"
+#include "qobject/qjson.h"
+#include "qobject/qlist.h"
+#include "qobject/qnum.h"
 #include "exec/target_page.h"
 #include "hw/cxl/cxl.h"
 #include "hw/cxl/cxl_device.h"
@@ -2796,6 +2800,207 @@ static const char *cxl_type2_paired_case_name(uint32_t case_kind)
     }
 }
 
+static void cxl_type2_qdict_put_u64(QDict *dict, const char *key,
+                                    uint64_t value)
+{
+    qdict_put(dict, key, qnum_from_uint(value));
+}
+
+static QDict *cxl_type2_model_supply_event(CXLType2State *ct2d)
+{
+    QDict *event = qdict_new();
+
+    cxl_type2_qdict_put_u64(event, "run_binding",
+                            ct2d->paired_case.run_binding);
+    qdict_put_str(event, "case",
+                  cxl_type2_paired_case_name(
+                      ct2d->paired_case.active_case));
+    cxl_type2_qdict_put_u64(event, "case_epoch",
+                            ct2d->paired_case.active_epoch);
+    qdict_put_str(event, "planned_route", ct2d->model_supply.route_text);
+    return event;
+}
+
+static void cxl_type2_model_supply_emit(const char *marker, QDict *event)
+{
+    g_autoptr(GString) json = qobject_to_json(QOBJECT(event));
+
+    qemu_log("%s %s\n", marker, json->str);
+    qobject_unref(event);
+}
+
+static void cxl_type2_model_supply_hash_event(GChecksum *checksum,
+                                               QDict *event)
+{
+    g_autoptr(GString) json = qobject_to_json(QOBJECT(event));
+
+    g_checksum_update(checksum, (const guchar *)json->str, json->len);
+    g_checksum_update(checksum, (const guchar *)"\n", 1);
+}
+
+static QList *cxl_type2_model_supply_source_calls(
+    const CXLType2CudaPageableAlias *alias)
+{
+    QList *calls = qlist_new();
+
+    if (alias) {
+        for (size_t i = 0; i < alias->contributing_source_call_count; i++) {
+            qlist_append(calls,
+                         qnum_from_uint(alias->contributing_source_call_ids[i]));
+        }
+    }
+    return calls;
+}
+
+static void cxl_type2_model_supply_fail(CXLType2State *ct2d,
+                                        uint64_t call_id,
+                                        const char *stage,
+                                        const char *detail,
+                                        uint64_t source_index,
+                                        uint64_t allocation_base,
+                                        uint64_t allocation_epoch,
+                                        uint64_t generation)
+{
+    QDict *event = cxl_type2_model_supply_event(ct2d);
+
+    if (!ct2d->model_supply.first_failure_stage) {
+        ct2d->model_supply.first_failure_stage = g_strdup(stage);
+        ct2d->model_supply.first_failure_detail = g_strdup(detail);
+    }
+    qdict_put_str(event, "stage", stage);
+    qdict_put_str(event, "detail", detail);
+    if (call_id) {
+        cxl_type2_qdict_put_u64(event, "call_id", call_id);
+    } else {
+        qdict_put_null(event, "call_id");
+    }
+    if (source_index != UINT64_MAX) {
+        cxl_type2_qdict_put_u64(event, "source_index", source_index);
+    } else {
+        qdict_put_null(event, "source_index");
+    }
+    if (allocation_base) {
+        cxl_type2_qdict_put_u64(event, "destination_allocation_id",
+                                allocation_base);
+        cxl_type2_qdict_put_u64(event, "allocation_epoch", allocation_epoch);
+    } else {
+        qdict_put_null(event, "destination_allocation_id");
+        qdict_put_null(event, "allocation_epoch");
+    }
+    if (generation) {
+        cxl_type2_qdict_put_u64(event, "content_generation", generation);
+    } else {
+        qdict_put_null(event, "content_generation");
+    }
+    cxl_type2_model_supply_emit("KIMI_MODEL_SUPPLY_FAILURE", event);
+}
+
+static const char *cxl_type2_model_supply_failure_stage(const char *stage)
+{
+    if (!stage) {
+        return "source-resolve";
+    }
+    if (!strcmp(stage, "batch-validate") ||
+        !strcmp(stage, "command-prevalidate") ||
+        !strcmp(stage, "wire-contract")) {
+        return "batch-validate";
+    }
+    if (!strcmp(stage, "range-admission") ||
+        !strcmp(stage, "destination-allocation") ||
+        !strcmp(stage, "member-range-admission") ||
+        !strcmp(stage, "source-coverage")) {
+        return "range-admission";
+    }
+    if (!strcmp(stage, "fabric-request")) {
+        return "fabric-request";
+    }
+    if (!strcmp(stage, "aperture-capacity")) {
+        return "aperture-capacity";
+    }
+    if (!strcmp(stage, "alias-geometry") ||
+        !strcmp(stage, "alias-stable-va-size-mismatch")) {
+        return "alias-geometry";
+    }
+    if (!strcmp(stage, "alias-byte-oracle-failed")) {
+        return "alias-oracle";
+    }
+    if (g_str_has_prefix(stage, "alias-") ||
+        !strcmp(stage, "source-view-allocate")) {
+        return "alias-map";
+    }
+    if (!strcmp(stage, "source-cleanup") ||
+        !strcmp(stage, "rollback-cleanup")) {
+        return "cleanup";
+    }
+    return "source-resolve";
+}
+
+static QDict *cxl_type2_model_supply_alias_release_event(
+    CXLType2State *ct2d, const CXLType2CudaAllocation *allocation)
+{
+    const CXLType2CudaPageableAlias *alias = allocation->pageable_alias;
+    QDict *event = cxl_type2_model_supply_event(ct2d);
+
+    qdict_put_str(event, "action", "release");
+    qdict_put_str(event, "result", "pass");
+    cxl_type2_qdict_put_u64(event, "destination_allocation_id",
+                            allocation->base);
+    cxl_type2_qdict_put_u64(event, "allocation_epoch", allocation->epoch);
+    cxl_type2_qdict_put_u64(event, "content_generation",
+                            allocation->content_generation);
+    qdict_put(event, "contributing_source_call_ids",
+              cxl_type2_model_supply_source_calls(alias));
+    cxl_type2_qdict_put_u64(event, "destination_offset",
+                            alias->destination_offset);
+    cxl_type2_qdict_put_u64(event, "logical_bytes", alias->logical_bytes);
+    cxl_type2_qdict_put_u64(event, "alias_offset",
+                            allocation->device_alias);
+    cxl_type2_qdict_put_u64(event, "file_mapped_bytes",
+                            alias->file_mapped_bytes);
+    cxl_type2_qdict_put_u64(event, "derived_boundary_pages",
+                            alias->derived_boundary_pages);
+    cxl_type2_qdict_put_u64(event, "derived_boundary_copy_bytes",
+                            alias->derived_boundary_copy_bytes);
+    cxl_type2_qdict_put_u64(event, "guard_bytes", alias->guard_bytes);
+    cxl_type2_qdict_put_u64(event, "duration_ns", 0);
+    return event;
+}
+
+static int cxl_type2_release_model_aliases(CXLType2State *ct2d)
+{
+    int first_error = CXL_GPU_SUCCESS;
+
+    for (size_t i = 0; i < ct2d->cuda_allocations.count; i++) {
+        CXLType2CudaAllocation *allocation =
+            &ct2d->cuda_allocations.entries[i];
+        QDict *event;
+        uint64_t generation;
+
+        if (!allocation->pageable_alias) {
+            continue;
+        }
+        generation = allocation->content_generation;
+        event = cxl_type2_model_supply_alias_release_event(
+            ct2d, allocation);
+        if (!cxl_type2_cuda_allocation_drop_pageable_alias(
+                &ct2d->cuda_allocations, allocation->base,
+                allocation->epoch, generation)) {
+            qobject_unref(event);
+            cxl_type2_model_supply_fail(
+                ct2d, ct2d->gpu_cmd.call_id, "cleanup",
+                "model-alias-release-failed", UINT64_MAX,
+                allocation->base, allocation->epoch, generation);
+            if (first_error == CXL_GPU_SUCCESS) {
+                first_error = CXL_GPU_ERROR_UNKNOWN;
+            }
+            continue;
+        }
+        ct2d->model_supply.alias_releases++;
+        cxl_type2_model_supply_emit("KIMI_MODEL_SUPPLY_ALIAS", event);
+    }
+    return first_error;
+}
+
 static void cxl_type2_notify_case_scope(uint64_t run_binding,
                                         uint32_t case_kind, uint64_t epoch,
                                         bool begin)
@@ -3129,12 +3334,23 @@ incomplete:
 
 typedef struct CXLType2GraphNodeGenerationConsumers {
     HetGPUGraphNode node;
+    uint32_t function_id;
+    uint64_t graph_node_token;
     GArray *identities;
+    GArray *alias_identities;
 } CXLType2GraphNodeGenerationConsumers;
 
 typedef struct CXLType2GraphExecGenerationConsumers {
+    CXLType2State *ct2d;
+    uint32_t graph_exec_id;
     GArray *nodes;
 } CXLType2GraphExecGenerationConsumers;
+
+typedef struct CXLType2AliasLaunchBinding {
+    CXLType2CudaAllocationIdentity identity;
+    uint64_t generation;
+    uint64_t alias_base;
+} CXLType2AliasLaunchBinding;
 
 static void cxl_type2_generation_reuse_fail(CXLType2State *ct2d,
                                              const char *reason)
@@ -3157,7 +3373,12 @@ static bool cxl_type2_cuda_param_allocation_identity(
     memcpy(&pointer, value, sizeof(pointer));
     if (!cxl_type2_cuda_allocation_identity_for_address(
             &ct2d->cuda_allocations, pointer, identity)) {
-        return false;
+        uint64_t generation;
+
+        if (!cxl_type2_cuda_allocation_identity_for_alias_address(
+                &ct2d->cuda_allocations, pointer, identity, &generation)) {
+            return false;
+        }
     }
     ct2d->paired_case.graph_allocation_pointer_params++;
     if (pointer == identity->base) {
@@ -3198,6 +3419,576 @@ static GArray *cxl_type2_generation_identities_from_params(
     return identities;
 }
 
+typedef enum CXLType2ModelParamClass {
+    CXL_TYPE2_MODEL_PARAM_ALIAS,
+    CXL_TYPE2_MODEL_PARAM_GPU_DESTINATION,
+    CXL_TYPE2_MODEL_PARAM_NON_MODEL_ALLOCATION,
+    CXL_TYPE2_MODEL_PARAM_UNCLASSIFIED,
+} CXLType2ModelParamClass;
+
+static CXLType2ModelParamClass cxl_type2_model_param_classify(
+    CXLType2State *ct2d, uint64_t pointer)
+{
+    CXLType2CudaAllocationIdentity identity;
+    CXLType2CudaAllocation *allocation;
+    uint64_t generation;
+
+    if (cxl_type2_cuda_allocation_identity_for_alias_address(
+            &ct2d->cuda_allocations, pointer, &identity, &generation)) {
+        return CXL_TYPE2_MODEL_PARAM_ALIAS;
+    }
+    if (!cxl_type2_cuda_allocation_identity_for_address(
+            &ct2d->cuda_allocations, pointer, &identity)) {
+        return CXL_TYPE2_MODEL_PARAM_UNCLASSIFIED;
+    }
+    allocation = cxl_type2_cuda_allocation_find(
+        &ct2d->cuda_allocations, identity.base, identity.epoch);
+    if (allocation && allocation->pageable_alias &&
+        pointer - identity.base >=
+            allocation->pageable_alias->destination_offset &&
+        pointer - identity.base -
+                allocation->pageable_alias->destination_offset <
+            allocation->pageable_alias->logical_bytes) {
+        return CXL_TYPE2_MODEL_PARAM_GPU_DESTINATION;
+    }
+    return CXL_TYPE2_MODEL_PARAM_NON_MODEL_ALLOCATION;
+}
+
+static bool cxl_type2_model_consumer_validate(
+    CXLType2State *ct2d, const CXLType2FunctionEntry *function,
+    const HetGPUParamLayout *layout, void **params, const char **reason)
+{
+    const CXLType2ModelConsumerFunction *consumer;
+
+    if (reason) {
+        *reason = NULL;
+    }
+    if (ct2d->model_supply.route != CXL_TYPE2_MODEL_SUPPLY_CXL_DIRECT) {
+        return true;
+    }
+    if (!reason || !function || !function->handle || !layout || !params ||
+        !(consumer = function->consumer)) {
+        if (reason) {
+            *reason = "consumer-certificate-entry-missing";
+        }
+        return false;
+    }
+    if (consumer->parameter_count != layout->num_args) {
+        *reason = "consumer-parameter-count-mismatch";
+        return false;
+    }
+    for (uint32_t i = 0; i < layout->num_args; i++) {
+        const CXLType2ModelConsumerRoot *parameter =
+            &consumer->parameters[i];
+
+        if (parameter->parameter_index != i ||
+            parameter->parameter_offset != layout->offsets[i] ||
+            parameter->parameter_size != layout->sizes[i]) {
+            *reason = "consumer-parameter-layout-mismatch";
+            return false;
+        }
+    }
+    for (size_t i = 0; i < consumer->sink_count; i++) {
+        const CXLType2ModelConsumerSink *sink = &consumer->sinks[i];
+        bool global = !strcmp(sink->memory_space, "global") ||
+                      !strcmp(sink->memory_space, "generic");
+        bool has_model_source = false;
+        bool has_other_root = false;
+
+        if (!global) {
+            continue;
+        }
+        for (size_t j = 0; j < sink->root_count; j++) {
+            const CXLType2ModelConsumerRoot *root = &sink->roots[j];
+            CXLType2ModelParamClass classification;
+            uint64_t pointer;
+
+            if (root->parameter_index >= layout->num_args ||
+                root->parameter_offset !=
+                    layout->offsets[root->parameter_index] ||
+                root->parameter_size !=
+                    layout->sizes[root->parameter_index] ||
+                root->parameter_size != sizeof(pointer) ||
+                !params[root->parameter_index]) {
+                *reason = "consumer-root-not-visible";
+                return false;
+            }
+            memcpy(&pointer, params[root->parameter_index], sizeof(pointer));
+            classification = cxl_type2_model_param_classify(ct2d, pointer);
+            if (classification == CXL_TYPE2_MODEL_PARAM_UNCLASSIFIED) {
+                *reason = "consumer-root-unclassified";
+                return false;
+            }
+            if (classification == CXL_TYPE2_MODEL_PARAM_ALIAS ||
+                classification == CXL_TYPE2_MODEL_PARAM_GPU_DESTINATION) {
+                has_model_source = true;
+            } else {
+                has_other_root = true;
+            }
+        }
+        if (has_model_source && strcmp(sink->access_mode, "read")) {
+            *reason = "model-alias-access-not-read";
+            return false;
+        }
+        if (has_model_source && has_other_root) {
+            *reason = "model-alias-root-mixed";
+            return false;
+        }
+    }
+    return true;
+}
+
+static const char *cxl_type2_model_param_class_name(
+    CXLType2ModelParamClass classification)
+{
+    switch (classification) {
+    case CXL_TYPE2_MODEL_PARAM_ALIAS:
+        return "model-alias";
+    case CXL_TYPE2_MODEL_PARAM_GPU_DESTINATION:
+        return "gpu-destination";
+    case CXL_TYPE2_MODEL_PARAM_NON_MODEL_ALLOCATION:
+        return "non-model-allocation";
+    case CXL_TYPE2_MODEL_PARAM_UNCLASSIFIED:
+        return "unclassified";
+    }
+    g_assert_not_reached();
+}
+
+static void cxl_type2_log_model_consumer_launch(
+    CXLType2State *ct2d, const char *action, uint64_t launch_id,
+    uint32_t function_id,
+    const HetGPUParamLayout *layout, void **params, const GArray *bindings,
+    CXLType2CudaAliasConsumer consumer, uint64_t graph_exec_id,
+    const uint64_t *graph_node_tokens, size_t graph_node_count)
+{
+    const CXLType2FunctionEntry *function =
+        &ct2d->gpu_cmd.functions[function_id];
+    const CXLType2ModuleEntry *module =
+        &ct2d->gpu_cmd.modules[function->module_id];
+    for (size_t i = 0; i < bindings->len; i++) {
+        const CXLType2AliasLaunchBinding *binding = &g_array_index(
+            bindings, CXLType2AliasLaunchBinding, i);
+        CXLType2CudaAllocation *allocation =
+            cxl_type2_cuda_allocation_find(
+                &ct2d->cuda_allocations, binding->identity.base,
+                binding->identity.epoch);
+
+        QList *roots = qlist_new();
+        QList *nodes = qlist_new();
+        QDict *event;
+
+        if (!allocation || !allocation->pageable_alias) {
+            cxl_type2_model_supply_fail(
+                ct2d, ct2d->gpu_cmd.call_id, "consumer-bind",
+                "consumer-alias-missing", 0, binding->identity.base,
+                binding->identity.epoch, binding->generation);
+            continue;
+        }
+        for (uint32_t parameter_index = 0;
+             parameter_index < layout->num_args; parameter_index++) {
+            CXLType2CudaAllocationIdentity identity = { 0 };
+            CXLType2ModelParamClass classification =
+                CXL_TYPE2_MODEL_PARAM_UNCLASSIFIED;
+            uint64_t pointer = 0;
+            uint64_t root_generation = 0;
+            QDict *root;
+
+            if (layout->sizes[parameter_index] != sizeof(pointer) ||
+                !params[parameter_index]) {
+                continue;
+            }
+            memcpy(&pointer, params[parameter_index], sizeof(pointer));
+            classification = cxl_type2_model_param_classify(ct2d, pointer);
+            if (classification == CXL_TYPE2_MODEL_PARAM_ALIAS) {
+                cxl_type2_cuda_allocation_identity_for_alias_address(
+                    &ct2d->cuda_allocations, pointer, &identity,
+                    &root_generation);
+            } else if (classification !=
+                       CXL_TYPE2_MODEL_PARAM_UNCLASSIFIED) {
+                cxl_type2_cuda_allocation_identity_for_address(
+                    &ct2d->cuda_allocations, pointer, &identity);
+            }
+            root = qdict_new();
+            cxl_type2_qdict_put_u64(root, "parameter_index", parameter_index);
+            cxl_type2_qdict_put_u64(root, "parameter_offset",
+                                    layout->offsets[parameter_index]);
+            cxl_type2_qdict_put_u64(root, "parameter_size",
+                                    layout->sizes[parameter_index]);
+            qdict_put_str(root, "runtime_classification",
+                          cxl_type2_model_param_class_name(classification));
+            if (identity.base) {
+                QDict *allocation_identity = qdict_new();
+
+                cxl_type2_qdict_put_u64(allocation_identity, "base",
+                                        identity.base);
+                cxl_type2_qdict_put_u64(allocation_identity, "epoch",
+                                        identity.epoch);
+                cxl_type2_qdict_put_u64(allocation_identity, "generation",
+                                        root_generation);
+                qdict_put(root, "allocation_identity", allocation_identity);
+            } else {
+                qdict_put_null(root, "allocation_identity");
+            }
+            qdict_put_null(root, "source_view_identity");
+            qlist_append(roots, root);
+        }
+
+        event = cxl_type2_model_supply_event(ct2d);
+        qdict_put_str(event, "action", action);
+        qdict_put_str(event, "result", "pass");
+        cxl_type2_qdict_put_u64(event, "launch_id", launch_id);
+        cxl_type2_qdict_put_u64(event, "destination_allocation_id",
+                                binding->identity.base);
+        cxl_type2_qdict_put_u64(event, "allocation_epoch",
+                                binding->identity.epoch);
+        cxl_type2_qdict_put_u64(event, "content_generation",
+                                binding->generation);
+        qdict_put(event, "contributing_source_call_ids",
+                  cxl_type2_model_supply_source_calls(
+                      allocation->pageable_alias));
+        cxl_type2_qdict_put_u64(event, "destination_cuda_token",
+                                binding->alias_base);
+        qdict_put_str(event, "binding_kind",
+                      consumer == CXL_TYPE2_CUDA_ALIAS_NORMAL
+                          ? "normal-top-level"
+                          : "graph-top-level");
+        if (consumer == CXL_TYPE2_CUDA_ALIAS_NORMAL) {
+            qdict_put_null(event, "graph_exec_id");
+        } else {
+            cxl_type2_qdict_put_u64(event, "graph_exec_id", graph_exec_id);
+        }
+        qdict_put_str(event, "node_kind",
+                      consumer == CXL_TYPE2_CUDA_ALIAS_NORMAL
+                          ? "kernel"
+                          : "graph-kernel");
+        for (size_t node_index = 0; node_index < graph_node_count;
+             node_index++) {
+            qlist_append(nodes,
+                         qnum_from_uint(graph_node_tokens[node_index]));
+        }
+        qdict_put(event, "graph_node_tokens", nodes);
+        qdict_put_str(event, "module_load_kind",
+                      module->load_kind == CXL_TYPE2_MODULE_LOAD_CUBIN
+                          ? "cubin"
+                          : "ptx");
+        qdict_put_str(event, "driver_input_cubin_sha256",
+                      module->driver_input_cubin_sha256);
+        qdict_put_str(event, "function_name", function->name);
+        qdict_put_str(event, "static_consumer_certificate_sha256",
+                      ct2d->model_supply.consumer_certificate.sha256);
+        qdict_put(event, "visible_parameter_roots", roots);
+        cxl_type2_model_supply_emit("KIMI_MODEL_SUPPLY_CONSUMER", event);
+    }
+    if (!strcmp(action, "launch")) {
+        if (consumer == CXL_TYPE2_CUDA_ALIAS_NORMAL) {
+            ct2d->model_supply.normal_launches++;
+        } else {
+            ct2d->model_supply.graph_launches++;
+        }
+    }
+}
+
+static void cxl_type2_log_model_graph_unbind(
+    CXLType2State *ct2d, uint32_t graph_exec_id,
+    const CXLType2GraphNodeGenerationConsumers *node,
+    const CXLType2CudaAllocation *allocation)
+{
+    const CXLType2FunctionEntry *function =
+        &ct2d->gpu_cmd.functions[node->function_id];
+    const CXLType2ModuleEntry *module =
+        &ct2d->gpu_cmd.modules[function->module_id];
+    QDict *event = cxl_type2_model_supply_event(ct2d);
+    QList *nodes = qlist_new();
+
+    qlist_append(nodes, qnum_from_uint(node->graph_node_token));
+    qdict_put_str(event, "action", "unbind");
+    qdict_put_str(event, "result", "pass");
+    cxl_type2_qdict_put_u64(event, "launch_id", 0);
+    cxl_type2_qdict_put_u64(event, "destination_allocation_id",
+                            allocation->base);
+    cxl_type2_qdict_put_u64(event, "allocation_epoch", allocation->epoch);
+    cxl_type2_qdict_put_u64(event, "content_generation",
+                            allocation->content_generation);
+    qdict_put(event, "contributing_source_call_ids",
+              cxl_type2_model_supply_source_calls(
+                  allocation->pageable_alias));
+    cxl_type2_qdict_put_u64(event, "destination_cuda_token",
+                            allocation->device_alias);
+    qdict_put_str(event, "node_kind", "graph-kernel");
+    qdict_put_str(event, "binding_kind", "graph-top-level");
+    cxl_type2_qdict_put_u64(event, "graph_exec_id", graph_exec_id);
+    qdict_put(event, "graph_node_tokens", nodes);
+    qdict_put_str(event, "module_load_kind",
+                  module->load_kind == CXL_TYPE2_MODULE_LOAD_CUBIN
+                      ? "cubin"
+                      : "ptx");
+    qdict_put_str(event, "driver_input_cubin_sha256",
+                  module->driver_input_cubin_sha256);
+    qdict_put_str(event, "function_name", function->name);
+    qdict_put_str(event, "static_consumer_certificate_sha256",
+                  ct2d->model_supply.consumer_certificate.sha256);
+    qdict_put(event, "visible_parameter_roots", qlist_new());
+    cxl_type2_model_supply_emit("KIMI_MODEL_SUPPLY_CONSUMER", event);
+}
+
+static void cxl_type2_alias_launch_bindings_release(
+    CXLType2State *ct2d, GArray *bindings,
+    CXLType2CudaAliasConsumer consumer)
+{
+    if (!bindings) {
+        return;
+    }
+    for (size_t i = 0; i < bindings->len; i++) {
+        CXLType2AliasLaunchBinding *binding = &g_array_index(
+            bindings, CXLType2AliasLaunchBinding, i);
+
+        if (!cxl_type2_cuda_allocation_release_pageable_alias(
+                &ct2d->cuda_allocations, binding->identity.base,
+                binding->identity.epoch, binding->generation, consumer)) {
+            cxl_type2_generation_reuse_fail(
+                ct2d, "model-alias-consumer-release-failed");
+        }
+    }
+    g_array_unref(bindings);
+}
+
+static GArray *cxl_type2_model_alias_rewrite_params(
+    CXLType2State *ct2d, const HetGPUParamLayout *layout, void **params,
+    CXLType2CudaAliasConsumer consumer)
+{
+    GArray *bindings = g_array_new(
+        false, false, sizeof(CXLType2AliasLaunchBinding));
+
+    if (ct2d->model_supply.route != CXL_TYPE2_MODEL_SUPPLY_CXL_DIRECT) {
+        return bindings;
+    }
+    for (uint32_t i = 0; i < layout->num_args; i++) {
+        CXLType2CudaAllocationIdentity identity;
+        CXLType2AliasLaunchBinding *binding = NULL;
+        uint64_t pointer;
+        uint64_t generation;
+        uint64_t alias_address;
+
+        if (!params[i] || layout->sizes[i] != sizeof(pointer)) {
+            continue;
+        }
+        memcpy(&pointer, params[i], sizeof(pointer));
+        for (size_t j = 0; j < bindings->len; j++) {
+            CXLType2AliasLaunchBinding *candidate = &g_array_index(
+                bindings, CXLType2AliasLaunchBinding, j);
+
+            if (pointer >= candidate->identity.base &&
+                candidate->alias_base <= UINT64_MAX -
+                    (pointer - candidate->identity.base)) {
+                CXLType2CudaAllocation *allocation =
+                    cxl_type2_cuda_allocation_find(
+                        &ct2d->cuda_allocations, candidate->identity.base,
+                        candidate->identity.epoch);
+
+                if (allocation && allocation->pageable_alias &&
+                    pointer - candidate->identity.base >=
+                        allocation->pageable_alias->destination_offset &&
+                    pointer - candidate->identity.base -
+                            allocation->pageable_alias->destination_offset <
+                        allocation->pageable_alias->logical_bytes) {
+                    binding = candidate;
+                    break;
+                }
+            }
+        }
+        if (binding) {
+            alias_address = binding->alias_base +
+                            pointer - binding->identity.base -
+                            cxl_type2_cuda_allocation_find(
+                                &ct2d->cuda_allocations,
+                                binding->identity.base,
+                                binding->identity.epoch)
+                                ->pageable_alias->destination_offset;
+            memcpy(params[i], &alias_address, sizeof(alias_address));
+            continue;
+        }
+        if (!cxl_type2_cuda_allocation_acquire_pageable_alias_for_address(
+                &ct2d->cuda_allocations, pointer, consumer, &identity,
+                &generation, &alias_address)) {
+            continue;
+        }
+        CXLType2AliasLaunchBinding current = {
+            .identity = identity,
+            .generation = generation,
+            .alias_base = alias_address -
+                          (pointer - identity.base -
+                           cxl_type2_cuda_allocation_find(
+                               &ct2d->cuda_allocations, identity.base,
+                               identity.epoch)
+                               ->pageable_alias->destination_offset),
+        };
+
+        g_array_append_val(bindings, current);
+        memcpy(params[i], &alias_address, sizeof(alias_address));
+    }
+    return bindings;
+}
+
+static void cxl_type2_graph_alias_identities_unbind(
+    CXLType2State *ct2d, GArray *identities)
+{
+    if (!identities) {
+        return;
+    }
+    for (size_t i = 0; i < identities->len; i++) {
+        CXLType2CudaAllocationIdentity identity = g_array_index(
+            identities, CXLType2CudaAllocationIdentity, i);
+        CXLType2CudaAllocation *allocation = cxl_type2_cuda_allocation_find(
+            &ct2d->cuda_allocations, identity.base, identity.epoch);
+
+        if (!allocation ||
+            !cxl_type2_cuda_allocation_unbind_graph_alias(
+                &ct2d->cuda_allocations, identity.base, identity.epoch,
+                allocation->device_alias)) {
+            cxl_type2_generation_reuse_fail(
+                ct2d, "graph-alias-unbind-failed");
+        }
+    }
+    g_array_unref(identities);
+}
+
+static void cxl_type2_graph_alias_identities_unbind_for_node(
+    CXLType2State *ct2d, uint32_t graph_exec_id,
+    const CXLType2GraphNodeGenerationConsumers *node, GArray *identities)
+{
+    if (!identities) {
+        return;
+    }
+    for (size_t i = 0; i < identities->len; i++) {
+        CXLType2CudaAllocationIdentity identity = g_array_index(
+            identities, CXLType2CudaAllocationIdentity, i);
+        CXLType2CudaAllocation *allocation = cxl_type2_cuda_allocation_find(
+            &ct2d->cuda_allocations, identity.base, identity.epoch);
+
+        if (!allocation ||
+            !cxl_type2_cuda_allocation_unbind_graph_alias(
+                &ct2d->cuda_allocations, identity.base, identity.epoch,
+                allocation->device_alias)) {
+            cxl_type2_generation_reuse_fail(
+                ct2d, "graph-alias-unbind-failed");
+            cxl_type2_model_supply_fail(
+                ct2d, ct2d->gpu_cmd.call_id, "cleanup",
+                "graph-alias-unbind-failed", UINT64_MAX, identity.base,
+                identity.epoch,
+                allocation ? allocation->content_generation : 0);
+            continue;
+        }
+        cxl_type2_log_model_graph_unbind(
+            ct2d, graph_exec_id, node, allocation);
+    }
+    g_array_unref(identities);
+}
+
+static GArray *cxl_type2_alias_bindings_from_identities(
+    CXLType2State *ct2d, const GArray *identities)
+{
+    GArray *bindings = g_array_new(
+        false, false, sizeof(CXLType2AliasLaunchBinding));
+
+    for (size_t i = 0; i < identities->len; i++) {
+        CXLType2CudaAllocationIdentity identity = g_array_index(
+            identities, CXLType2CudaAllocationIdentity, i);
+        CXLType2CudaAllocation *allocation = cxl_type2_cuda_allocation_find(
+            &ct2d->cuda_allocations, identity.base, identity.epoch);
+
+        if (!allocation || !allocation->pageable_alias) {
+            g_array_unref(bindings);
+            return NULL;
+        }
+        CXLType2AliasLaunchBinding binding = {
+            .identity = identity,
+            .generation = allocation->content_generation,
+            .alias_base = allocation->device_alias,
+        };
+
+        g_array_append_val(bindings, binding);
+    }
+    return bindings;
+}
+
+static bool cxl_type2_model_alias_bind_graph_params(
+    CXLType2State *ct2d, const HetGPUParamLayout *layout, void **params,
+    GArray **identities_out)
+{
+    GArray *identities = g_array_new(
+        false, false, sizeof(CXLType2CudaAllocationIdentity));
+
+    if (!identities_out) {
+        g_array_unref(identities);
+        return false;
+    }
+    if (ct2d->model_supply.route != CXL_TYPE2_MODEL_SUPPLY_CXL_DIRECT) {
+        *identities_out = identities;
+        return true;
+    }
+    for (uint32_t i = 0; i < layout->num_args; i++) {
+        CXLType2CudaAllocationIdentity identity;
+        CXLType2CudaAllocation *allocation;
+        uint64_t pointer;
+        uint64_t generation;
+        uint64_t alias_address;
+        bool model_pointer = false;
+
+        if (!params[i] || layout->sizes[i] != sizeof(pointer)) {
+            continue;
+        }
+        memcpy(&pointer, params[i], sizeof(pointer));
+        if (cxl_type2_cuda_allocation_identity_for_address(
+                &ct2d->cuda_allocations, pointer, &identity)) {
+            allocation = cxl_type2_cuda_allocation_find(
+                &ct2d->cuda_allocations, identity.base, identity.epoch);
+            model_pointer = allocation && allocation->pageable_alias;
+        } else {
+            model_pointer =
+                cxl_type2_cuda_allocation_identity_for_alias_address(
+                    &ct2d->cuda_allocations, pointer, &identity,
+                    &generation);
+        }
+        if (!model_pointer) {
+            continue;
+        }
+        for (size_t j = 0; j < identities->len; j++) {
+            CXLType2CudaAllocationIdentity candidate = g_array_index(
+                identities, CXLType2CudaAllocationIdentity, j);
+
+            if (candidate.base == identity.base &&
+                candidate.epoch == identity.epoch) {
+                allocation = cxl_type2_cuda_allocation_find(
+                    &ct2d->cuda_allocations, identity.base, identity.epoch);
+                alias_address = allocation->device_alias +
+                                (pointer >= identity.base &&
+                                         pointer < identity.base +
+                                                       allocation->size
+                                     ? pointer - identity.base -
+                                           allocation->pageable_alias
+                                               ->destination_offset
+                                     : pointer - allocation->device_alias);
+                memcpy(params[i], &alias_address, sizeof(alias_address));
+                model_pointer = false;
+                break;
+            }
+        }
+        if (!model_pointer) {
+            continue;
+        }
+        if (!cxl_type2_cuda_allocation_bind_pageable_alias_for_address(
+                &ct2d->cuda_allocations, pointer, &identity, &generation,
+                &alias_address)) {
+            cxl_type2_graph_alias_identities_unbind(ct2d, identities);
+            return false;
+        }
+        g_array_append_val(identities, identity);
+        memcpy(params[i], &alias_address, sizeof(alias_address));
+    }
+    *identities_out = identities;
+    return true;
+}
+
 static void cxl_type2_graph_exec_generation_consumers_free(gpointer opaque)
 {
     CXLType2GraphExecGenerationConsumers *exec = opaque;
@@ -3210,6 +4001,39 @@ static void cxl_type2_graph_exec_generation_consumers_free(gpointer opaque)
             &g_array_index(exec->nodes,
                            CXLType2GraphNodeGenerationConsumers, i);
 
+        for (size_t j = 0; j < node->alias_identities->len; j++) {
+            CXLType2CudaAllocationIdentity identity = g_array_index(
+                node->alias_identities, CXLType2CudaAllocationIdentity, j);
+            CXLType2CudaAllocation *allocation =
+                cxl_type2_cuda_allocation_find(
+                    &exec->ct2d->cuda_allocations, identity.base,
+                    identity.epoch);
+
+            if (!allocation) {
+                cxl_type2_generation_reuse_fail(
+                    exec->ct2d, "graph-alias-unbind-failed");
+                cxl_type2_model_supply_fail(
+                    exec->ct2d, exec->ct2d->gpu_cmd.call_id, "cleanup",
+                    "graph-alias-allocation-missing", UINT64_MAX,
+                    identity.base, identity.epoch, 0);
+                continue;
+            }
+            if (!cxl_type2_cuda_allocation_unbind_graph_alias(
+                    &exec->ct2d->cuda_allocations, identity.base,
+                    identity.epoch, allocation->device_alias)) {
+                cxl_type2_generation_reuse_fail(
+                    exec->ct2d, "graph-alias-unbind-failed");
+                cxl_type2_model_supply_fail(
+                    exec->ct2d, exec->ct2d->gpu_cmd.call_id, "cleanup",
+                    "graph-alias-unbind-failed", UINT64_MAX,
+                    identity.base, identity.epoch,
+                    allocation->content_generation);
+                continue;
+            }
+            cxl_type2_log_model_graph_unbind(
+                exec->ct2d, exec->graph_exec_id, node, allocation);
+        }
+        g_array_unref(node->alias_identities);
         g_array_unref(node->identities);
     }
     g_array_unref(exec->nodes);
@@ -3218,7 +4042,8 @@ static void cxl_type2_graph_exec_generation_consumers_free(gpointer opaque)
 
 static CXLType2GraphExecGenerationConsumers *
 cxl_type2_graph_generation_consumers_snapshot(CXLType2State *ct2d,
-                                               HetGPUGraph graph)
+                                               HetGPUGraph graph,
+                                               uint32_t graph_exec_id)
 {
     HetGPUState *hetgpu = &ct2d->gpu_info.hetgpu_state;
     CXLType2GraphExecGenerationConsumers *exec = g_new0(
@@ -3226,6 +4051,8 @@ cxl_type2_graph_generation_consumers_snapshot(CXLType2State *ct2d,
     g_autofree HetGPUGraphNode *nodes = NULL;
     size_t count = 0;
 
+    exec->ct2d = ct2d;
+    exec->graph_exec_id = graph_exec_id;
     exec->nodes = g_array_new(false, false,
                               sizeof(CXLType2GraphNodeGenerationConsumers));
     if (hetgpu_cuda_graph_get_nodes(hetgpu, graph, NULL, &count) !=
@@ -3241,6 +4068,9 @@ cxl_type2_graph_generation_consumers_snapshot(CXLType2State *ct2d,
         CudaKernelNodeParams params = { 0 };
         const HetGPUParamLayout *layout = NULL;
         CXLType2GraphNodeGenerationConsumers node;
+        uint32_t function_id = UINT32_MAX;
+        uint64_t graph_node_token = UINT64_MAX;
+        const char *consumer_reason = NULL;
         int node_type = -1;
 
         if (hetgpu_cuda_graph_node_get_type(hetgpu, nodes[i], &node_type) !=
@@ -3258,12 +4088,84 @@ cxl_type2_graph_generation_consumers_snapshot(CXLType2State *ct2d,
             !params.kernel_params) {
             goto failed;
         }
+        for (uint32_t j = 0; j < ct2d->gpu_cmd.num_functions; j++) {
+            if (ct2d->gpu_cmd.functions[j].handle == params.func) {
+                function_id = j;
+                break;
+            }
+        }
+        for (uint32_t j = 0; j < ct2d->gpu_cmd.num_graph_nodes; j++) {
+            if (ct2d->gpu_cmd.graph_nodes[j] == nodes[i]) {
+                graph_node_token = j;
+                break;
+            }
+        }
+        if (function_id == UINT32_MAX || graph_node_token == UINT64_MAX ||
+            !cxl_type2_model_consumer_validate(
+                ct2d, &ct2d->gpu_cmd.functions[function_id], layout,
+                params.kernel_params, &consumer_reason)) {
+            goto failed;
+        }
         node = (CXLType2GraphNodeGenerationConsumers) {
             .node = nodes[i],
+            .function_id = function_id,
+            .graph_node_token = graph_node_token,
             .identities = cxl_type2_generation_identities_from_params(
                 ct2d, layout, params.kernel_params),
+            .alias_identities = g_array_new(
+                false, false, sizeof(CXLType2CudaAllocationIdentity)),
         };
         g_array_append_val(exec->nodes, node);
+        if (ct2d->model_supply.route == CXL_TYPE2_MODEL_SUPPLY_CXL_DIRECT) {
+            for (uint32_t j = 0; j < layout->num_args; j++) {
+                CXLType2CudaAllocationIdentity identity;
+                uint64_t pointer;
+                uint64_t generation;
+                uint64_t alias_address;
+
+                if (!params.kernel_params[j] ||
+                    layout->sizes[j] != sizeof(pointer)) {
+                    continue;
+                }
+                memcpy(&pointer, params.kernel_params[j], sizeof(pointer));
+                if (cxl_type2_cuda_allocation_bind_pageable_alias_for_address(
+                        &ct2d->cuda_allocations, pointer, &identity,
+                        &generation, &alias_address)) {
+                    size_t previous_count = node.alias_identities->len;
+
+                    cxl_type2_generation_identities_append(
+                        node.alias_identities, identity);
+                    if (node.alias_identities->len == previous_count) {
+                        CXLType2CudaAllocation *allocation =
+                            cxl_type2_cuda_allocation_find(
+                                &ct2d->cuda_allocations, identity.base,
+                                identity.epoch);
+
+                        if (!allocation ||
+                            !cxl_type2_cuda_allocation_unbind_graph_alias(
+                                &ct2d->cuda_allocations, identity.base,
+                                identity.epoch, allocation->device_alias)) {
+                            goto failed;
+                        }
+                    }
+                }
+            }
+            GArray *event_bindings =
+                cxl_type2_alias_bindings_from_identities(
+                    ct2d, node.alias_identities);
+
+            if (!event_bindings) {
+                goto failed;
+            }
+            if (event_bindings->len) {
+                cxl_type2_log_model_consumer_launch(
+                    ct2d, "bind", 0, function_id, layout,
+                    params.kernel_params, event_bindings,
+                    CXL_TYPE2_CUDA_ALIAS_GRAPH, graph_exec_id,
+                    &graph_node_token, 1);
+            }
+            g_array_unref(event_bindings);
+        }
     }
     return exec;
 
@@ -3304,9 +4206,72 @@ cxl_type2_graph_generation_consumers_get(CXLType2State *ct2d,
     return g_ptr_array_index(ct2d->graph_exec_generation_consumers, exec_id);
 }
 
+static void cxl_type2_log_model_graph_launch(
+    CXLType2State *ct2d, uint64_t launch_id, uint32_t exec_id,
+    const GArray *bindings)
+{
+    CXLType2GraphExecGenerationConsumers *exec =
+        cxl_type2_graph_generation_consumers_get(ct2d, exec_id);
+    QList *nodes = qlist_new();
+
+    if (!exec || !bindings->len) {
+        return;
+    }
+    for (size_t i = 0; i < exec->nodes->len; i++) {
+        CXLType2GraphNodeGenerationConsumers *node = &g_array_index(
+            exec->nodes, CXLType2GraphNodeGenerationConsumers, i);
+        uint32_t node_id = UINT32_MAX;
+
+        for (uint32_t j = 0; j < ct2d->gpu_cmd.num_graph_nodes; j++) {
+            if (ct2d->gpu_cmd.graph_nodes[j] == node->node) {
+                node_id = j;
+                break;
+            }
+        }
+        qlist_append(nodes, qnum_from_uint(node_id));
+    }
+    for (size_t i = 0; i < bindings->len; i++) {
+        const CXLType2AliasLaunchBinding *binding = &g_array_index(
+            bindings, CXLType2AliasLaunchBinding, i);
+        CXLType2CudaAllocation *allocation = cxl_type2_cuda_allocation_find(
+            &ct2d->cuda_allocations, binding->identity.base,
+            binding->identity.epoch);
+        QDict *event = cxl_type2_model_supply_event(ct2d);
+
+        qdict_put_str(event, "action", "launch");
+        qdict_put_str(event, "result", "pass");
+        cxl_type2_qdict_put_u64(event, "launch_id", launch_id);
+        cxl_type2_qdict_put_u64(event, "destination_allocation_id",
+                                binding->identity.base);
+        cxl_type2_qdict_put_u64(event, "allocation_epoch",
+                                binding->identity.epoch);
+        cxl_type2_qdict_put_u64(event, "content_generation",
+                                binding->generation);
+        qdict_put(event, "contributing_source_call_ids",
+                  cxl_type2_model_supply_source_calls(
+                      allocation ? allocation->pageable_alias : NULL));
+        cxl_type2_qdict_put_u64(event, "destination_cuda_token",
+                                binding->alias_base);
+        qdict_put_str(event, "node_kind", "graph-kernel");
+        qdict_put_str(event, "binding_kind", "graph-top-level");
+        cxl_type2_qdict_put_u64(event, "graph_exec_id", exec_id);
+        qdict_put(event, "graph_node_tokens", qobject_ref(nodes));
+        qdict_put_null(event, "module_load_kind");
+        qdict_put_null(event, "driver_input_cubin_sha256");
+        qdict_put_null(event, "function_name");
+        qdict_put_str(event, "static_consumer_certificate_sha256",
+                      ct2d->model_supply.consumer_certificate.sha256);
+        qdict_put(event, "visible_parameter_roots", qlist_new());
+        cxl_type2_model_supply_emit("KIMI_MODEL_SUPPLY_CONSUMER", event);
+    }
+    qobject_unref(nodes);
+    ct2d->model_supply.graph_launches++;
+}
+
 static bool cxl_type2_graph_generation_consumers_set_node(
     CXLType2State *ct2d, uint32_t exec_id, HetGPUGraphNode node_handle,
-    GArray *identities)
+    uint32_t function_id, uint64_t graph_node_token, GArray *identities,
+    GArray *alias_identities)
 {
     CXLType2GraphExecGenerationConsumers *exec =
         cxl_type2_graph_generation_consumers_get(ct2d, exec_id);
@@ -3320,14 +4285,53 @@ static bool cxl_type2_graph_generation_consumers_set_node(
                            CXLType2GraphNodeGenerationConsumers, i);
 
         if (node->node == node_handle) {
+            for (size_t j = 0; j < node->alias_identities->len; j++) {
+                CXLType2CudaAllocationIdentity identity = g_array_index(
+                    node->alias_identities, CXLType2CudaAllocationIdentity, j);
+                CXLType2CudaAllocation *allocation =
+                    cxl_type2_cuda_allocation_find(
+                        &ct2d->cuda_allocations, identity.base,
+                        identity.epoch);
+
+                if (!allocation) {
+                    cxl_type2_generation_reuse_fail(
+                        ct2d, "graph-alias-unbind-failed");
+                    cxl_type2_model_supply_fail(
+                        ct2d, ct2d->gpu_cmd.call_id, "cleanup",
+                        "graph-alias-allocation-missing", UINT64_MAX,
+                        identity.base, identity.epoch, 0);
+                    continue;
+                }
+                if (!cxl_type2_cuda_allocation_unbind_graph_alias(
+                        &ct2d->cuda_allocations, identity.base,
+                        identity.epoch, allocation->device_alias)) {
+                    cxl_type2_generation_reuse_fail(
+                        ct2d, "graph-alias-unbind-failed");
+                    cxl_type2_model_supply_fail(
+                        ct2d, ct2d->gpu_cmd.call_id, "cleanup",
+                        "graph-alias-unbind-failed", UINT64_MAX,
+                        identity.base, identity.epoch,
+                        allocation->content_generation);
+                    continue;
+                }
+                cxl_type2_log_model_graph_unbind(
+                    ct2d, exec_id, node, allocation);
+            }
             g_array_unref(node->identities);
+            g_array_unref(node->alias_identities);
             node->identities = identities;
+            node->alias_identities = alias_identities;
+            node->function_id = function_id;
+            node->graph_node_token = graph_node_token;
             return true;
         }
     }
     CXLType2GraphNodeGenerationConsumers node = {
         .node = node_handle,
+        .function_id = function_id,
+        .graph_node_token = graph_node_token,
         .identities = identities,
+        .alias_identities = alias_identities,
     };
 
     g_array_append_val(exec->nodes, node);
@@ -3366,6 +4370,55 @@ static void cxl_type2_generation_consume_graph(CXLType2State *ct2d,
             return;
         }
     }
+}
+
+static GArray *cxl_type2_graph_alias_launch_acquire(
+    CXLType2State *ct2d, uint32_t exec_id)
+{
+    CXLType2GraphExecGenerationConsumers *exec =
+        cxl_type2_graph_generation_consumers_get(ct2d, exec_id);
+    GArray *bindings = g_array_new(
+        false, false, sizeof(CXLType2AliasLaunchBinding));
+
+    if (!exec ||
+        ct2d->model_supply.route != CXL_TYPE2_MODEL_SUPPLY_CXL_DIRECT) {
+        return bindings;
+    }
+    for (size_t i = 0; i < exec->nodes->len; i++) {
+        CXLType2GraphNodeGenerationConsumers *node = &g_array_index(
+            exec->nodes, CXLType2GraphNodeGenerationConsumers, i);
+
+        for (size_t j = 0; j < node->alias_identities->len; j++) {
+            CXLType2CudaAllocationIdentity identity = g_array_index(
+                node->alias_identities, CXLType2CudaAllocationIdentity, j);
+            CXLType2AliasLaunchBinding binding = { .identity = identity };
+            bool duplicate = false;
+
+            for (size_t k = 0; k < bindings->len; k++) {
+                CXLType2AliasLaunchBinding candidate = g_array_index(
+                    bindings, CXLType2AliasLaunchBinding, k);
+
+                if (candidate.identity.base == identity.base &&
+                    candidate.identity.epoch == identity.epoch) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) {
+                continue;
+            }
+            if (!cxl_type2_cuda_allocation_acquire_pageable_alias_for_identity(
+                    &ct2d->cuda_allocations, identity,
+                    CXL_TYPE2_CUDA_ALIAS_GRAPH, &binding.generation,
+                    &binding.alias_base)) {
+                cxl_type2_alias_launch_bindings_release(
+                    ct2d, bindings, CXL_TYPE2_CUDA_ALIAS_GRAPH);
+                return NULL;
+            }
+            g_array_append_val(bindings, binding);
+        }
+    }
+    return bindings;
 }
 
 static CXLType2CudaCoverageKind cxl_type2_cuda_record_coverage(
@@ -3441,6 +4494,36 @@ static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
         0, false);
 
     ct2d->generation_reuse_error = NULL;
+    g_clear_pointer(&ct2d->model_supply.first_failure_stage, g_free);
+    g_clear_pointer(&ct2d->model_supply.first_failure_detail, g_free);
+    g_clear_pointer(&ct2d->model_supply.source_geometry, g_checksum_free);
+    g_clear_pointer(&ct2d->model_supply.alias_geometry, g_checksum_free);
+    ct2d->model_supply.source_geometry = g_checksum_new(G_CHECKSUM_SHA256);
+    ct2d->model_supply.alias_geometry = g_checksum_new(G_CHECKSUM_SHA256);
+    ct2d->model_supply.source_descriptor_count = 0;
+    ct2d->model_supply.source_logical_bytes = 0;
+    ct2d->model_supply.alias_builds = 0;
+    ct2d->model_supply.alias_remaps = 0;
+    ct2d->model_supply.alias_releases = 0;
+    ct2d->model_supply.alias_logical_bytes = 0;
+    ct2d->model_supply.logical_source_view_bytes = 0;
+    ct2d->model_supply.page_collateral_bytes = 0;
+    ct2d->model_supply.file_mapped_bytes = 0;
+    ct2d->model_supply.derived_boundary_pages = 0;
+    ct2d->model_supply.derived_boundary_copy_bytes = 0;
+    ct2d->model_supply.boundary_composition_wall_ns = 0;
+    ct2d->model_supply.guard_bytes = 0;
+    ct2d->model_supply.model_htod_calls = 0;
+    ct2d->model_supply.model_htod_bytes = 0;
+    ct2d->model_supply.logical_direct_bytes = 0;
+    ct2d->model_supply.reserved_gpu_token_bytes = 0;
+    ct2d->model_supply.normal_launches = 0;
+    ct2d->model_supply.graph_launches = 0;
+    ct2d->model_supply.normal_completions = 0;
+    ct2d->model_supply.graph_completions = 0;
+    ct2d->model_supply.mapping_pin_acquires = 0;
+    ct2d->model_supply.mapping_pin_releases = 0;
+    ct2d->model_supply.poisoned = false;
 
     for (registration = ct2d->direct_registrations; registration;
          registration = registration->next) {
@@ -4018,6 +5101,114 @@ static void cxl_type2_log_generation_reuse_summary(
         status, entry_count, reason);
 }
 
+static void cxl_type2_log_model_supply_terminal(
+    CXLType2State *ct2d, bool case_success, bool context_quiesced,
+    int cleanup_status)
+{
+    uint64_t live_graph_bindings = 0;
+    uint64_t live_inflight_refs = 0;
+    uint64_t live_aliases = 0;
+    uint64_t live_source_views = 0;
+    uint64_t live_source_fd_refs = 0;
+    bool poisoned = ct2d->model_supply.poisoned ||
+                    ct2d->direct_source_poisoned;
+    bool pass;
+    QDict *event;
+
+    for (size_t i = 0; i < ct2d->cuda_allocations.count; i++) {
+        CXLType2CudaAllocation *allocation =
+            &ct2d->cuda_allocations.entries[i];
+
+        live_graph_bindings += allocation->graph_binding_refs;
+        live_inflight_refs += allocation->normal_inflight_refs +
+                              allocation->graph_inflight_refs;
+        poisoned |= allocation->poisoned;
+        if (allocation->pageable_alias) {
+            live_aliases++;
+            live_source_views += allocation->pageable_alias->source_count;
+            live_source_fd_refs += allocation->pageable_alias->source_count;
+        }
+    }
+    pass = case_success && !ct2d->model_supply.first_failure_stage &&
+           context_quiesced &&
+           cleanup_status == 0 &&
+           ct2d->model_supply.mapping_pin_acquires ==
+               ct2d->model_supply.mapping_pin_releases &&
+           !live_graph_bindings && !live_inflight_refs && !live_aliases &&
+           !live_source_views && !live_source_fd_refs && !poisoned;
+
+    event = cxl_type2_model_supply_event(ct2d);
+    qdict_put_str(event, "actual_route",
+                  ct2d->model_supply.route ==
+                          CXL_TYPE2_MODEL_SUPPLY_CXL_DIRECT
+                      ? "cxl-direct"
+                      : "selected-htod");
+    qdict_put_str(event, "status", pass ? "pass" : "fail");
+    if (ct2d->model_supply.first_failure_stage) {
+        qdict_put_str(event, "first_failure_stage",
+                      ct2d->model_supply.first_failure_stage);
+    } else {
+        qdict_put_null(event, "first_failure_stage");
+    }
+    cxl_type2_qdict_put_u64(event, "source_descriptor_count",
+                            ct2d->model_supply.source_descriptor_count);
+    cxl_type2_qdict_put_u64(event, "source_logical_bytes",
+                            ct2d->model_supply.source_logical_bytes);
+    qdict_put_str(event, "source_geometry_sha256",
+                  g_checksum_get_string(ct2d->model_supply.source_geometry));
+    cxl_type2_qdict_put_u64(event, "logical_source_view_bytes",
+                            ct2d->model_supply.logical_source_view_bytes);
+    cxl_type2_qdict_put_u64(event, "page_collateral_bytes",
+                            ct2d->model_supply.page_collateral_bytes);
+    qdict_put_str(event, "alias_geometry_sha256",
+                  g_checksum_get_string(ct2d->model_supply.alias_geometry));
+    cxl_type2_qdict_put_u64(event, "alias_builds",
+                            ct2d->model_supply.alias_builds);
+    cxl_type2_qdict_put_u64(event, "alias_remaps",
+                            ct2d->model_supply.alias_remaps);
+    cxl_type2_qdict_put_u64(event, "alias_releases",
+                            ct2d->model_supply.alias_releases);
+    cxl_type2_qdict_put_u64(event, "file_mapped_bytes",
+                            ct2d->model_supply.file_mapped_bytes);
+    cxl_type2_qdict_put_u64(event, "derived_boundary_pages",
+                            ct2d->model_supply.derived_boundary_pages);
+    cxl_type2_qdict_put_u64(event, "derived_boundary_copy_bytes",
+                            ct2d->model_supply.derived_boundary_copy_bytes);
+    cxl_type2_qdict_put_u64(event, "guard_bytes",
+                            ct2d->model_supply.guard_bytes);
+    cxl_type2_qdict_put_u64(event, "model_htod_calls",
+                            ct2d->model_supply.model_htod_calls);
+    cxl_type2_qdict_put_u64(event, "model_htod_bytes",
+                            ct2d->model_supply.model_htod_bytes);
+    cxl_type2_qdict_put_u64(event, "logical_direct_bytes",
+                            ct2d->model_supply.logical_direct_bytes);
+    cxl_type2_qdict_put_u64(event, "reserved_gpu_token_bytes",
+                            ct2d->model_supply.reserved_gpu_token_bytes);
+    cxl_type2_qdict_put_u64(event, "normal_launches",
+                            ct2d->model_supply.normal_launches);
+    cxl_type2_qdict_put_u64(event, "normal_completions",
+                            ct2d->model_supply.normal_completions);
+    cxl_type2_qdict_put_u64(event, "graph_launches",
+                            ct2d->model_supply.graph_launches);
+    cxl_type2_qdict_put_u64(event, "graph_completions",
+                            ct2d->model_supply.graph_completions);
+    cxl_type2_qdict_put_u64(event, "live_graph_bindings",
+                            live_graph_bindings);
+    cxl_type2_qdict_put_u64(event, "live_inflight_refs", live_inflight_refs);
+    cxl_type2_qdict_put_u64(event, "live_aliases", live_aliases);
+    cxl_type2_qdict_put_u64(event, "live_source_views", live_source_views);
+    cxl_type2_qdict_put_u64(event, "live_source_fd_refs",
+                            live_source_fd_refs);
+    cxl_type2_qdict_put_u64(event, "mapping_pin_acquires",
+                            ct2d->model_supply.mapping_pin_acquires);
+    cxl_type2_qdict_put_u64(event, "mapping_pin_releases",
+                            ct2d->model_supply.mapping_pin_releases);
+    qdict_put_bool(event, "context_quiesced", context_quiesced);
+    qdict_put_int(event, "cleanup_status", cleanup_status);
+    qdict_put_bool(event, "poisoned", poisoned);
+    cxl_type2_model_supply_emit("KIMI_MODEL_SUPPLY_TERMINAL", event);
+}
+
 static void cxl_type2_log_case_summary(CXLType2State *ct2d,
                                        uint64_t run_binding,
                                        uint32_t case_kind,
@@ -4485,11 +5676,12 @@ static int cxl_type2_cuda_query_mem_info(void *opaque)
                                     &request->total_bytes);
 }
 
-static bool cxl_type2_reserve_gpu_handle(void ***handles, size_t *capacity,
-                                         uint32_t count)
+static bool cxl_type2_reserve_gpu_entries(void **entries, size_t *capacity,
+                                           uint32_t count,
+                                           size_t entry_size)
 {
     size_t next_capacity;
-    void **grown;
+    void *grown;
 
     if (count == G_MAXUINT32) {
         return false;
@@ -4506,13 +5698,22 @@ static bool cxl_type2_reserve_gpu_handle(void ***handles, size_t *capacity,
             next_capacity *= 2;
         }
     }
-    grown = g_try_realloc_n(*handles, next_capacity, sizeof(**handles));
+    grown = g_try_realloc_n(*entries, next_capacity, entry_size);
     if (!grown) {
         return false;
     }
-    *handles = grown;
+    memset((uint8_t *)grown + *capacity * entry_size, 0,
+           (next_capacity - *capacity) * entry_size);
+    *entries = grown;
     *capacity = next_capacity;
     return true;
+}
+
+static bool cxl_type2_reserve_gpu_handle(void ***handles, size_t *capacity,
+                                         uint32_t count)
+{
+    return cxl_type2_reserve_gpu_entries((void **)handles, capacity, count,
+                                         sizeof(**handles));
 }
 
 static bool cxl_type2_register_gpu_handle(void ***handles, size_t *capacity,
@@ -4966,6 +6167,10 @@ static int cxl_type2_direct_source_unregister(CXLType2State *ct2d,
     for (uint32_t i = 0; i < source->run_count; i++) {
         int result;
 
+        if (source->runs[i].source_fd >= 0) {
+            close(source->runs[i].source_fd);
+            source->runs[i].source_fd = -1;
+        }
         if (!source->runs[i].physical) {
             continue;
         }
@@ -5290,6 +6495,8 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
     source = g_new0(CXLType2DirectSource, 1);
     source->case_epoch = ct2d->paired_case.active_epoch;
     source->logical_bytes = header.logical_bytes;
+    source->pageable_alias =
+        ct2d->model_supply.route == CXL_TYPE2_MODEL_SUPPLY_CXL_DIRECT;
     for (uint32_t i = 0; i < resolved_runs->len; i++) {
         bool duplicate = false;
 
@@ -5307,6 +6514,114 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
     }
     source->range_count = header.range_count;
     source->ranges = g_steal_pointer(&range_layouts);
+    if (source->pageable_alias) {
+        source->runs = g_try_new0(CXLType2DirectRun, resolved_runs->len);
+        if (!source->runs) {
+            result = CXL_GPU_ERROR_OUT_OF_MEMORY;
+            *failure_stage_out = "source-view-allocate";
+            goto rollback;
+        }
+        source->run_count = resolved_runs->len;
+        for (uint32_t i = 0; i < source->run_count; i++) {
+            source->runs[i].source_fd = -1;
+        }
+        for (uint32_t i = 0; i < source->run_count; i++) {
+            CXLType2DirectRun *run = &source->runs[i];
+            VirtioSharedMemoryMapping *pinned_mapping = NULL;
+            uint64_t pinned_generation = 0;
+            uint64_t mapping_file_offset = 0;
+            uint64_t mapping_length = 0;
+            void *mapping_host = NULL;
+            struct stat source_stat;
+            const CXLType2ModelMember *member;
+
+            run->source_fd = -1;
+            if (validated[i].mapping->allow_write ||
+                virtio_shared_memory_pin_range(
+                    shmem, validated[i].mapping_offset, validated[i].length,
+                    &pinned_mapping, &pinned_generation, &mapping_host,
+                    NULL, NULL) != 0) {
+                result = CXL_GPU_ERROR_INVALID_VALUE;
+                *failure_stage_out = "source-view-resolve";
+                *failure_index_out = i;
+                goto rollback;
+            }
+            ct2d->model_supply.mapping_pin_acquires++;
+            if (pinned_mapping != validated[i].mapping ||
+                pinned_generation != validated[i].generation ||
+                virtio_shared_memory_mapping_dup_source(
+                    pinned_mapping, pinned_generation, &run->source_fd,
+                    &mapping_file_offset, &mapping_length) != 0 ||
+                validated[i].mapping_offset < pinned_mapping->offset ||
+                validated[i].mapping_offset - pinned_mapping->offset >
+                    UINT64_MAX - mapping_file_offset ||
+                fstat(run->source_fd, &source_stat) != 0) {
+                virtio_shared_memory_unpin(pinned_mapping);
+                ct2d->model_supply.mapping_pin_releases++;
+                result = CXL_GPU_ERROR_INVALID_VALUE;
+                *failure_stage_out = "source-view-resolve";
+                *failure_index_out = i;
+                goto rollback;
+            }
+            run->file_offset = mapping_file_offset +
+                               validated[i].mapping_offset -
+                               pinned_mapping->offset;
+            run->length = validated[i].length;
+            run->mapping_generation = pinned_generation;
+            run->source_device = source_stat.st_dev;
+            run->source_inode = source_stat.st_ino;
+            run->source_size = source_stat.st_size;
+            run->source_mode = source_stat.st_mode;
+            member = cxl_type2_model_member_find(
+                &ct2d->model_supply.member_manifest,
+                run->source_device, run->source_inode, run->source_size,
+                run->source_mode, run->file_offset, run->length);
+            if (!member || member->logical_cxl_offset >
+                               UINT64_MAX - ct2d->model_aperture.offset ||
+                run->file_offset > UINT64_MAX -
+                                       member->logical_cxl_offset -
+                                       ct2d->model_aperture.offset) {
+                virtio_shared_memory_unpin(pinned_mapping);
+                ct2d->model_supply.mapping_pin_releases++;
+                result = CXL_GPU_ERROR_INVALID_VALUE;
+                *failure_stage_out = "member-range-admission";
+                *failure_index_out = i;
+                goto rollback;
+            }
+            run->logical_cxl_offset = ct2d->model_aperture.offset +
+                                      member->logical_cxl_offset +
+                                      run->file_offset;
+            run->model_member_index = member -
+                ct2d->model_supply.member_manifest.members;
+            if (!cxl_type2_range_contains(ct2d->model_aperture.offset,
+                                          ct2d->model_aperture.size,
+                                          run->logical_cxl_offset,
+                                          run->length)) {
+                virtio_shared_memory_unpin(pinned_mapping);
+                ct2d->model_supply.mapping_pin_releases++;
+                result = CXL_GPU_ERROR_INVALID_VALUE;
+                *failure_stage_out = "aperture-capacity";
+                *failure_index_out = i;
+                goto rollback;
+            }
+            if (!cxl_type2_fabric_access_allowed(
+                    ct2d, run->logical_cxl_offset, run->length, false,
+                    false) ||
+                !cxl_type2_memsim_request(
+                    ct2d, CXL_OP_RANGE_READ, run->logical_cxl_offset,
+                    run->length, NULL, NULL)) {
+                virtio_shared_memory_unpin(pinned_mapping);
+                ct2d->model_supply.mapping_pin_releases++;
+                result = CXL_GPU_ERROR_INVALID_VALUE;
+                *failure_stage_out = "fabric-request";
+                *failure_index_out = i;
+                goto rollback;
+            }
+            virtio_shared_memory_unpin(pinned_mapping);
+            ct2d->model_supply.mapping_pin_releases++;
+        }
+        goto views_done;
+    }
     {
         GArray *views = g_array_new(false, false, sizeof(CXLType2DirectRun));
         GPtrArray *pending = g_ptr_array_new();
@@ -5733,6 +7048,7 @@ views_done:
         goto rollback;
     }
     source->source_id = ++ct2d->next_direct_source_id;
+    source->register_call_id = ct2d->gpu_cmd.call_id;
     source->next = ct2d->direct_sources;
     ct2d->direct_sources = source;
     bool inserted = g_hash_table_insert(ct2d->direct_source_ids,
@@ -5748,6 +7064,10 @@ views_done:
 
 rollback:
     for (uint32_t i = 0; i < source->run_count; i++) {
+        if (source->runs[i].source_fd >= 0) {
+            close(source->runs[i].source_fd);
+            source->runs[i].source_fd = -1;
+        }
         if (source->runs[i].physical) {
             int cleanup = cxl_type2_direct_physical_put(
                 ct2d, source->runs[i].physical);
@@ -5846,7 +7166,7 @@ static bool cxl_type2_direct_range_is_valid(
     for (uint32_t i = 0; i < range->run_count && remaining; i++) {
         CXLType2DirectRun *run = &source->runs[range->first_run + i];
 
-        if (!run->physical) {
+        if (source->pageable_alias ? run->source_fd < 0 : !run->physical) {
             return false;
         }
         if (skip >= run->length) {
@@ -5862,6 +7182,289 @@ static bool cxl_type2_direct_range_is_valid(
     }
     *source_out = source;
     return true;
+}
+
+typedef struct CXLType2PageableAliasPiece {
+    CXLType2CudaAliasSource source;
+    uint64_t destination;
+    uint64_t source_index;
+    uint32_t model_member_index;
+} CXLType2PageableAliasPiece;
+
+static gint cxl_type2_pageable_alias_piece_compare(gconstpointer left,
+                                                    gconstpointer right)
+{
+    const CXLType2PageableAliasPiece *a = left;
+    const CXLType2PageableAliasPiece *b = right;
+
+    return a->destination < b->destination
+               ? -1
+               : a->destination > b->destination ? 1 : 0;
+}
+
+static int cxl_type2_direct_alias_submit(
+    CXLType2State *ct2d, const uint8_t *payload, uint64_t payload_capacity,
+    uint64_t range_count, uint64_t payload_bytes,
+    CXLType2DirectSource *source_override, uint64_t *fail_index,
+    const char **failure_stage, uint64_t *logical_enqueued,
+    uint64_t *fragments_enqueued)
+{
+    GArray *pieces = NULL;
+    CXLType2CudaAllocationIdentity allocation_identity = { 0 };
+    CXLType2CudaAllocation *allocation = NULL;
+    CXLType2CudaAliasSource *alias_sources = NULL;
+    uint64_t generation = source_override ? source_override->source_id : 0;
+    uint64_t destination_offset = 0;
+    uint64_t covered = 0;
+    uint64_t alias = 0;
+    uint64_t alias_begin_ns = 0;
+    const char *alias_reason = NULL;
+    bool remap = false;
+    int result = CXL_GPU_ERROR_INVALID_VALUE;
+
+    *failure_stage = NULL;
+    *logical_enqueued = 0;
+    *fragments_enqueued = 0;
+    if (!source_override || !source_override->pageable_alias || !generation ||
+        !cxl_gpu_direct_batch_validate(payload, payload_capacity, range_count,
+                                       payload_bytes, fail_index)) {
+        *failure_stage = "batch-validate";
+        return CXL_GPU_ERROR_INVALID_VALUE;
+    }
+    pieces = g_array_new(false, false, sizeof(CXLType2PageableAliasPiece));
+    for (uint64_t i = 0; i < range_count; i++) {
+        CXLGPUDirectRangeV1 wire;
+        CXLType2DirectSource *source = NULL;
+        CXLType2DirectRangeLayout *range;
+        CXLType2CudaAllocationIdentity current_identity;
+        uint64_t allocation_offset;
+        uint64_t skip;
+        uint64_t remaining;
+        uint64_t copied = 0;
+
+        memcpy(&wire, payload + i * sizeof(wire), sizeof(wire));
+        if (!cxl_type2_direct_range_is_valid(ct2d, &wire, source_override,
+                                             &source) ||
+            !cxl_type2_cuda_allocation_identity_for_range(
+                &ct2d->cuda_allocations, wire.destination, wire.size,
+                &current_identity, &allocation_offset)) {
+            *fail_index = i;
+            *failure_stage = "range-admission";
+            goto out;
+        }
+        if (i && (current_identity.base != allocation_identity.base ||
+                  current_identity.epoch != allocation_identity.epoch)) {
+            *fail_index = i;
+            *failure_stage = "destination-allocation";
+            goto out;
+        }
+        allocation_identity = current_identity;
+        range = &source->ranges[wire.source_range];
+        skip = range->first_run_byte_offset + wire.source_offset;
+        remaining = wire.size;
+        for (uint32_t j = 0; j < range->run_count && remaining; j++) {
+            CXLType2DirectRun *run = &source->runs[range->first_run + j];
+            CXLType2PageableAliasPiece piece;
+            uint64_t chunk;
+
+            if (skip >= run->length) {
+                skip -= run->length;
+                continue;
+            }
+            chunk = MIN(remaining, run->length - skip);
+            piece = (CXLType2PageableAliasPiece) {
+                .source = {
+                    .fd = run->source_fd,
+                    .file_offset = run->file_offset + skip,
+                    .destination_offset = allocation_offset + copied,
+                    .length = chunk,
+                    .mapping_generation = run->mapping_generation,
+                    .logical_cxl_offset = run->logical_cxl_offset + skip,
+                    .stat_device = run->source_device,
+                    .stat_inode = run->source_inode,
+                    .stat_size = run->source_size,
+                    .stat_mode = run->source_mode,
+                    .readonly = true,
+                },
+                .destination = wire.destination + copied,
+                .source_index = i,
+                .model_member_index = run->model_member_index,
+            };
+            g_array_append_val(pieces, piece);
+            copied += chunk;
+            remaining -= chunk;
+            skip = 0;
+        }
+        if (remaining) {
+            *fail_index = i;
+            *failure_stage = "source-coverage";
+            goto out;
+        }
+    }
+    g_array_sort(pieces, cxl_type2_pageable_alias_piece_compare);
+    allocation = cxl_type2_cuda_allocation_find(
+        &ct2d->cuda_allocations, allocation_identity.base,
+        allocation_identity.epoch);
+    if (!allocation || !pieces->len) {
+        *failure_stage = "destination-allocation";
+        goto out;
+    }
+    destination_offset = g_array_index(
+        pieces, CXLType2PageableAliasPiece, 0).source.destination_offset;
+    for (size_t i = 0; i < pieces->len; i++) {
+        CXLType2PageableAliasPiece *piece = &g_array_index(
+            pieces, CXLType2PageableAliasPiece, i);
+
+        if (destination_offset > allocation->size ||
+            covered > allocation->size - destination_offset ||
+            piece->source.destination_offset != destination_offset + covered ||
+            piece->source.length >
+                allocation->size - destination_offset - covered) {
+            *fail_index = i;
+            *failure_stage = "alias-geometry";
+            goto out;
+        }
+        if (piece->model_member_index >=
+            ct2d->model_supply.member_manifest.member_count) {
+            *fail_index = i;
+            *failure_stage = "member-range-admission";
+            goto out;
+        }
+        piece->source.destination_offset -= destination_offset;
+        covered += piece->source.length;
+    }
+    for (size_t i = 0; i < pieces->len; i++) {
+        CXLType2PageableAliasPiece *piece = &g_array_index(
+            pieces, CXLType2PageableAliasPiece, i);
+        const CXLType2ModelMember *member =
+            &ct2d->model_supply.member_manifest.members[
+                piece->model_member_index];
+
+        QDict *event = cxl_type2_model_supply_event(ct2d);
+
+        cxl_type2_qdict_put_u64(event, "call_id",
+                                source_override->register_call_id);
+        cxl_type2_qdict_put_u64(event, "source_index",
+                                piece->source_index);
+        cxl_type2_qdict_put_u64(event, "model_member",
+                                piece->model_member_index);
+        qdict_put_str(event, "artifact_sha256", member->artifact_sha256);
+        cxl_type2_qdict_put_u64(event, "file_offset",
+                                piece->source.file_offset);
+        cxl_type2_qdict_put_u64(event, "logical_bytes",
+                                piece->source.length);
+        cxl_type2_qdict_put_u64(event, "mapping_generation",
+                                piece->source.mapping_generation);
+        cxl_type2_qdict_put_u64(event, "logical_cxl_offset",
+                                piece->source.logical_cxl_offset);
+        cxl_type2_qdict_put_u64(event, "destination_cuda_token",
+                                piece->destination);
+        cxl_type2_qdict_put_u64(event, "destination_bytes",
+                                piece->source.length);
+        cxl_type2_qdict_put_u64(event, "destination_allocation_id",
+                                allocation_identity.base);
+        cxl_type2_qdict_put_u64(event, "allocation_epoch",
+                                allocation_identity.epoch);
+        cxl_type2_qdict_put_u64(
+            event, "destination_offset",
+            destination_offset + piece->source.destination_offset);
+        cxl_type2_model_supply_hash_event(
+            ct2d->model_supply.source_geometry, event);
+        cxl_type2_model_supply_emit("KIMI_MODEL_SUPPLY_SOURCE", event);
+        ct2d->model_supply.source_descriptor_count++;
+        ct2d->model_supply.source_logical_bytes += piece->source.length;
+    }
+    alias_sources = g_try_new(CXLType2CudaAliasSource, pieces->len);
+    if (!alias_sources) {
+        *failure_stage = "alias-source-allocate";
+        result = CXL_GPU_ERROR_OUT_OF_MEMORY;
+        goto out;
+    }
+    for (size_t i = 0; i < pieces->len; i++) {
+        alias_sources[i] = g_array_index(
+            pieces, CXLType2PageableAliasPiece, i).source;
+    }
+    remap = allocation->pageable_alias != NULL;
+    alias_begin_ns = cxl_type2_host_monotonic_ns();
+    if (!covered ||
+        !cxl_type2_cuda_allocation_map_pageable_alias(
+            &ct2d->cuda_allocations, allocation_identity.base,
+            allocation_identity.epoch, generation,
+            alias_sources, pieces->len, &source_override->register_call_id, 1,
+            destination_offset, covered, 0, &alias, &alias_reason)) {
+        *failure_stage = alias_reason ? alias_reason : "alias-map";
+        goto out;
+    }
+    allocation = cxl_type2_cuda_allocation_find(
+        &ct2d->cuda_allocations, allocation_identity.base,
+        allocation_identity.epoch);
+    {
+        CXLType2CudaPageableAlias *pageable = allocation->pageable_alias;
+        uint64_t duration_ns =
+            cxl_type2_host_monotonic_ns() - alias_begin_ns;
+        QDict *event = cxl_type2_model_supply_event(ct2d);
+
+        qdict_put_str(event, "action", remap ? "remap" : "build");
+        qdict_put_str(event, "result", "pass");
+        cxl_type2_qdict_put_u64(event, "destination_allocation_id",
+                                allocation_identity.base);
+        cxl_type2_qdict_put_u64(event, "allocation_epoch",
+                                allocation_identity.epoch);
+        cxl_type2_qdict_put_u64(event, "content_generation", generation);
+        qdict_put(event, "contributing_source_call_ids",
+                  cxl_type2_model_supply_source_calls(pageable));
+        cxl_type2_qdict_put_u64(event, "destination_offset",
+                                destination_offset);
+        cxl_type2_qdict_put_u64(event, "logical_bytes", covered);
+        cxl_type2_qdict_put_u64(event, "alias_offset", alias);
+        cxl_type2_qdict_put_u64(event, "file_mapped_bytes",
+                                pageable->file_mapped_bytes);
+        cxl_type2_qdict_put_u64(event, "derived_boundary_pages",
+                                pageable->derived_boundary_pages);
+        cxl_type2_qdict_put_u64(event, "derived_boundary_copy_bytes",
+                                pageable->derived_boundary_copy_bytes);
+        cxl_type2_qdict_put_u64(event, "guard_bytes", pageable->guard_bytes);
+        cxl_type2_qdict_put_u64(event, "duration_ns", duration_ns);
+        cxl_type2_model_supply_hash_event(
+            ct2d->model_supply.alias_geometry, event);
+        cxl_type2_model_supply_emit("KIMI_MODEL_SUPPLY_ALIAS", event);
+
+        if (remap) {
+            ct2d->model_supply.alias_remaps++;
+        } else {
+            ct2d->model_supply.alias_builds++;
+            ct2d->model_supply.reserved_gpu_token_bytes += allocation->size;
+        }
+        ct2d->model_supply.alias_logical_bytes += covered;
+        ct2d->model_supply.logical_source_view_bytes += covered;
+        ct2d->model_supply.file_mapped_bytes += pageable->file_mapped_bytes;
+        ct2d->model_supply.derived_boundary_pages +=
+            pageable->derived_boundary_pages;
+        ct2d->model_supply.derived_boundary_copy_bytes +=
+            pageable->derived_boundary_copy_bytes;
+        ct2d->model_supply.boundary_composition_wall_ns += duration_ns;
+        ct2d->model_supply.guard_bytes += pageable->guard_bytes;
+        if (pageable->file_mapped_bytes +
+                pageable->derived_boundary_copy_bytes +
+                pageable->guard_bytes >
+            covered) {
+            ct2d->model_supply.page_collateral_bytes +=
+                pageable->file_mapped_bytes +
+                pageable->derived_boundary_copy_bytes +
+                pageable->guard_bytes - covered;
+        }
+        ct2d->model_supply.logical_direct_bytes += covered;
+    }
+    *logical_enqueued = range_count;
+    *fail_index = SIZE_MAX;
+    result = CXL_GPU_SUCCESS;
+
+out:
+    g_free(alias_sources);
+    if (pieces) {
+        g_array_free(pieces, true);
+    }
+    return result;
 }
 
 static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
@@ -5899,6 +7502,13 @@ static int cxl_type2_direct_batch_submit(CXLType2State *ct2d,
     size_t *logical_sizes = NULL;
     size_t failed_span = SIZE_MAX;
     int result = CXL_GPU_SUCCESS;
+
+    if (source_override && source_override->pageable_alias) {
+        return cxl_type2_direct_alias_submit(
+            ct2d, payload, payload_capacity, range_count, payload_bytes,
+            source_override, fail_index, failure_stage, logical_enqueued,
+            fragments_enqueued);
+    }
 
     *failure_stage = NULL;
     *logical_enqueued = 0;
@@ -6342,6 +7952,153 @@ static int cxl_type2_clear_htod_staging_pool(CXLType2State *ct2d)
     return first_error;
 }
 
+static void cxl_type2_pending_alias_consumers_add(
+    CXLType2State *ct2d, HetGPUStream stream, uint64_t launch_id,
+    CXLType2CudaAliasConsumer consumer, GArray *bindings)
+{
+    for (size_t i = 0; i < bindings->len; i++) {
+        const CXLType2AliasLaunchBinding *binding = &g_array_index(
+            bindings, CXLType2AliasLaunchBinding, i);
+        CXLType2PendingAliasConsumer *pending =
+            g_new0(CXLType2PendingAliasConsumer, 1);
+
+        pending->stream = stream;
+        pending->identity = binding->identity;
+        pending->generation = binding->generation;
+        pending->sequence = ++ct2d->next_alias_consumer_sequence;
+        pending->launch_id = launch_id;
+        pending->consumer = consumer;
+        pending->next = ct2d->pending_alias_consumers;
+        ct2d->pending_alias_consumers = pending;
+    }
+    g_array_unref(bindings);
+}
+
+static int cxl_type2_release_pending_alias_consumers(
+    CXLType2State *ct2d, HetGPUStream stream, bool all_streams,
+    uint64_t through_sequence)
+{
+    CXLType2PendingAliasConsumer **cursor =
+        &ct2d->pending_alias_consumers;
+
+    while (*cursor) {
+        CXLType2PendingAliasConsumer *pending = *cursor;
+
+        if ((!all_streams && pending->stream != stream) ||
+            pending->sequence > through_sequence) {
+            cursor = &pending->next;
+            continue;
+        }
+        *cursor = pending->next;
+        CXLType2CudaAllocation *allocation =
+            cxl_type2_cuda_allocation_find(
+                &ct2d->cuda_allocations, pending->identity.base,
+                pending->identity.epoch);
+        QList *source_calls = cxl_type2_model_supply_source_calls(
+            allocation ? allocation->pageable_alias : NULL);
+        if (!cxl_type2_cuda_allocation_release_pageable_alias(
+                &ct2d->cuda_allocations, pending->identity.base,
+                pending->identity.epoch, pending->generation,
+                pending->consumer)) {
+            qobject_unref(source_calls);
+            cxl_type2_model_supply_fail(
+                ct2d, ct2d->gpu_cmd.call_id, "completion",
+                "consumer-release-failed", UINT64_MAX,
+                pending->identity.base, pending->identity.epoch,
+                pending->generation);
+            g_free(pending);
+            return CXL_GPU_ERROR_INVALID_VALUE;
+        }
+        QDict *event = cxl_type2_model_supply_event(ct2d);
+
+        qdict_put_str(event, "action", "complete");
+        qdict_put_str(event, "result", "pass");
+        cxl_type2_qdict_put_u64(event, "launch_id", pending->launch_id);
+        cxl_type2_qdict_put_u64(event, "destination_allocation_id",
+                                pending->identity.base);
+        cxl_type2_qdict_put_u64(event, "allocation_epoch",
+                                pending->identity.epoch);
+        cxl_type2_qdict_put_u64(event, "content_generation",
+                                pending->generation);
+        qdict_put(event, "contributing_source_call_ids", source_calls);
+        qdict_put_null(event, "destination_cuda_token");
+        qdict_put_null(event, "node_kind");
+        qdict_put_str(event, "binding_kind",
+                      pending->consumer == CXL_TYPE2_CUDA_ALIAS_NORMAL
+                          ? "normal-top-level"
+                          : "graph-top-level");
+        qdict_put_null(event, "graph_exec_id");
+        qdict_put(event, "graph_node_tokens", qlist_new());
+        qdict_put_null(event, "module_load_kind");
+        qdict_put_null(event, "driver_input_cubin_sha256");
+        qdict_put_null(event, "function_name");
+        qdict_put_null(event, "static_consumer_certificate_sha256");
+        qdict_put(event, "visible_parameter_roots", qlist_new());
+        cxl_type2_model_supply_emit("KIMI_MODEL_SUPPLY_CONSUMER", event);
+        bool launch_still_pending = false;
+
+        for (CXLType2PendingAliasConsumer *candidate =
+                 ct2d->pending_alias_consumers;
+             candidate; candidate = candidate->next) {
+            if (candidate->launch_id == pending->launch_id) {
+                launch_still_pending = true;
+                break;
+            }
+        }
+        if (!launch_still_pending) {
+            if (pending->consumer == CXL_TYPE2_CUDA_ALIAS_NORMAL) {
+                ct2d->model_supply.normal_completions++;
+            } else {
+                ct2d->model_supply.graph_completions++;
+            }
+        }
+        g_free(pending);
+    }
+    return CXL_GPU_SUCCESS;
+}
+
+static uint64_t cxl_type2_latest_pending_alias_sequence(
+    CXLType2State *ct2d, HetGPUStream stream)
+{
+    uint64_t latest = 0;
+
+    for (CXLType2PendingAliasConsumer *pending =
+             ct2d->pending_alias_consumers;
+         pending; pending = pending->next) {
+        if (pending->stream == stream && pending->sequence > latest) {
+            latest = pending->sequence;
+        }
+    }
+    return latest;
+}
+
+static bool cxl_type2_stream_wire_is_capturing(CXLType2State *ct2d,
+                                                uint64_t stream_wire)
+{
+    return ct2d->gpu_cmd.capturing_stream_wires &&
+           g_hash_table_contains(ct2d->gpu_cmd.capturing_stream_wires,
+                                 &stream_wire);
+}
+
+static void cxl_type2_stream_wire_capture_set(CXLType2State *ct2d,
+                                               uint64_t stream_wire,
+                                               bool capturing)
+{
+    if (capturing) {
+        if (!ct2d->gpu_cmd.capturing_stream_wires) {
+            ct2d->gpu_cmd.capturing_stream_wires = g_hash_table_new_full(
+                g_int64_hash, g_int64_equal, g_free, NULL);
+        }
+        uint64_t *key = g_new(uint64_t, 1);
+
+        *key = stream_wire;
+        g_hash_table_replace(ct2d->gpu_cmd.capturing_stream_wires, key, key);
+    } else if (ct2d->gpu_cmd.capturing_stream_wires) {
+        g_hash_table_remove(ct2d->gpu_cmd.capturing_stream_wires,
+                            &stream_wire);
+    }
+}
+
 static int cxl_type2_release_pending_htod(CXLType2State *ct2d,
                                           HetGPUStream stream,
                                           bool all_streams,
@@ -6534,6 +8291,19 @@ static uint32_t cxl_type2_count_live_handles(void **handles, uint32_t count)
     return live;
 }
 
+static uint32_t cxl_type2_count_live_modules(
+    const CXLType2ModuleEntry *modules, uint32_t count)
+{
+    uint32_t live = 0;
+
+    for (uint32_t i = 0; i < count; i++) {
+        if (modules[i].handle) {
+            live++;
+        }
+    }
+    return live;
+}
+
 static int cxl_type2_clear_gpu_handles(CXLType2State *ct2d,
                                        uint64_t run_binding, uint32_t case_kind,
                                        uint64_t epoch)
@@ -6652,6 +8422,34 @@ static int cxl_type2_clear_gpu_handles(CXLType2State *ct2d,
                                                 total, category_error, true);
         }
 
+        for (uint32_t i = 0; i < ct2d->gpu_cmd.num_graph_execs; i++) {
+            if (ct2d->gpu_cmd.graph_execs[i]) {
+                int error = hetgpu_cuda_graph_exec_destroy(
+                    hetgpu, ct2d->gpu_cmd.graph_execs[i]);
+
+                if (first_error == 0 && error != 0) {
+                    first_error = error;
+                }
+                if (error == CXL_GPU_SUCCESS) {
+                    ct2d->gpu_cmd.graph_execs[i] = NULL;
+                }
+            }
+        }
+        cxl_type2_graph_generation_consumers_clear(ct2d);
+        for (uint32_t i = 0; i < ct2d->gpu_cmd.num_graphs; i++) {
+            if (ct2d->gpu_cmd.graphs[i]) {
+                int error = hetgpu_cuda_graph_destroy(
+                    hetgpu, ct2d->gpu_cmd.graphs[i]);
+
+                if (first_error == 0 && error != 0) {
+                    first_error = error;
+                }
+                if (error == CXL_GPU_SUCCESS) {
+                    ct2d->gpu_cmd.graphs[i] = NULL;
+                }
+            }
+        }
+
         category_error = 0;
         completed = 0;
         total = cxl_type2_count_live_handles(ct2d->gpu_cmd.link_states,
@@ -6688,7 +8486,7 @@ static int cxl_type2_clear_gpu_handles(CXLType2State *ct2d,
 
         category_error = 0;
         completed = 0;
-        total = cxl_type2_count_live_handles(ct2d->gpu_cmd.modules,
+        total = cxl_type2_count_live_modules(ct2d->gpu_cmd.modules,
                                              ct2d->gpu_cmd.num_modules);
         if (log_stages) {
             cxl_type2_log_kimi_cleanup_progress(run_binding, case_kind, epoch,
@@ -6696,9 +8494,10 @@ static int cxl_type2_clear_gpu_handles(CXLType2State *ct2d,
                                                 completed, total, 0, false);
         }
         for (uint32_t i = 0; i < ct2d->gpu_cmd.num_modules; i++) {
-            if (ct2d->gpu_cmd.modules[i]) {
+            if (ct2d->gpu_cmd.modules[i].handle) {
                 int error =
-                    hetgpu_unload_module(hetgpu, ct2d->gpu_cmd.modules[i]);
+                    hetgpu_unload_module(hetgpu,
+                                        ct2d->gpu_cmd.modules[i].handle);
                 if (category_error == 0 && error != 0) {
                     category_error = error;
                 }
@@ -6725,6 +8524,9 @@ static int cxl_type2_clear_gpu_handles(CXLType2State *ct2d,
                                       "handle_table_release", "begin", 0,
                                       false);
     }
+    for (uint32_t i = 0; i < ct2d->gpu_cmd.num_functions; i++) {
+        g_free(ct2d->gpu_cmd.functions[i].name);
+    }
     g_free(ct2d->gpu_cmd.modules);
     g_free(ct2d->gpu_cmd.functions);
     g_free(ct2d->gpu_cmd.graphs);
@@ -6733,7 +8535,11 @@ static int cxl_type2_clear_gpu_handles(CXLType2State *ct2d,
     g_free(ct2d->gpu_cmd.link_states);
     g_free(ct2d->gpu_cmd.streams);
     g_free(ct2d->gpu_cmd.events);
-    cxl_type2_graph_generation_consumers_clear(ct2d);
+    g_clear_pointer(&ct2d->gpu_cmd.capturing_stream_wires,
+                    g_hash_table_destroy);
+    if (!hetgpu->initialized) {
+        cxl_type2_graph_generation_consumers_clear(ct2d);
+    }
     cxl_type2_clear_event_htod_marks(ct2d);
     ct2d->gpu_cmd.modules = NULL;
     ct2d->gpu_cmd.functions = NULL;
@@ -7040,6 +8846,9 @@ static void cxl_type2_paired_case_end(CXLType2State *ct2d,
     HetGPUError concordia_error;
     HetGPUError reset_error;
     int pool_clear_result;
+    int handle_clear_result;
+    int alias_clear_result;
+    int cleanup_status;
     bool result_valid;
     bool case_success;
 
@@ -7068,6 +8877,11 @@ static void cxl_type2_paired_case_end(CXLType2State *ct2d,
         cxl_type2_release_pending_htod(ct2d, NULL, true, UINT64_MAX,
                                        "case-end") !=
             CXL_GPU_SUCCESS) {
+        sync_error = HETGPU_ERROR_UNKNOWN;
+    }
+    if (sync_error == HETGPU_SUCCESS &&
+        cxl_type2_release_pending_alias_consumers(
+            ct2d, NULL, true, UINT64_MAX) != CXL_GPU_SUCCESS) {
         sync_error = HETGPU_ERROR_UNKNOWN;
     }
     if (sync_error == HETGPU_SUCCESS &&
@@ -7144,12 +8958,22 @@ static void cxl_type2_paired_case_end(CXLType2State *ct2d,
                                       reset_error, true);
         ct2d->gpu_info.passthrough_enabled = false;
     }
-    (void)cxl_type2_clear_gpu_handles(ct2d, run_binding, case_kind, epoch);
+    handle_clear_result =
+        cxl_type2_clear_gpu_handles(ct2d, run_binding, case_kind, epoch);
+    alias_clear_result = cxl_type2_release_model_aliases(ct2d);
+    cleanup_status = reset_error != HETGPU_SUCCESS ? reset_error
+                     : handle_clear_result != CXL_GPU_SUCCESS
+                         ? handle_clear_result
+                         : alias_clear_result;
+    if (handle_clear_result != CXL_GPU_SUCCESS ||
+        alias_clear_result != CXL_GPU_SUCCESS) {
+        case_success = false;
+    }
 
     ct2d->gpu_cmd.results[0] = epoch;
     ct2d->gpu_cmd.results[1] = trace_sequence;
     ct2d->gpu_cmd.results[2] = result.outcome;
-    ct2d->gpu_cmd.results[3] = reset_error;
+    ct2d->gpu_cmd.results[3] = cleanup_status;
 
     {
         int64_t interval_end_ns = cxl_type2_host_monotonic_ns();
@@ -7169,6 +8993,8 @@ static void cxl_type2_paired_case_end(CXLType2State *ct2d,
             end_identity);
     }
     cxl_type2_log_case_summary(ct2d, run_binding, case_kind, epoch);
+    cxl_type2_log_model_supply_terminal(
+        ct2d, case_success, sync_error == HETGPU_SUCCESS, cleanup_status);
     cxl_type2_notify_case_scope(run_binding, case_kind, epoch, false);
 
     cxl_type2_log_kimi_case_stage(
@@ -7177,7 +9003,7 @@ static void cxl_type2_paired_case_end(CXLType2State *ct2d,
         : sync_error != HETGPU_SUCCESS      ? sync_error
         : concordia_error != HETGPU_SUCCESS ? concordia_error
         : !result_valid ? (result.reason ? result.reason : HETGPU_ERROR_UNKNOWN)
-        : reset_error != HETGPU_SUCCESS ? reset_error : HETGPU_SUCCESS,
+        : cleanup_status != CXL_GPU_SUCCESS ? cleanup_status : HETGPU_SUCCESS,
         true);
 
     qemu_log("KIMI_CASE_END run_binding=%" PRIu64 " case=%s epoch=%" PRIu64
@@ -7197,7 +9023,9 @@ static void cxl_type2_paired_case_end(CXLType2State *ct2d,
 
     if (application_exit != 0 || sync_error != HETGPU_SUCCESS ||
         concordia_error != HETGPU_SUCCESS || !result_valid ||
-        reset_error != HETGPU_SUCCESS) {
+        reset_error != HETGPU_SUCCESS ||
+        handle_clear_result != CXL_GPU_SUCCESS ||
+        alias_clear_result != CXL_GPU_SUCCESS) {
         ct2d->paired_case.failed = true;
         if (application_exit != 0) {
             ct2d->paired_case.failure_code = (uint32_t)application_exit;
@@ -7208,8 +9036,13 @@ static void cxl_type2_paired_case_end(CXLType2State *ct2d,
         } else if (!result_valid) {
             ct2d->paired_case.failure_code =
                 result.reason ? result.reason : HETGPU_ERROR_UNKNOWN;
-        } else {
+        } else if (reset_error != HETGPU_SUCCESS) {
             ct2d->paired_case.failure_code = reset_error;
+        } else {
+            ct2d->paired_case.failure_code =
+                handle_clear_result != CXL_GPU_SUCCESS
+                    ? handle_clear_result
+                    : alias_clear_result;
         }
         ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_UNKNOWN;
     }
@@ -7547,6 +9380,11 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                     CXL_GPU_SUCCESS) {
                 err = HETGPU_ERROR_UNKNOWN;
             }
+            if (err == HETGPU_SUCCESS &&
+                cxl_type2_release_pending_alias_consumers(
+                    ct2d, NULL, true, UINT64_MAX) != CXL_GPU_SUCCESS) {
+                err = HETGPU_ERROR_UNKNOWN;
+            }
             if (err != HETGPU_SUCCESS) {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_UNKNOWN;
             }
@@ -7626,17 +9464,42 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         break;
 
     case CXL_GPU_CMD_MEM_FREE:
-        dev_ptr = ct2d->gpu_cmd.params[0];
-        if (hetgpu->initialized) {
-            err = hetgpu_free(hetgpu, dev_ptr);
-            if (err != HETGPU_SUCCESS) {
-                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
-            } else if (!cxl_type2_cuda_allocation_forget(
-                           &ct2d->cuda_allocations, dev_ptr)) {
-                cxl_type2_cuda_classifier_reject(
-                    ct2d, CXL_TYPE2_CUDA_CLASSIFIER_UNAVAILABLE,
-                    CXL_TYPE2_CUDA_REJECTION_ALLOCATION_MISSING,
-                    CXL_GPU_CMD_MEM_FREE, true);
+        {
+            CXLType2CudaAllocation *allocation;
+            CXLType2CudaAllocationIdentity identity;
+            QDict *release_event = NULL;
+
+            dev_ptr = ct2d->gpu_cmd.params[0];
+            allocation =
+                cxl_type2_cuda_allocation_identity_for_address(
+                    &ct2d->cuda_allocations, dev_ptr, &identity)
+                    ? cxl_type2_cuda_allocation_find(
+                          &ct2d->cuda_allocations, identity.base,
+                          identity.epoch)
+                    : NULL;
+            if (allocation && allocation->pageable_alias) {
+                release_event = cxl_type2_model_supply_alias_release_event(
+                    ct2d, allocation);
+            }
+            if (hetgpu->initialized) {
+                err = hetgpu_free(hetgpu, dev_ptr);
+                if (err != HETGPU_SUCCESS) {
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                } else if (!cxl_type2_cuda_allocation_forget(
+                               &ct2d->cuda_allocations, dev_ptr)) {
+                    cxl_type2_cuda_classifier_reject(
+                        ct2d, CXL_TYPE2_CUDA_CLASSIFIER_UNAVAILABLE,
+                        CXL_TYPE2_CUDA_REJECTION_ALLOCATION_MISSING,
+                        CXL_GPU_CMD_MEM_FREE, true);
+                } else if (release_event) {
+                    cxl_type2_model_supply_emit(
+                        "KIMI_MODEL_SUPPLY_ALIAS", release_event);
+                    release_event = NULL;
+                    ct2d->model_supply.alias_releases++;
+                }
+            }
+            if (release_event) {
+                qobject_unref(release_event);
             }
         }
         /* Fallback: no-op for simple allocator */
@@ -7730,6 +9593,8 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             uint64_t payload_bytes = ct2d->gpu_cmd.params[1];
             uint64_t fail_idx = SIZE_MAX;
             uint64_t enqueued = 0;
+            uint64_t source_bytes_before =
+                ct2d->paired_case.active_payload_source_bytes;
             void *stream = NULL;
             CXLType2BatchHtoDEnqueueContext context;
 
@@ -7757,6 +9622,14 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 &fail_idx, &enqueued);
             ct2d->gpu_cmd.results[0] = fail_idx;
             ct2d->gpu_cmd.results[1] = enqueued;
+            if (ct2d->gpu_cmd.cmd_result == CXL_GPU_SUCCESS &&
+                ct2d->model_supply.route ==
+                    CXL_TYPE2_MODEL_SUPPLY_SELECTED_HTOD) {
+                ct2d->model_supply.model_htod_calls++;
+                ct2d->model_supply.model_htod_bytes +=
+                    ct2d->paired_case.active_payload_source_bytes -
+                    source_bytes_before;
+            }
         }
         break;
 
@@ -7984,16 +9857,22 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         if (hetgpu->initialized) {
             /* PTX source is in data buffer */
             void *module = NULL;
-            if (!cxl_type2_reserve_gpu_handle(&ct2d->gpu_cmd.modules,
-                                               &ct2d->gpu_cmd.modules_capacity,
-                                               ct2d->gpu_cmd.num_modules)) {
+            if (!cxl_type2_reserve_gpu_entries(
+                    (void **)&ct2d->gpu_cmd.modules,
+                    &ct2d->gpu_cmd.modules_capacity,
+                    ct2d->gpu_cmd.num_modules,
+                    sizeof(*ct2d->gpu_cmd.modules))) {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_OUT_OF_MEMORY;
                 break;
             }
             err = hetgpu_load_ptx(hetgpu, (const char *)ct2d->gpu_cmd.data,
                                   (HetGPUModule *)&module);
             if (err == HETGPU_SUCCESS) {
-                ct2d->gpu_cmd.modules[ct2d->gpu_cmd.num_modules] = module;
+                CXLType2ModuleEntry *entry =
+                    &ct2d->gpu_cmd.modules[ct2d->gpu_cmd.num_modules];
+
+                entry->handle = module;
+                entry->load_kind = CXL_TYPE2_MODULE_LOAD_PTX;
                 ct2d->gpu_cmd.results[0] = ct2d->gpu_cmd.num_modules;
                 ct2d->gpu_cmd.num_modules++;
                 ct2d->gpu_cmd.modules_high_water =
@@ -8072,18 +9951,29 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                      size, cubin_size);
 
             void *module = NULL;
-            if (!cxl_type2_reserve_gpu_handle(&ct2d->gpu_cmd.modules,
-                                               &ct2d->gpu_cmd.modules_capacity,
-                                               ct2d->gpu_cmd.num_modules)) {
+            g_autoptr(GChecksum) cubin_checksum =
+                g_checksum_new(G_CHECKSUM_SHA256);
+            if (!cxl_type2_reserve_gpu_entries(
+                    (void **)&ct2d->gpu_cmd.modules,
+                    &ct2d->gpu_cmd.modules_capacity,
+                    ct2d->gpu_cmd.num_modules,
+                    sizeof(*ct2d->gpu_cmd.modules))) {
                 g_free(decoded);
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_OUT_OF_MEMORY;
                 break;
             }
+            g_checksum_update(cubin_checksum, cubin_data, cubin_size);
             err = hetgpu_load_cubin(hetgpu, cubin_data, cubin_size,
                                     (HetGPUModule *)&module);
-            g_free(decoded);
             if (err == HETGPU_SUCCESS) {
-                ct2d->gpu_cmd.modules[ct2d->gpu_cmd.num_modules] = module;
+                CXLType2ModuleEntry *entry =
+                    &ct2d->gpu_cmd.modules[ct2d->gpu_cmd.num_modules];
+
+                entry->handle = module;
+                entry->load_kind = CXL_TYPE2_MODULE_LOAD_CUBIN;
+                pstrcpy(entry->driver_input_cubin_sha256,
+                        sizeof(entry->driver_input_cubin_sha256),
+                        g_checksum_get_string(cubin_checksum));
                 ct2d->gpu_cmd.results[0] = ct2d->gpu_cmd.num_modules;
                 ct2d->gpu_cmd.num_modules++;
                 ct2d->gpu_cmd.modules_high_water =
@@ -8092,6 +9982,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             } else {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_PTX;
             }
+            g_free(decoded);
         } else {
             ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
         }
@@ -8102,21 +9993,43 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             uint32_t module_id = ct2d->gpu_cmd.params[0];
             /* Function name is in data buffer */
             if (module_id < ct2d->gpu_cmd.num_modules &&
-                ct2d->gpu_cmd.modules[module_id]) {
+                ct2d->gpu_cmd.modules[module_id].handle) {
                 void *func = NULL;
-                if (!cxl_type2_reserve_gpu_handle(
-                        &ct2d->gpu_cmd.functions,
+                CXLType2FunctionEntry *entry;
+
+                if (!memchr(ct2d->gpu_cmd.data, '\0',
+                            ct2d->gpu_cmd.data_size)) {
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                    break;
+                }
+                if (!cxl_type2_reserve_gpu_entries(
+                        (void **)&ct2d->gpu_cmd.functions,
                         &ct2d->gpu_cmd.functions_capacity,
-                        ct2d->gpu_cmd.num_functions)) {
+                        ct2d->gpu_cmd.num_functions,
+                        sizeof(*ct2d->gpu_cmd.functions))) {
                     ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_OUT_OF_MEMORY;
                     break;
                 }
                 err = hetgpu_get_function(hetgpu,
-                                          ct2d->gpu_cmd.modules[module_id],
+                                          ct2d->gpu_cmd.modules[module_id]
+                                              .handle,
                                           (const char *)ct2d->gpu_cmd.data,
                                           (HetGPUFunction *)&func);
                 if (err == HETGPU_SUCCESS) {
-                    ct2d->gpu_cmd.functions[ct2d->gpu_cmd.num_functions] = func;
+                    entry = &ct2d->gpu_cmd.functions[
+                        ct2d->gpu_cmd.num_functions];
+                    entry->handle = func;
+                    entry->module_id = module_id;
+                    entry->name = g_strdup((const char *)ct2d->gpu_cmd.data);
+                    if (ct2d->gpu_cmd.modules[module_id].load_kind ==
+                        CXL_TYPE2_MODULE_LOAD_CUBIN) {
+                        entry->consumer =
+                            cxl_type2_model_consumer_function_find(
+                                &ct2d->model_supply.consumer_certificate,
+                                ct2d->gpu_cmd.modules[module_id]
+                                    .driver_input_cubin_sha256,
+                                entry->name);
+                    }
                     ct2d->gpu_cmd.results[0] = ct2d->gpu_cmd.num_functions;
                     ct2d->gpu_cmd.num_functions++;
                     ct2d->gpu_cmd.functions_high_water =
@@ -8137,14 +10050,16 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         if (hetgpu->initialized) {
             uint32_t module_id = ct2d->gpu_cmd.params[0];
             if (module_id >= ct2d->gpu_cmd.num_modules ||
-                !ct2d->gpu_cmd.modules[module_id]) {
+                !ct2d->gpu_cmd.modules[module_id].handle) {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
                 break;
             }
             err = hetgpu_unload_module(hetgpu,
-                                       ct2d->gpu_cmd.modules[module_id]);
+                                       ct2d->gpu_cmd.modules[module_id]
+                                           .handle);
             if (err == HETGPU_SUCCESS) {
-                ct2d->gpu_cmd.modules[module_id] = NULL;
+                memset(&ct2d->gpu_cmd.modules[module_id], 0,
+                       sizeof(ct2d->gpu_cmd.modules[module_id]));
             } else if (err == HETGPU_ERROR_INVALID_VALUE) {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
             } else if (err == HETGPU_ERROR_NOT_INITIALIZED) {
@@ -8167,7 +10082,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         if (hetgpu->initialized) {
             uint32_t module_id = ct2d->gpu_cmd.params[0];
             if (module_id >= ct2d->gpu_cmd.num_modules ||
-                !ct2d->gpu_cmd.modules[module_id]) {
+                !ct2d->gpu_cmd.modules[module_id].handle) {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
                 break;
             }
@@ -8179,7 +10094,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             dev_ptr = 0;
             size = 0;
             err = hetgpu_get_global(hetgpu,
-                                    ct2d->gpu_cmd.modules[module_id],
+                                    ct2d->gpu_cmd.modules[module_id].handle,
                                     (const char *)ct2d->gpu_cmd.data,
                                     &dev_ptr, &size);
             if (err == HETGPU_SUCCESS) {
@@ -8214,23 +10129,25 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
                 break;
             }
-            if (!ct2d->gpu_cmd.functions[func_id]) {
+            if (!ct2d->gpu_cmd.functions[func_id].handle) {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
                 break;
             }
             if (ct2d->paired_case.qemu_cuda_calls_enabled) {
                 qemu_log("CXL TYPE2 TRACE function_param_layout event=query_begin "
                          "layer=qemu function_id=%u backend_function=%p\n",
-                         func_id, ct2d->gpu_cmd.functions[func_id]);
+                         func_id, ct2d->gpu_cmd.functions[func_id].handle);
             }
             err = hetgpu_get_param_layout(hetgpu,
-                                          ct2d->gpu_cmd.functions[func_id],
+                                          ct2d->gpu_cmd.functions[func_id]
+                                              .handle,
                                           &layout);
             if (ct2d->paired_case.qemu_cuda_calls_enabled) {
                 qemu_log("CXL TYPE2 TRACE function_param_layout event=query_end "
                          "layer=qemu function_id=%u backend_function=%p "
                          "backend_result=%d layout=%p backend_queries=%" PRIu64 "\n",
-                         func_id, ct2d->gpu_cmd.functions[func_id], err, layout,
+                         func_id,
+                         ct2d->gpu_cmd.functions[func_id].handle, err, layout,
                          hetgpu->param_info_backend_queries - backend_queries_before);
             }
             if (err != HETGPU_SUCCESS) {
@@ -8281,7 +10198,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 break;
             }
             err = hetgpu_set_function_attribute(
-                hetgpu, ct2d->gpu_cmd.functions[func_id],
+                hetgpu, ct2d->gpu_cmd.functions[func_id].handle,
                 (int)ct2d->gpu_cmd.params[1],
                 (int)ct2d->gpu_cmd.params[2]);
             if (err == HETGPU_ERROR_INVALID_VALUE) {
@@ -8307,12 +10224,12 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             int value = 0;
 
             if (func_id >= ct2d->gpu_cmd.num_functions ||
-                !ct2d->gpu_cmd.functions[func_id]) {
+                !ct2d->gpu_cmd.functions[func_id].handle) {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
                 break;
             }
             err = hetgpu_get_function_attribute(
-                hetgpu, ct2d->gpu_cmd.functions[func_id],
+                hetgpu, ct2d->gpu_cmd.functions[func_id].handle,
                 (int)ct2d->gpu_cmd.params[1], &value);
             if (err == HETGPU_SUCCESS) {
                 ct2d->gpu_cmd.results[0] = (uint64_t)(int64_t)value;
@@ -8345,7 +10262,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 break;
             }
             err = hetgpu_get_max_active_blocks_per_multiprocessor(
-                hetgpu, ct2d->gpu_cmd.functions[func_id],
+                hetgpu, ct2d->gpu_cmd.functions[func_id].handle,
                 (int)(int64_t)ct2d->gpu_cmd.params[1],
                 (size_t)ct2d->gpu_cmd.params[2],
                 (unsigned int)ct2d->gpu_cmd.params[3], &num_blocks);
@@ -8416,6 +10333,10 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             size_t param_extent = ct2d->gpu_cmd.params[7];
             void *args[256];
             const HetGPUParamLayout *layout = NULL;
+            GArray *identities = NULL;
+            GArray *alias_identities = NULL;
+            GArray *event_bindings = NULL;
+            const char *consumer_reason = NULL;
             int cuda_result;
 
             if (graph_exec_id_raw > UINT32_MAX || graph_node_id_raw > UINT32_MAX ||
@@ -8431,12 +10352,12 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             uint32_t func_id = func_id_raw;
             if (!ct2d->gpu_cmd.graph_execs[graph_exec_id] ||
                 !ct2d->gpu_cmd.graph_nodes[graph_node_id] ||
-                !ct2d->gpu_cmd.functions[func_id]) {
+                !ct2d->gpu_cmd.functions[func_id].handle) {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
                 break;
             }
             err = hetgpu_get_param_layout(
-                hetgpu, ct2d->gpu_cmd.functions[func_id], &layout);
+                hetgpu, ct2d->gpu_cmd.functions[func_id].handle, &layout);
             if (err != HETGPU_SUCCESS || num_args != layout->num_args ||
                 param_extent != layout->extent || num_args > ARRAY_SIZE(args) ||
                 param_extent > ct2d->gpu_cmd.data_size) {
@@ -8454,25 +10375,68 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             if (ct2d->gpu_cmd.cmd_result != CXL_GPU_SUCCESS) {
                 break;
             }
+            if (!cxl_type2_model_consumer_validate(
+                    ct2d, &ct2d->gpu_cmd.functions[func_id], layout, args,
+                    &consumer_reason)) {
+                cxl_type2_model_supply_fail(
+                    ct2d, ct2d->gpu_cmd.call_id, "driver-binding",
+                    consumer_reason, UINT64_MAX, 0, 0, 0);
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                break;
+            }
+            identities = cxl_type2_generation_identities_from_params(
+                ct2d, layout, args);
+            if (!cxl_type2_model_alias_bind_graph_params(
+                    ct2d, layout, args, &alias_identities)) {
+                g_array_unref(identities);
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                break;
+            }
+            event_bindings = cxl_type2_alias_bindings_from_identities(
+                ct2d, alias_identities);
+            if (!event_bindings) {
+                g_array_unref(identities);
+                cxl_type2_graph_alias_identities_unbind(
+                    ct2d, alias_identities);
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                break;
+            }
+            CXLType2GraphNodeGenerationConsumers event_node = {
+                .node = ct2d->gpu_cmd.graph_nodes[graph_node_id],
+                .function_id = func_id,
+                .graph_node_token = graph_node_id,
+            };
+
+            if (event_bindings->len) {
+                cxl_type2_log_model_consumer_launch(
+                    ct2d, "bind", 0, func_id, layout, args,
+                    event_bindings, CXL_TYPE2_CUDA_ALIAS_GRAPH,
+                    graph_exec_id, &graph_node_id_raw, 1);
+            }
             cuda_result = hetgpu_cuda_graph_exec_kernel_node_set_params(
                 hetgpu, ct2d->gpu_cmd.graph_execs[graph_exec_id],
                 ct2d->gpu_cmd.graph_nodes[graph_node_id],
-                ct2d->gpu_cmd.functions[func_id], &config, args);
+                ct2d->gpu_cmd.functions[func_id].handle, &config, args);
             ct2d->gpu_cmd.cmd_result = cuda_result;
             if (cuda_result == CXL_GPU_SUCCESS) {
-                GArray *identities =
-                    cxl_type2_generation_identities_from_params(
-                        ct2d, layout, args);
-
                 if (!cxl_type2_graph_generation_consumers_set_node(
                         ct2d, graph_exec_id,
                         ct2d->gpu_cmd.graph_nodes[graph_node_id],
-                        identities)) {
+                        func_id, graph_node_id, identities,
+                        alias_identities)) {
                     g_array_unref(identities);
+                    cxl_type2_graph_alias_identities_unbind_for_node(
+                        ct2d, graph_exec_id, &event_node,
+                        alias_identities);
                     cxl_type2_generation_reuse_fail(
                         ct2d, "graph-node-consumer-identity-unavailable");
                 }
+            } else {
+                g_array_unref(identities);
+                cxl_type2_graph_alias_identities_unbind_for_node(
+                    ct2d, graph_exec_id, &event_node, alias_identities);
             }
+            g_array_unref(event_bindings);
         }
         break;
 
@@ -8512,7 +10476,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 break;
             }
             for (uint32_t i = 0; i < ct2d->gpu_cmd.num_functions; i++) {
-                if (ct2d->gpu_cmd.functions[i] == params.func) {
+                if (ct2d->gpu_cmd.functions[i].handle == params.func) {
                     function_id = i;
                     break;
                 }
@@ -8600,6 +10564,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         {
             uint64_t graph_exec_id_raw = ct2d->gpu_cmd.params[0];
             void *stream = NULL;
+            GArray *alias_bindings = NULL;
 
             if (graph_exec_id_raw > UINT32_MAX ||
                 graph_exec_id_raw >= ct2d->gpu_cmd.num_graph_execs ||
@@ -8609,11 +10574,41 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
                 break;
             }
+            alias_bindings = cxl_type2_graph_alias_launch_acquire(
+                ct2d, graph_exec_id_raw);
+            if (!alias_bindings) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                break;
+            }
             ct2d->gpu_cmd.cmd_result = hetgpu_cuda_graph_launch(
                 hetgpu, ct2d->gpu_cmd.graph_execs[graph_exec_id_raw], stream);
             if (ct2d->gpu_cmd.cmd_result == CXL_GPU_SUCCESS) {
+                uint64_t launch_id = ++ct2d->next_model_supply_launch_id;
+
+                if (alias_bindings->len) {
+                    cxl_type2_log_model_graph_launch(
+                        ct2d, launch_id, graph_exec_id_raw, alias_bindings);
+                    cxl_type2_pending_alias_consumers_add(
+                        ct2d, stream, launch_id,
+                        CXL_TYPE2_CUDA_ALIAS_GRAPH, alias_bindings);
+                } else {
+                    g_array_unref(alias_bindings);
+                }
                 cxl_type2_generation_consume_graph(
                     ct2d, graph_exec_id_raw, ct2d->gpu_cmd.call_id);
+            } else {
+                if (alias_bindings->len) {
+                    const CXLType2AliasLaunchBinding *binding = &g_array_index(
+                        alias_bindings, CXLType2AliasLaunchBinding, 0);
+
+                    cxl_type2_model_supply_fail(
+                        ct2d, ct2d->gpu_cmd.call_id, "driver-launch",
+                        "graph-launch-failed", UINT64_MAX,
+                        binding->identity.base, binding->identity.epoch,
+                        binding->generation);
+                }
+                cxl_type2_alias_launch_bindings_release(
+                    ct2d, alias_bindings, CXL_TYPE2_CUDA_ALIAS_GRAPH);
             }
         }
         break;
@@ -8656,6 +10651,8 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             char log_dummy = 0;
             HetGPUGraphExec graph_exec = NULL;
             HetGPUGraphNode error_node = NULL;
+            CXLType2GraphExecGenerationConsumers *consumers = NULL;
+            uint32_t graph_exec_id = ct2d->gpu_cmd.num_graph_execs;
 
             if (graph_id_raw > UINT32_MAX ||
                 graph_id_raw >= ct2d->gpu_cmd.num_graphs ||
@@ -8684,6 +10681,19 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                     break;
                 }
             }
+            if (ct2d->model_supply.route ==
+                CXL_TYPE2_MODEL_SUPPLY_CXL_DIRECT) {
+                consumers = cxl_type2_graph_generation_consumers_snapshot(
+                    ct2d, ct2d->gpu_cmd.graphs[graph_id_raw], graph_exec_id);
+                if (!consumers) {
+                    cxl_type2_model_supply_fail(
+                        ct2d, ct2d->gpu_cmd.call_id, "driver-binding",
+                        "graph-consumer-snapshot-unavailable", UINT64_MAX,
+                        0, 0, 0);
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                    break;
+                }
+            }
             int cuda_result = hetgpu_cuda_graph_instantiate(
                 hetgpu, ct2d->gpu_cmd.graphs[graph_id_raw], &graph_exec,
                 want_error_node ? &error_node : NULL,
@@ -8708,16 +10718,18 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             }
             if (cuda_result == CXL_GPU_SUCCESS) {
                 if (!graph_exec) {
+                    cxl_type2_graph_exec_generation_consumers_free(consumers);
                     ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
                     break;
                 }
-                uint32_t graph_exec_id = ct2d->gpu_cmd.num_graph_execs;
                 ct2d->gpu_cmd.graph_execs[graph_exec_id] = graph_exec;
                 ct2d->gpu_cmd.results[0] = graph_exec_id;
                 ct2d->gpu_cmd.num_graph_execs++;
-                CXLType2GraphExecGenerationConsumers *consumers =
-                    cxl_type2_graph_generation_consumers_snapshot(
-                        ct2d, ct2d->gpu_cmd.graphs[graph_id_raw]);
+                if (!consumers) {
+                    consumers = cxl_type2_graph_generation_consumers_snapshot(
+                        ct2d, ct2d->gpu_cmd.graphs[graph_id_raw],
+                        graph_exec_id);
+                }
 
                 if (consumers) {
                     cxl_type2_graph_generation_consumers_set(
@@ -8730,6 +10742,8 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                     cxl_type2_cuda_classify_graph(
                         ct2d, ct2d->gpu_cmd.graphs[graph_id_raw]);
                 }
+            } else {
+                cxl_type2_graph_exec_generation_consumers_free(consumers);
             }
         }
         break;
@@ -8825,6 +10839,14 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
                 break;
             }
+            if (ct2d->model_supply.route ==
+                CXL_TYPE2_MODEL_SUPPLY_CXL_DIRECT) {
+                cxl_type2_model_supply_fail(
+                    ct2d, ct2d->gpu_cmd.call_id, "driver-binding",
+                    "graph-exec-update-not-qualified", UINT64_MAX, 0, 0, 0);
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_SUPPORTED;
+                break;
+            }
             int cuda_result = hetgpu_cuda_graph_exec_update(
                 hetgpu, ct2d->gpu_cmd.graph_execs[graph_exec_id],
                 ct2d->gpu_cmd.graphs[graph_id], &info);
@@ -8832,7 +10854,8 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             if (cuda_result == CXL_GPU_SUCCESS) {
                 CXLType2GraphExecGenerationConsumers *consumers =
                     cxl_type2_graph_generation_consumers_snapshot(
-                        ct2d, ct2d->gpu_cmd.graphs[graph_id]);
+                        ct2d, ct2d->gpu_cmd.graphs[graph_id],
+                        graph_exec_id);
 
                 if (consumers) {
                     cxl_type2_graph_generation_consumers_set(
@@ -9065,13 +11088,17 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 void *args[256];
                 CXLType2CudaAllocationIdentity consumer_identities[256];
                 size_t consumer_identity_count = 0;
+                GArray *alias_bindings = NULL;
                 const HetGPUParamLayout *layout = NULL;
+                const char *consumer_reason = NULL;
                 uint64_t cache_hits_before = hetgpu->param_info_cache_hits;
                 uint64_t cache_misses_before = hetgpu->param_info_cache_misses;
                 uint64_t backend_queries_before = hetgpu->param_info_backend_queries;
+                bool capturing = cxl_type2_stream_wire_is_capturing(
+                    ct2d, ct2d->gpu_cmd.params[6]);
 
                 err = hetgpu_get_param_layout(
-                    hetgpu, ct2d->gpu_cmd.functions[func_id], &layout);
+                    hetgpu, ct2d->gpu_cmd.functions[func_id].handle, &layout);
                 if (err != HETGPU_SUCCESS || num_args != layout->num_args ||
                     param_extent != layout->extent ||
                     num_args > ARRAY_SIZE(args) ||
@@ -9101,6 +11128,17 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 if (ct2d->gpu_cmd.cmd_result != CXL_GPU_SUCCESS) {
                     break;
                 }
+                if (!cxl_type2_model_consumer_validate(
+                        ct2d, &ct2d->gpu_cmd.functions[func_id], layout,
+                        args, &consumer_reason)) {
+                    cxl_type2_model_supply_fail(
+                        ct2d, ct2d->gpu_cmd.call_id, "driver-binding",
+                        consumer_reason, UINT64_MAX, 0, 0, 0);
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                    break;
+                }
+                alias_bindings = cxl_type2_model_alias_rewrite_params(
+                    ct2d, layout, args, CXL_TYPE2_CUDA_ALIAS_NORMAL);
 
                 if (ct2d->paired_case.qemu_cuda_calls_enabled) qemu_log(
                     "CXL TYPE2 TRACE function_param_layout event=launch "
@@ -9112,17 +11150,52 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                     hetgpu->param_info_backend_queries - backend_queries_before);
 
                 err = hetgpu_launch_kernel(hetgpu,
-                                           ct2d->gpu_cmd.functions[func_id],
+                                           ct2d->gpu_cmd.functions[func_id]
+                                               .handle,
                                            &config, args, num_args);
                 if (err != HETGPU_SUCCESS) {
+                    if (alias_bindings->len) {
+                        const CXLType2AliasLaunchBinding *binding =
+                            &g_array_index(alias_bindings,
+                                           CXLType2AliasLaunchBinding, 0);
+
+                        cxl_type2_model_supply_fail(
+                            ct2d, ct2d->gpu_cmd.call_id, "driver-launch",
+                            "kernel-launch-failed", UINT64_MAX,
+                            binding->identity.base, binding->identity.epoch,
+                            binding->generation);
+                    }
+                    cxl_type2_alias_launch_bindings_release(
+                        ct2d, alias_bindings,
+                        CXL_TYPE2_CUDA_ALIAS_NORMAL);
                     ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_LAUNCH_FAILED;
-                } else if (!cxl_type2_cuda_generation_consume(
-                               &ct2d->cuda_allocations,
-                               consumer_identities, consumer_identity_count,
-                               CXL_GPU_CMD_LAUNCH_KERNEL,
-                               ct2d->gpu_cmd.call_id)) {
-                    cxl_type2_generation_reuse_fail(
-                        ct2d, ct2d->cuda_allocations.first_generation_error);
+                } else {
+                    uint64_t launch_id = ++ct2d->next_model_supply_launch_id;
+
+                    if (capturing) {
+                        cxl_type2_alias_launch_bindings_release(
+                            ct2d, alias_bindings,
+                            CXL_TYPE2_CUDA_ALIAS_NORMAL);
+                    } else if (alias_bindings->len) {
+                        cxl_type2_log_model_consumer_launch(
+                            ct2d, "launch", launch_id, func_id, layout, args,
+                            alias_bindings, CXL_TYPE2_CUDA_ALIAS_NORMAL, 0,
+                            NULL, 0);
+                        cxl_type2_pending_alias_consumers_add(
+                            ct2d, config.stream, launch_id,
+                            CXL_TYPE2_CUDA_ALIAS_NORMAL, alias_bindings);
+                    } else {
+                        g_array_unref(alias_bindings);
+                    }
+                    if (!capturing && !cxl_type2_cuda_generation_consume(
+                            &ct2d->cuda_allocations,
+                            consumer_identities, consumer_identity_count,
+                            CXL_GPU_CMD_LAUNCH_KERNEL,
+                            ct2d->gpu_cmd.call_id)) {
+                        cxl_type2_generation_reuse_fail(
+                            ct2d,
+                            ct2d->cuda_allocations.first_generation_error);
+                    }
                 }
             } else {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
@@ -9168,6 +11241,10 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                     ct2d, stream, false, UINT64_MAX, "stream-destroy");
             }
             if (result == CXL_GPU_SUCCESS) {
+                result = cxl_type2_release_pending_alias_consumers(
+                    ct2d, stream, false, UINT64_MAX);
+            }
+            if (result == CXL_GPU_SUCCESS) {
                 result = hetgpu_cuda_stream_destroy(hetgpu, stream);
             }
             ct2d->gpu_cmd.cmd_result = result;
@@ -9204,6 +11281,12 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                                                    UINT64_MAX, "stream-sync");
                 if (release_result != CXL_GPU_SUCCESS) {
                     ct2d->gpu_cmd.cmd_result = release_result;
+                } else {
+                    release_result = cxl_type2_release_pending_alias_consumers(
+                        ct2d, stream, false, UINT64_MAX);
+                    if (release_result != CXL_GPU_SUCCESS) {
+                        ct2d->gpu_cmd.cmd_result = release_result;
+                    }
                 }
             }
         }
@@ -9290,6 +11373,10 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             }
             ct2d->gpu_cmd.cmd_result = hetgpu_cuda_stream_begin_capture(
                 hetgpu, stream, (int)ct2d->gpu_cmd.params[1]);
+            if (ct2d->gpu_cmd.cmd_result == CXL_GPU_SUCCESS) {
+                cxl_type2_stream_wire_capture_set(
+                    ct2d, ct2d->gpu_cmd.params[0], true);
+            }
         }
         break;
 
@@ -9306,6 +11393,8 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             }
             int result = hetgpu_cuda_stream_end_capture(hetgpu, stream, &graph);
             ct2d->gpu_cmd.cmd_result = result;
+            cxl_type2_stream_wire_capture_set(
+                ct2d, ct2d->gpu_cmd.params[0], false);
             if (result == CXL_GPU_SUCCESS && graph) {
                 if (!cxl_type2_register_gpu_handle(&ct2d->gpu_cmd.graphs,
                         &ct2d->gpu_cmd.graphs_capacity,
@@ -9440,6 +11529,14 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                                                        : "event-sync");
                     if (release_result != CXL_GPU_SUCCESS) {
                         ct2d->gpu_cmd.cmd_result = release_result;
+                    } else {
+                        release_result =
+                            cxl_type2_release_pending_alias_consumers(
+                                ct2d, mark->stream, false,
+                                mark->alias_sequence);
+                        if (release_result != CXL_GPU_SUCCESS) {
+                            ct2d->gpu_cmd.cmd_result = release_result;
+                        }
                     }
                 }
             }
@@ -9469,6 +11566,8 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 mark->stream = stream;
                 mark->sequence =
                     cxl_type2_latest_pending_htod_sequence(ct2d, stream);
+                mark->alias_sequence =
+                    cxl_type2_latest_pending_alias_sequence(ct2d, stream);
             }
         }
         break;
@@ -9626,6 +11725,14 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 cxl_type2_log_direct_source_register_failure(
                     ct2d, failure_stage, failure_index,
                     ct2d->gpu_cmd.cmd_result, ct2d->gpu_cmd.params[0]);
+                if (ct2d->model_supply.route ==
+                    CXL_TYPE2_MODEL_SUPPLY_CXL_DIRECT) {
+                    cxl_type2_model_supply_fail(
+                        ct2d, ct2d->gpu_cmd.call_id,
+                        cxl_type2_model_supply_failure_stage(failure_stage),
+                        failure_stage ? failure_stage : "source-register",
+                        failure_index, 0, 0, 0);
+                }
             }
         }
         break;
@@ -9663,6 +11770,12 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 cxl_type2_log_direct_source_register_failure(
                     ct2d, "command-prevalidate", SIZE_MAX,
                     ct2d->gpu_cmd.cmd_result, register_bytes);
+                if (ct2d->model_supply.route ==
+                    CXL_TYPE2_MODEL_SUPPLY_CXL_DIRECT) {
+                    cxl_type2_model_supply_fail(
+                        ct2d, ct2d->gpu_cmd.call_id, "batch-validate",
+                        "command-prevalidate", UINT64_MAX, 0, 0, 0);
+                }
                 break;
             }
             direct_bytes = range_count * sizeof(CXLGPUDirectRangeV1);
@@ -9671,6 +11784,12 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 cxl_type2_log_direct_source_register_failure(
                     ct2d, "command-prevalidate", SIZE_MAX,
                     ct2d->gpu_cmd.cmd_result, register_bytes);
+                if (ct2d->model_supply.route ==
+                    CXL_TYPE2_MODEL_SUPPLY_CXL_DIRECT) {
+                    cxl_type2_model_supply_fail(
+                        ct2d, ct2d->gpu_cmd.call_id, "batch-validate",
+                        "command-prevalidate", UINT64_MAX, 0, 0, 0);
+                }
                 break;
             }
             ct2d->gpu_cmd.cmd_result = cxl_type2_direct_source_register(
@@ -9680,6 +11799,14 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 cxl_type2_log_direct_source_register_failure(
                     ct2d, failure_stage, fail_idx,
                     ct2d->gpu_cmd.cmd_result, register_bytes);
+                if (ct2d->model_supply.route ==
+                    CXL_TYPE2_MODEL_SUPPLY_CXL_DIRECT) {
+                    cxl_type2_model_supply_fail(
+                        ct2d, ct2d->gpu_cmd.call_id,
+                        cxl_type2_model_supply_failure_stage(failure_stage),
+                        failure_stage ? failure_stage : "source-register",
+                        fail_idx, 0, 0, 0);
+                }
                 break;
             }
             CXLType2DirectSource *source = cxl_type2_direct_source_find(
@@ -9705,6 +11832,14 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                     ct2d, batch_failure_stage, fail_idx,
                     ct2d->gpu_cmd.cmd_result,
                     register_bytes + direct_bytes);
+                if (ct2d->model_supply.route ==
+                    CXL_TYPE2_MODEL_SUPPLY_CXL_DIRECT) {
+                    cxl_type2_model_supply_fail(
+                        ct2d, ct2d->gpu_cmd.call_id,
+                        cxl_type2_model_supply_failure_stage(
+                            batch_failure_stage),
+                        batch_failure_stage, fail_idx, 0, 0, source_id);
+                }
             }
             if (!source->pending_refcount) {
                 int cleanup = cxl_type2_direct_source_unregister(
@@ -9715,6 +11850,12 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                     cxl_type2_log_direct_source_register_failure(
                         ct2d, "source-cleanup", SIZE_MAX, cleanup,
                         register_bytes + direct_bytes);
+                    if (ct2d->model_supply.route ==
+                        CXL_TYPE2_MODEL_SUPPLY_CXL_DIRECT) {
+                        cxl_type2_model_supply_fail(
+                            ct2d, ct2d->gpu_cmd.call_id, "cleanup",
+                            "source-cleanup", UINT64_MAX, 0, 0, source_id);
+                    }
                     ct2d->gpu_cmd.cmd_result = cleanup;
                 }
             }
@@ -10631,7 +12772,9 @@ static void cxl_type2_reset(DeviceState *dev)
                 HETGPU_SUCCESS &&
             cxl_type2_release_pending_htod(ct2d, NULL, true, UINT64_MAX,
                                            "device-reset") ==
-                CXL_GPU_SUCCESS) {
+                CXL_GPU_SUCCESS &&
+            cxl_type2_release_pending_alias_consumers(
+                ct2d, NULL, true, UINT64_MAX) == CXL_GPU_SUCCESS) {
             result = cxl_type2_direct_sources_cleanup(ct2d);
         }
         if (result != CXL_GPU_SUCCESS) {
@@ -10690,6 +12833,51 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
                    "cache-size (%" PRIu64 ") is smaller than the BAR2 GPU command region (%u)",
                    ct2d->cache_size, CXL_GPU_CMD_REG_SIZE);
         return;
+    }
+    if (!cxl_type2_model_supply_route_parse(ct2d->model_supply.route_text,
+                                             &ct2d->model_supply.route,
+                                             errp)) {
+        return;
+    }
+    if (ct2d->model_supply.route == CXL_TYPE2_MODEL_SUPPLY_SELECTED_HTOD) {
+        if (ct2d->model_supply.member_manifest_path ||
+            ct2d->model_supply.member_manifest_sha256 ||
+            ct2d->model_supply.consumer_certificate_path ||
+            ct2d->model_supply.consumer_certificate_sha256) {
+            error_setg(errp,
+                       "selected-htod does not accept model supply manifests");
+            return;
+        }
+    } else {
+        if (!ct2d->cuda_direct_source || !ct2d->direct_source_fs ||
+            !ct2d->model_aperture.size ||
+            !ct2d->model_supply.member_manifest_path ||
+            !ct2d->model_supply.member_manifest_sha256 ||
+            !ct2d->model_supply.consumer_certificate_path ||
+            !ct2d->model_supply.consumer_certificate_sha256 ||
+            ct2d->gpu_info.mode != CXL_TYPE2_GPU_MODE_HETGPU ||
+            ct2d->gpu_info.hetgpu_backend != HETGPU_BACKEND_NVIDIA ||
+            !ct2d->gpu_info.hetgpu_lib_path ||
+            ct2d->gpu_info.hetgpu_lib_path[0] != '/') {
+            error_setg(errp, "cxl-direct requires cuda-direct-source, a DAX "
+                       "direct-source-fs, a nonzero model aperture, a sealed "
+                       "model member and consumer manifests, and explicit "
+                       "NVIDIA hetGPU mode");
+            return;
+        }
+        if (!cxl_type2_model_member_manifest_load(
+                &ct2d->model_supply.member_manifest,
+                ct2d->model_supply.member_manifest_path,
+                ct2d->model_supply.member_manifest_sha256,
+                ct2d->model_aperture.size, errp)) {
+            return;
+        }
+        if (!cxl_type2_model_consumer_certificate_load(
+                &ct2d->model_supply.consumer_certificate,
+                ct2d->model_supply.consumer_certificate_path,
+                ct2d->model_supply.consumer_certificate_sha256, errp)) {
+            return;
+        }
     }
 
     {
@@ -11052,6 +13240,8 @@ static void cxl_type2_exit(PCIDevice *pci_dev)
         (void)hetgpu_synchronize(&ct2d->gpu_info.hetgpu_state);
         (void)cxl_type2_release_pending_htod(ct2d, NULL, true, UINT64_MAX,
                                              "device-exit");
+        (void)cxl_type2_release_pending_alias_consumers(
+            ct2d, NULL, true, UINT64_MAX);
         (void)cxl_type2_clear_htod_staging_pool(ct2d);
         if (cxl_type2_direct_sources_cleanup(ct2d) != CXL_GPU_SUCCESS) {
             error_report("CXL Type2 direct source cleanup failed at device exit");
@@ -11100,6 +13290,14 @@ static void cxl_type2_exit(PCIDevice *pci_dev)
     }
 
     cxl_type2_fabric_features_cleanup(ct2d);
+    cxl_type2_model_member_manifest_clear(
+        &ct2d->model_supply.member_manifest);
+    cxl_type2_model_consumer_certificate_clear(
+        &ct2d->model_supply.consumer_certificate);
+    g_clear_pointer(&ct2d->model_supply.source_geometry, g_checksum_free);
+    g_clear_pointer(&ct2d->model_supply.alias_geometry, g_checksum_free);
+    g_clear_pointer(&ct2d->model_supply.first_failure_stage, g_free);
+    g_clear_pointer(&ct2d->model_supply.first_failure_detail, g_free);
 
     qemu_log("CXL Type2: Device exit complete\n");
 }
@@ -11119,6 +13317,16 @@ static const Property cxl_type2_props[] = {
                      direct_registration_padding_limit, 0),
     DEFINE_PROP_LINK("direct-source-fs", CXLType2State, direct_source_fs,
                      TYPE_VHOST_USER_FS_PCI, Object *),
+    DEFINE_PROP_STRING("model-supply-route", CXLType2State,
+                       model_supply.route_text),
+    DEFINE_PROP_STRING("model-member-manifest", CXLType2State,
+                       model_supply.member_manifest_path),
+    DEFINE_PROP_STRING("model-member-manifest-sha256", CXLType2State,
+                       model_supply.member_manifest_sha256),
+    DEFINE_PROP_STRING("model-consumer-certificate", CXLType2State,
+                       model_supply.consumer_certificate_path),
+    DEFINE_PROP_STRING("model-consumer-certificate-sha256", CXLType2State,
+                       model_supply.consumer_certificate_sha256),
     DEFINE_PROP_SIZE("model-aperture-offset", CXLType2State,
                      model_aperture.offset, 0),
     DEFINE_PROP_SIZE("model-aperture-size", CXLType2State,

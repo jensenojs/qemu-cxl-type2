@@ -17,6 +17,7 @@
 #include "hw/cxl/cxl_component.h"
 #include "hw/cxl/cxl_hetgpu.h"
 #include "hw/cxl/cxl_type2_cuda_contract.h"
+#include "hw/cxl/cxl_type2_model_supply.h"
 #include "hw/cxl/cxl_type2_gpu_cmd.h"
 #include "hw/cxl/cxl_type2_coherency.h"
 #include "hw/cxl/cxl_p2p_dma.h"
@@ -206,6 +207,16 @@ typedef struct CXLType2PendingHtoD {
     struct CXLType2PendingHtoD *next;
 } CXLType2PendingHtoD;
 
+typedef struct CXLType2PendingAliasConsumer {
+    HetGPUStream stream;
+    CXLType2CudaAllocationIdentity identity;
+    uint64_t generation;
+    uint64_t sequence;
+    uint64_t launch_id;
+    CXLType2CudaAliasConsumer consumer;
+    struct CXLType2PendingAliasConsumer *next;
+} CXLType2PendingAliasConsumer;
+
 typedef struct CXLType2DirectRegistration {
     void *host_address;
     uint64_t length;
@@ -237,6 +248,15 @@ typedef struct CXLType2DirectRun {
     CXLType2DirectPhysical *physical;
     uint64_t physical_offset;
     uint64_t length;
+    int source_fd;
+    uint64_t file_offset;
+    uint64_t mapping_generation;
+    uint64_t logical_cxl_offset;
+    uint64_t source_device;
+    uint64_t source_inode;
+    uint64_t source_size;
+    uint32_t source_mode;
+    uint32_t model_member_index;
 } CXLType2DirectRun;
 
 typedef struct CXLType2DirectRangeLayout {
@@ -253,6 +273,7 @@ typedef struct CXLType2MemoryRange {
 
 typedef struct CXLType2DirectSource {
     uint64_t source_id;
+    uint64_t register_call_id;
     uint64_t case_epoch;
     uint64_t logical_bytes;
     uint64_t unique_dmap_bytes;
@@ -262,6 +283,7 @@ typedef struct CXLType2DirectSource {
     uint32_t run_count;
     uint64_t pending_refcount;
     bool auto_unregister;
+    bool pageable_alias;
     struct CXLType2DirectSource *next;
 } CXLType2DirectSource;
 
@@ -276,6 +298,7 @@ typedef struct CXLType2EventHtoDMark {
     void *event;
     HetGPUStream stream;
     uint64_t sequence;
+    uint64_t alias_sequence;
     struct CXLType2EventHtoDMark *next;
 } CXLType2EventHtoDMark;
 
@@ -377,14 +400,15 @@ typedef struct CXLType2State {
         /* Guest-visible IDs are indexes into tables that grow with the active
          * CUDA workload. A case reset releases both tables and invalidates all
          * IDs from that case. */
-        void    **modules;             /* Loaded PTX/CUBIN modules */
-        void    **functions;           /* Kernel function handles */
+        CXLType2ModuleEntry *modules;
+        CXLType2FunctionEntry *functions;
         void    **graphs;              /* CUDA graph handles */
         void    **graph_execs;         /* CUDA executable graph handles */
         void    **graph_nodes;         /* CUDA graph node handles */
         void    **link_states;         /* CUDA JIT link state handles */
         void    **streams;             /* CUDA stream handles */
         void    **events;              /* CUDA event handles */
+        GHashTable *capturing_stream_wires;
         /* knockout: one stable stream serializes PTDS across guest threads;
          * restore thread-local concurrency when the wire carries guest TID. */
         void     *per_thread_stream;
@@ -410,9 +434,12 @@ typedef struct CXLType2State {
     } gpu_cmd;
 
     CXLType2PendingHtoD *pending_htod;
+    CXLType2PendingAliasConsumer *pending_alias_consumers;
     CXLType2HtoDStagingBuffer *htod_staging_pool;
     CXLType2EventHtoDMark *event_htod_marks;
     uint64_t next_htod_sequence;
+    uint64_t next_alias_consumer_sequence;
+    uint64_t next_model_supply_launch_id;
     uint64_t next_htod_staging_id;
     uint64_t htod_staging_pool_size;
     uint64_t htod_pending_copies;
@@ -436,6 +463,44 @@ typedef struct CXLType2State {
         uint64_t offset;
         uint64_t size;
     } model_aperture;
+    struct {
+        char *route_text;
+        CXLType2ModelSupplyRoute route;
+        char *member_manifest_path;
+        char *member_manifest_sha256;
+        CXLType2ModelMemberManifest member_manifest;
+        char *consumer_certificate_path;
+        char *consumer_certificate_sha256;
+        CXLType2ModelConsumerCertificate consumer_certificate;
+        uint64_t source_descriptor_count;
+        uint64_t source_logical_bytes;
+        uint64_t alias_builds;
+        uint64_t alias_remaps;
+        uint64_t alias_releases;
+        uint64_t alias_logical_bytes;
+        uint64_t logical_source_view_bytes;
+        uint64_t page_collateral_bytes;
+        uint64_t file_mapped_bytes;
+        uint64_t derived_boundary_pages;
+        uint64_t derived_boundary_copy_bytes;
+        uint64_t boundary_composition_wall_ns;
+        uint64_t guard_bytes;
+        uint64_t model_htod_calls;
+        uint64_t model_htod_bytes;
+        uint64_t logical_direct_bytes;
+        uint64_t reserved_gpu_token_bytes;
+        uint64_t normal_launches;
+        uint64_t graph_launches;
+        uint64_t normal_completions;
+        uint64_t graph_completions;
+        uint64_t mapping_pin_acquires;
+        uint64_t mapping_pin_releases;
+        GChecksum *source_geometry;
+        GChecksum *alias_geometry;
+        char *first_failure_stage;
+        char *first_failure_detail;
+        bool poisoned;
+    } model_supply;
     struct {
         char *output;
         char *fixture;

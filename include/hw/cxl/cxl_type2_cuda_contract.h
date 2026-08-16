@@ -155,9 +155,12 @@ typedef struct CXLType2CudaPageableAlias {
     uint64_t owned_reservation_size;
     void *reservation;
     uint64_t reservation_size;
+    uint64_t destination_offset;
     uint64_t logical_bytes;
     uint64_t guard_bytes;
     uint64_t content_generation;
+    uint64_t *contributing_source_call_ids;
+    size_t contributing_source_call_count;
     uint64_t file_mapped_bytes;
     uint64_t derived_boundary_copy_bytes;
     uint64_t boundary_composition_wall_ns;
@@ -311,8 +314,10 @@ bool cxl_type2_cuda_allocation_materialize(
 bool cxl_type2_cuda_allocation_map_pageable_alias(
     CXLType2CudaAllocationTable *table, uint64_t base, uint64_t epoch,
     uint64_t generation, const CXLType2CudaAliasSource *sources,
-    size_t source_count, uint64_t logical_bytes, uint64_t guard_bytes,
-    uint64_t *device_alias, const char **reason);
+    size_t source_count, const uint64_t *contributing_source_call_ids,
+    size_t contributing_source_call_count, uint64_t destination_offset,
+    uint64_t logical_bytes, uint64_t guard_bytes, uint64_t *device_alias,
+    const char **reason);
 bool cxl_type2_cuda_allocation_drop_pageable_alias(
     CXLType2CudaAllocationTable *table, uint64_t base, uint64_t epoch,
     uint64_t generation);
@@ -322,10 +327,24 @@ bool cxl_type2_cuda_allocation_bind_graph_alias(
 bool cxl_type2_cuda_allocation_unbind_graph_alias(
     CXLType2CudaAllocationTable *table, uint64_t base, uint64_t epoch,
     uint64_t device_alias);
+bool cxl_type2_cuda_allocation_bind_pageable_alias_for_address(
+    CXLType2CudaAllocationTable *table, uint64_t address,
+    CXLType2CudaAllocationIdentity *identity, uint64_t *generation,
+    uint64_t *alias_address);
+bool cxl_type2_cuda_allocation_acquire_pageable_alias_for_identity(
+    CXLType2CudaAllocationTable *table,
+    CXLType2CudaAllocationIdentity identity,
+    CXLType2CudaAliasConsumer consumer, uint64_t *generation,
+    uint64_t *alias_address);
 bool cxl_type2_cuda_allocation_acquire_pageable_alias(
     CXLType2CudaAllocationTable *table, uint64_t base, uint64_t epoch,
     uint64_t generation, CXLType2CudaAliasConsumer consumer,
     uint64_t *device_alias);
+bool cxl_type2_cuda_allocation_acquire_pageable_alias_for_address(
+    CXLType2CudaAllocationTable *table, uint64_t address,
+    CXLType2CudaAliasConsumer consumer,
+    CXLType2CudaAllocationIdentity *identity, uint64_t *generation,
+    uint64_t *alias_address);
 bool cxl_type2_cuda_allocation_release_pageable_alias(
     CXLType2CudaAllocationTable *table, uint64_t base, uint64_t epoch,
     uint64_t generation, CXLType2CudaAliasConsumer consumer);
@@ -343,6 +362,13 @@ bool cxl_type2_cuda_generation_release(CXLType2CudaAllocationTable *table,
 bool cxl_type2_cuda_allocation_identity_for_address(
     const CXLType2CudaAllocationTable *table, uint64_t address,
     CXLType2CudaAllocationIdentity *identity);
+bool cxl_type2_cuda_allocation_identity_for_alias_address(
+    const CXLType2CudaAllocationTable *table, uint64_t address,
+    CXLType2CudaAllocationIdentity *identity, uint64_t *generation);
+bool cxl_type2_cuda_allocation_identity_for_range(
+    const CXLType2CudaAllocationTable *table, uint64_t address,
+    uint64_t size, CXLType2CudaAllocationIdentity *identity,
+    uint64_t *allocation_offset);
 const char *cxl_type2_cuda_generation_boundary_name(
     CXLType2CudaGenerationBoundary boundary);
 void cxl_type2_cuda_destination_union_classify(
