@@ -6369,6 +6369,8 @@ static void cxl_type2_log_direct_source_register_failure(
 static int cxl_type2_direct_source_register(CXLType2State *ct2d,
                                             uint64_t payload_bytes,
                                             uint64_t *source_id_out,
+                                            bool allow_ordinary_source,
+                                            bool *ordinary_source_out,
                                             const char **failure_stage_out,
                                             uint64_t *failure_index_out)
 {
@@ -6387,6 +6389,9 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
 
     *failure_stage_out = NULL;
     *failure_index_out = SIZE_MAX;
+    if (ordinary_source_out) {
+        *ordinary_source_out = false;
+    }
     if (!ct2d->cuda_direct_source) {
         *failure_stage_out = "policy-disabled";
         return CXL_GPU_ERROR_INVALID_VALUE;
@@ -6503,7 +6508,23 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
         mr = address_space_translate(
             &address_space_memory, validated[i].guest_phys_addr,
             &translated, &translated_len, false, MEMTXATTRS_UNSPECIFIED);
-        if (mr != dax_mr || translated_len < validated[i].length) {
+        if (translated_len < validated[i].length) {
+            *failure_stage_out = "address-translate";
+            *failure_index_out = i;
+            goto out;
+        }
+        if (mr != dax_mr) {
+            if (allow_ordinary_source && ordinary_source_out &&
+                memory_region_is_ram(mr)) {
+                /*
+                 * knockout: a mixed model/RAM batch remains one ordinary
+                 * HtoD batch. Split it only when a real workload proves that
+                 * the avoided model bytes outweigh the extra ordering state.
+                 */
+                *ordinary_source_out = true;
+                result = CXL_GPU_SUCCESS;
+                goto out;
+            }
             *failure_stage_out = "address-translate";
             *failure_index_out = i;
             goto out;
@@ -11946,8 +11967,8 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             const char *failure_stage = NULL;
 
             ct2d->gpu_cmd.cmd_result = cxl_type2_direct_source_register(
-                ct2d, ct2d->gpu_cmd.params[0], &source_id, &failure_stage,
-                &failure_index);
+                ct2d, ct2d->gpu_cmd.params[0], &source_id, false, NULL,
+                &failure_stage, &failure_index);
             if (ct2d->gpu_cmd.cmd_result == CXL_GPU_SUCCESS) {
                 ct2d->gpu_cmd.results[0] = source_id;
                 ct2d->paired_case.active_direct_register_calls++;
@@ -11981,6 +12002,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             uint64_t range_count = ct2d->gpu_cmd.params[1];
             uint64_t direct_bytes;
             uint64_t source_id = 0;
+            bool ordinary_source = false;
             uint64_t fail_idx = SIZE_MAX;
             uint64_t logical_enqueued = 0;
             uint64_t fragments_enqueued = 0;
@@ -11991,7 +12013,10 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             ct2d->gpu_cmd.results[0] = SIZE_MAX;
             ct2d->gpu_cmd.results[1] = 0;
             ct2d->gpu_cmd.results[2] = 0;
+            ct2d->gpu_cmd.results[3] = CXL_GPU_SOURCE_ROUTE_UNKNOWN;
             if (!hetgpu->initialized || !ct2d->gpu_cmd.batch_data ||
+                !ct2d->gpu_cmd.descriptor ||
+                ct2d->gpu_cmd.descriptor->protocol_version < 4U ||
                 range_count > UINT64_MAX / sizeof(CXLGPUDirectRangeV1) ||
                 register_bytes > CXL_GPU_BATCH_DATA_SIZE ||
                 !cxl_type2_stream_from_wire(ct2d, ct2d->gpu_cmd.params[2],
@@ -12023,7 +12048,13 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 break;
             }
             ct2d->gpu_cmd.cmd_result = cxl_type2_direct_source_register(
-                ct2d, register_bytes, &source_id, &failure_stage, &fail_idx);
+                ct2d, register_bytes, &source_id, true, &ordinary_source,
+                &failure_stage, &fail_idx);
+            if (ct2d->gpu_cmd.cmd_result == CXL_GPU_SUCCESS &&
+                ordinary_source) {
+                ct2d->gpu_cmd.results[3] = CXL_GPU_SOURCE_ROUTE_ORDINARY;
+                break;
+            }
             if (ct2d->gpu_cmd.cmd_result != CXL_GPU_SUCCESS) {
                 ct2d->gpu_cmd.results[0] = fail_idx;
                 cxl_type2_log_direct_source_register_failure(
@@ -12039,6 +12070,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 }
                 break;
             }
+            ct2d->gpu_cmd.results[3] = CXL_GPU_SOURCE_ROUTE_DIRECT;
             CXLType2DirectSource *source = cxl_type2_direct_source_find(
                 ct2d, source_id);
 

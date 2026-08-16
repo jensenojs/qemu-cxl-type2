@@ -41,7 +41,7 @@
 #define CXL_GPU_DESCRIPTOR_OFFSET 0x801000
 #define CXL_GPU_DESCRIPTOR_REGION_SIZE 0x1000
 #define CXL_GPU_DESCRIPTOR_WIRE_SIZE 0x0100
-#define CXL_GPU_DESCRIPTOR_PROTOCOL_VERSION 3U
+#define CXL_GPU_DESCRIPTOR_PROTOCOL_VERSION 4U
 #define CXL_GPU_DESCRIPTOR_DOORBELL_OFFSET CXL_GPU_REG_CMD
 #define CXL_GPU_DESCRIPTOR_DOORBELL_VALUE 1U
 
@@ -357,6 +357,12 @@ typedef enum {
     CXL_GPU_CMD_MHSLD_GET_INFO      = 0xD0,  /* results: heads, current, stats */
     CXL_GPU_CMD_MHSLD_SET_HEAD      = 0xD1,  /* params: head_id */
 } CXLGPUCommand;
+
+typedef enum {
+    CXL_GPU_SOURCE_ROUTE_UNKNOWN = 0,
+    CXL_GPU_SOURCE_ROUTE_DIRECT = 1,
+    CXL_GPU_SOURCE_ROUTE_ORDINARY = 2,
+} CXLGPUSourceRoute;
 
 /* Guest-visible representation of a CUDA_KERNEL_NODE_PARAMS response. BAR2 carries
  * only ids, scalars and copied argument bytes; host addresses never cross it. */

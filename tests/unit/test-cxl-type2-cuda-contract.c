@@ -335,7 +335,7 @@ static void test_batch_wire_layout_and_validation(void)
     g_assert_cmphex(CXL_GPU_CMD_MEM_COPY_DTOD_ASYNC, ==, 0x2f);
     g_assert_cmphex(CXL_GPU_CMD_COHERENT_MAP_DEVICE, ==, 0xa7);
     g_assert_cmphex(CXL_GPU_CMD_COHERENT_UNMAP_DEVICE, ==, 0xa8);
-    g_assert_cmpuint(CXL_GPU_DESCRIPTOR_PROTOCOL_VERSION, ==, 3);
+    g_assert_cmpuint(CXL_GPU_DESCRIPTOR_PROTOCOL_VERSION, ==, 4);
     g_assert_cmpuint(CXL_GPU_CASE_PROTOCOL_VERSION, ==, 1);
     g_assert_cmphex(CXL_GPU_BATCH_DATA_OFFSET, ==, UINT64_C(0x802000));
     g_assert_cmphex(CXL_GPU_CMD_REG_SIZE, ==, UINT64_C(0x2802000));
