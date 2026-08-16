@@ -10,6 +10,7 @@
 #include "qapi/error.h"
 
 typedef enum CXLType2ModelSupplyRoute {
+    CXL_TYPE2_MODEL_SUPPLY_GPU_RESIDENT,
     CXL_TYPE2_MODEL_SUPPLY_SELECTED_HTOD,
     CXL_TYPE2_MODEL_SUPPLY_CXL_DIRECT,
 } CXLType2ModelSupplyRoute;
@@ -81,6 +82,8 @@ typedef struct CXLType2FunctionEntry {
 
 bool cxl_type2_model_supply_route_parse(
     const char *text, CXLType2ModelSupplyRoute *route, Error **errp);
+const char *cxl_type2_model_supply_route_name(
+    CXLType2ModelSupplyRoute route);
 bool cxl_type2_model_member_manifest_load(
     CXLType2ModelMemberManifest *manifest, const char *path,
     const char *expected_sha256, uint64_t aperture_size, Error **errp);

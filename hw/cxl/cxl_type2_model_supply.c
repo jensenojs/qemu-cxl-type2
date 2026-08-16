@@ -69,12 +69,32 @@ bool cxl_type2_model_supply_route_parse(
         *route = CXL_TYPE2_MODEL_SUPPLY_SELECTED_HTOD;
         return true;
     }
+    if (!strcmp(text, "gpu-resident")) {
+        *route = CXL_TYPE2_MODEL_SUPPLY_GPU_RESIDENT;
+        return true;
+    }
     if (!strcmp(text, "cxl-direct")) {
         *route = CXL_TYPE2_MODEL_SUPPLY_CXL_DIRECT;
         return true;
     }
-    error_setg(errp, "model-supply-route must be selected-htod or cxl-direct");
+    error_setg(errp,
+               "model-supply-route must be gpu-resident, selected-htod or "
+               "cxl-direct");
     return false;
+}
+
+const char *cxl_type2_model_supply_route_name(
+    CXLType2ModelSupplyRoute route)
+{
+    switch (route) {
+    case CXL_TYPE2_MODEL_SUPPLY_GPU_RESIDENT:
+        return "gpu-resident";
+    case CXL_TYPE2_MODEL_SUPPLY_SELECTED_HTOD:
+        return "selected-htod";
+    case CXL_TYPE2_MODEL_SUPPLY_CXL_DIRECT:
+        return "cxl-direct";
+    }
+    g_assert_not_reached();
 }
 
 void cxl_type2_model_member_manifest_clear(

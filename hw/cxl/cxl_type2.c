@@ -2821,10 +2821,8 @@ static QDict *cxl_type2_model_supply_event(CXLType2State *ct2d)
     cxl_type2_qdict_put_u64(event, "case_epoch",
                             ct2d->paired_case.active_epoch);
     qdict_put_str(event, "planned_route",
-                  ct2d->model_supply.route ==
-                          CXL_TYPE2_MODEL_SUPPLY_CXL_DIRECT
-                      ? "cxl-direct"
-                      : "selected-htod");
+                  cxl_type2_model_supply_route_name(
+                      ct2d->model_supply.route));
     return event;
 }
 
@@ -5149,10 +5147,8 @@ static void cxl_type2_log_model_supply_terminal(
 
     event = cxl_type2_model_supply_event(ct2d);
     qdict_put_str(event, "actual_route",
-                  ct2d->model_supply.route ==
-                          CXL_TYPE2_MODEL_SUPPLY_CXL_DIRECT
-                      ? "cxl-direct"
-                      : "selected-htod");
+                  cxl_type2_model_supply_route_name(
+                      ct2d->model_supply.route));
     qdict_put_str(event, "status", pass ? "pass" : "fail");
     if (ct2d->model_supply.first_failure_stage) {
         qdict_put_str(event, "first_failure_stage",
@@ -12883,13 +12879,23 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
                                              errp)) {
         return;
     }
-    if (ct2d->model_supply.route == CXL_TYPE2_MODEL_SUPPLY_SELECTED_HTOD) {
+    if (ct2d->model_supply.route != CXL_TYPE2_MODEL_SUPPLY_CXL_DIRECT) {
         if (ct2d->model_supply.member_manifest_path ||
             ct2d->model_supply.member_manifest_sha256 ||
             ct2d->model_supply.consumer_certificate_path ||
             ct2d->model_supply.consumer_certificate_sha256) {
             error_setg(errp,
-                       "selected-htod does not accept model supply manifests");
+                       "%s does not accept model supply manifests",
+                       cxl_type2_model_supply_route_name(
+                           ct2d->model_supply.route));
+            return;
+        }
+        if (ct2d->model_supply.route ==
+                CXL_TYPE2_MODEL_SUPPLY_GPU_RESIDENT &&
+            (ct2d->cuda_direct_source || ct2d->model_aperture.size)) {
+            error_setg(errp,
+                       "gpu-resident requires cuda-direct-source=off and "
+                       "a zero model aperture");
             return;
         }
     } else {
