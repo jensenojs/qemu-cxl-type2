@@ -3158,9 +3158,8 @@ VirtioSharedMemoryMapping *virtio_shared_memory_mapping_new(uint8_t shmid,
         error_report("Failed to stat shared memory fd: %s", strerror(errno));
         return NULL;
     }
-    if (source_stat.st_size < 0 ||
-        fd_offset + len > (uint64_t)source_stat.st_size) {
-        error_report("VIRTIO Shared Memory file range exceeds source size");
+    if (source_stat.st_size < 0) {
+        error_report("VIRTIO Shared Memory source size is invalid");
         return NULL;
     }
 
