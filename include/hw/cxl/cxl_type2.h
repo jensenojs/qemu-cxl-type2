@@ -202,6 +202,7 @@ typedef struct CXLType2PendingHtoD {
     int64_t enqueue_host_ns;
     size_t size;
     bool direct_source;
+    bool model_supply;
     const void *direct_host;
     struct CXLType2DirectSource *source;
     struct CXLType2PendingHtoD *next;
@@ -213,6 +214,7 @@ typedef struct CXLType2PendingAliasConsumer {
     uint64_t generation;
     uint64_t sequence;
     uint64_t launch_id;
+    int64_t enqueue_host_ns;
     CXLType2CudaAliasConsumer consumer;
     struct CXLType2PendingAliasConsumer *next;
 } CXLType2PendingAliasConsumer;
@@ -493,6 +495,11 @@ typedef struct CXLType2State {
         uint64_t graph_launches;
         uint64_t normal_completions;
         uint64_t graph_completions;
+        uint64_t completion_wait_calls;
+        uint64_t completion_wait_wall_ns;
+        uint64_t completion_wait_work_items;
+        uint64_t completion_nonblocking_work_items;
+        uint64_t consumer_wall_ns;
         uint64_t mapping_pin_acquires;
         uint64_t mapping_pin_releases;
         GChecksum *source_geometry;
