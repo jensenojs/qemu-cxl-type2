@@ -47,6 +47,7 @@
 #include "hw/core/cpu.h"
 #include "hw/virtio/vhost-user-fs.h"
 #include "migration/vmstate.h"
+#include "system/hw_accel.h"
 #include "system/memory.h"
 #include "system/runstate.h"
 #include "io/channel-socket.h"
@@ -6417,6 +6418,7 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
         *failure_stage_out = "dax-unavailable";
         return CXL_GPU_ERROR_INVALID_VALUE;
     }
+    cpu_synchronize_state(current_cpu);
     cxl_type2_direct_indexes_ensure(ct2d);
     if (!cxl_gpu_source_register_validate(
             ct2d->gpu_cmd.batch_data, CXL_GPU_BATCH_DATA_SIZE, payload_bytes,
