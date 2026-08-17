@@ -20,6 +20,7 @@ static void cxl_type2_cuda_pageable_alias_free(
     }
     for (size_t i = 0; i < alias->source_count; i++) {
         close(alias->sources[i].fd);
+        g_free(alias->sources[i].owned_host_copy);
     }
     g_free(alias->contributing_source_call_ids);
     g_free(alias->sources);
@@ -789,6 +790,13 @@ static bool cxl_type2_cuda_alias_source_copy(
     if (host_copy) {
         *destination = *source;
         destination->fd = -1;
+        destination->owned_host_copy = g_memdup2(source->host_copy_source,
+                                                  source->length);
+        destination->host_copy_source = destination->owned_host_copy;
+        if (!destination->owned_host_copy) {
+            *reason = "source-copy-allocation-failed";
+            return false;
+        }
         return true;
     }
     if (fstat(source->fd, &source_stat) < 0) {
@@ -834,18 +842,62 @@ static bool cxl_type2_cuda_pread_all(int fd, uint8_t *destination,
     return true;
 }
 
-static bool cxl_type2_cuda_alias_verify(
-    const CXLType2CudaPageableAlias *alias)
+static int cxl_type2_cuda_alias_source_compare(const void *left,
+                                                const void *right)
+{
+    const CXLType2CudaAliasSource *a = left;
+    const CXLType2CudaAliasSource *b = right;
+
+    return a->destination_offset < b->destination_offset ? -1 :
+           a->destination_offset > b->destination_offset ? 1 : 0;
+}
+
+static int cxl_type2_cuda_u64_compare(const void *left, const void *right)
+{
+    uint64_t a = *(const uint64_t *)left;
+    uint64_t b = *(const uint64_t *)right;
+
+    return a < b ? -1 : a > b ? 1 : 0;
+}
+
+bool cxl_type2_cuda_pageable_alias_contains(
+    const CXLType2CudaPageableAlias *alias, uint64_t allocation_offset)
+{
+    if (!alias) {
+        return false;
+    }
+    for (size_t i = 0; i < alias->source_count; i++) {
+        const CXLType2CudaAliasSource *source = &alias->sources[i];
+
+        if (allocation_offset >= source->destination_offset &&
+            allocation_offset - source->destination_offset < source->length) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool cxl_type2_cuda_alias_verify_range(
+    const CXLType2CudaPageableAlias *alias, uint64_t begin, uint64_t end)
 {
     uint8_t expected[64 * 1024];
 
     for (size_t i = 0; i < alias->source_count; i++) {
         const CXLType2CudaAliasSource *source = &alias->sources[i];
-        uint64_t compared = 0;
+        uint64_t source_end = source->destination_offset + source->length;
+        uint64_t compare_begin = MAX(begin, source->destination_offset);
+        uint64_t compare_end = MIN(end, source_end);
+        uint64_t compared;
 
-        while (compared < source->length) {
+        if (compare_begin >= compare_end) {
+            continue;
+        }
+        compared = compare_begin - source->destination_offset;
+
+        while (source->destination_offset + compared < compare_end) {
             size_t count = MIN((uint64_t)sizeof(expected),
-                               source->length - compared);
+                               compare_end - source->destination_offset -
+                                   compared);
 
             bool read_ok = source->host_copy_source
                                ? (memcpy(expected,
@@ -872,16 +924,18 @@ static bool cxl_type2_cuda_alias_verify(
 }
 
 static bool cxl_type2_cuda_alias_map_pages(
-    CXLType2CudaPageableAlias *alias, uint64_t total_bytes,
+    CXLType2CudaPageableAlias *alias, uint64_t begin, uint64_t end,
     const char **reason)
 {
     size_t page_size = qemu_real_host_page_size();
     size_t source_index = 0;
+    uint64_t page_first = QEMU_ALIGN_DOWN(begin, page_size);
+    uint64_t page_limit = QEMU_ALIGN_UP(end, page_size);
 
-    for (uint64_t page_begin = 0; page_begin < alias->reservation_size;
+    for (uint64_t page_begin = page_first; page_begin < page_limit;
          page_begin += page_size) {
         uint64_t page_end = page_begin + page_size;
-        uint64_t covered_end = MIN(page_end, total_bytes);
+        uint64_t covered_end = page_end;
         const CXLType2CudaAliasSource *source;
         uint64_t source_end;
         uint64_t file_page_offset;
@@ -963,12 +1017,9 @@ static bool cxl_type2_cuda_alias_map_pages(
             qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - composition_begin_ns;
         alias->derived_boundary_pages++;
     }
-    if (!cxl_type2_cuda_alias_verify(alias)) {
+    if (!cxl_type2_cuda_alias_verify_range(alias, page_first, page_limit)) {
         *reason = "alias-byte-oracle-failed";
         return false;
-    }
-    for (size_t i = 0; i < alias->source_count; i++) {
-        alias->sources[i].host_copy_source = NULL;
     }
     return true;
 }
@@ -986,8 +1037,13 @@ bool cxl_type2_cuda_allocation_map_pageable_alias(
     CXLType2CudaPageableAlias *old_alias;
     CXLType2CudaPageableAlias *alias = NULL;
     uint64_t total_bytes;
+    uint64_t range_end;
+    uint64_t envelope_begin = UINT64_MAX;
+    uint64_t envelope_end = 0;
     size_t page_size = qemu_real_host_page_size();
     uint64_t covered = 0;
+    size_t retained_source_count = 0;
+    size_t source_call_capacity;
 
     if (reason) {
         *reason = NULL;
@@ -1004,14 +1060,35 @@ bool cxl_type2_cuda_allocation_map_pageable_alias(
     total_bytes = logical_bytes + guard_bytes;
     if (destination_offset > allocation->size ||
         total_bytes > allocation->size - destination_offset ||
-        total_bytes > UINT64_MAX - (page_size - 1)) {
+        total_bytes > UINT64_MAX - (page_size - 1) ||
+        allocation->size > UINT64_MAX - (page_size - 1)) {
         *reason = "alias-allocation-bounds";
         return false;
     }
+    range_end = destination_offset + total_bytes;
     if (allocation->consumer_refs || allocation->normal_inflight_refs ||
         allocation->graph_inflight_refs) {
         *reason = "alias-consumer-in-flight";
         return false;
+    }
+
+    old_alias = allocation->pageable_alias;
+    if (old_alias) {
+        for (size_t i = 0; i < old_alias->source_count; i++) {
+            const CXLType2CudaAliasSource *source = &old_alias->sources[i];
+            uint64_t source_end = source->destination_offset + source->length;
+
+            if (source_end <= destination_offset ||
+                source->destination_offset >= range_end) {
+                retained_source_count++;
+                continue;
+            }
+            if (source->destination_offset < destination_offset ||
+                source_end > range_end) {
+                *reason = "alias-subrange-overlap";
+                return false;
+            }
+        }
     }
 
     alias = g_try_new0(CXLType2CudaPageableAlias, 1);
@@ -1019,13 +1096,21 @@ bool cxl_type2_cuda_allocation_map_pageable_alias(
         *reason = "alias-allocation-failed";
         return false;
     }
-    alias->sources = g_try_new0(CXLType2CudaAliasSource, source_count);
+    alias->sources = g_try_new0(CXLType2CudaAliasSource,
+                                retained_source_count + source_count);
     if (!alias->sources) {
         *reason = "alias-source-allocation-failed";
         goto fail;
     }
-    alias->contributing_source_call_ids = g_try_new(
-        uint64_t, contributing_source_call_count);
+    alias->source_count = retained_source_count + source_count;
+    for (size_t i = 0; i < alias->source_count; i++) {
+        alias->sources[i].fd = -1;
+    }
+    source_call_capacity = retained_source_count +
+        contributing_source_call_count +
+        (old_alias ? old_alias->contributing_source_call_count : 0);
+    alias->contributing_source_call_ids = g_try_new(uint64_t,
+                                                    source_call_capacity);
     if (!alias->contributing_source_call_ids) {
         *reason = "alias-source-call-allocation-failed";
         goto fail;
@@ -1037,15 +1122,9 @@ bool cxl_type2_cuda_allocation_map_pageable_alias(
             *reason = "alias-source-call-order-invalid";
             goto fail;
         }
-        alias->contributing_source_call_ids[i] =
-            contributing_source_call_ids[i];
     }
-    alias->contributing_source_call_count = contributing_source_call_count;
-    alias->logical_bytes = logical_bytes;
-    alias->guard_bytes = guard_bytes;
-    alias->destination_offset = destination_offset;
     alias->content_generation = generation;
-    alias->reservation_size = QEMU_ALIGN_UP(total_bytes, page_size);
+    alias->reservation_size = QEMU_ALIGN_UP(allocation->size, page_size);
     if (alias->reservation_size > SIZE_MAX - 2 * page_size) {
         *reason = "alias-reservation-size-overflow";
         goto fail;
@@ -1058,33 +1137,94 @@ bool cxl_type2_cuda_allocation_map_pageable_alias(
             *reason = "alias-source-coverage";
             goto fail;
         }
-        if (!cxl_type2_cuda_alias_source_copy(&alias->sources[i],
-                                               &sources[i], reason)) {
+        if (!cxl_type2_cuda_alias_source_copy(
+                &alias->sources[retained_source_count + i], &sources[i],
+                reason)) {
             goto fail;
         }
-        alias->source_count++;
+        alias->sources[retained_source_count + i].destination_offset +=
+            destination_offset;
+        if (contributing_source_call_count == 1) {
+            alias->sources[retained_source_count + i].source_call_id =
+                contributing_source_call_ids[0];
+        }
         covered += sources[i].length;
     }
     if (covered != total_bytes) {
         *reason = "alias-source-coverage";
         goto fail;
     }
+    size_t retained_index = 0;
+    for (size_t i = 0; old_alias && i < old_alias->source_count; i++) {
+        CXLType2CudaAliasSource *source = &old_alias->sources[i];
+        uint64_t source_end = source->destination_offset + source->length;
 
-    old_alias = allocation->pageable_alias;
-    if (old_alias) {
-        if (old_alias->reservation_size != alias->reservation_size ||
-            old_alias->destination_offset != alias->destination_offset) {
-            *reason = "alias-stable-va-size-mismatch";
+        if (source_end > destination_offset &&
+            source->destination_offset < range_end) {
+            continue;
+        }
+        alias->sources[retained_index++] = *source;
+        *source = (CXLType2CudaAliasSource) { .fd = -1 };
+    }
+    g_assert(retained_index == retained_source_count);
+    bool unattributed_retained_source = false;
+    for (size_t i = 0; i < retained_source_count; i++) {
+        if (alias->sources[i].source_call_id) {
+            alias->contributing_source_call_ids[
+                alias->contributing_source_call_count++] =
+                alias->sources[i].source_call_id;
+        } else {
+            unattributed_retained_source = true;
+        }
+    }
+    if (unattributed_retained_source) {
+        for (size_t i = 0;
+             i < old_alias->contributing_source_call_count; i++) {
+            alias->contributing_source_call_ids[
+                alias->contributing_source_call_count++] =
+                old_alias->contributing_source_call_ids[i];
+        }
+    }
+    for (size_t i = 0; i < contributing_source_call_count; i++) {
+        alias->contributing_source_call_ids[
+            alias->contributing_source_call_count++] =
+            contributing_source_call_ids[i];
+    }
+    qsort(alias->contributing_source_call_ids,
+          alias->contributing_source_call_count, sizeof(uint64_t),
+          cxl_type2_cuda_u64_compare);
+    size_t unique_call_count = 0;
+    for (size_t i = 0; i < alias->contributing_source_call_count; i++) {
+        if (!i || alias->contributing_source_call_ids[i] !=
+                      alias->contributing_source_call_ids[i - 1]) {
+            alias->contributing_source_call_ids[unique_call_count++] =
+                alias->contributing_source_call_ids[i];
+        }
+    }
+    alias->contributing_source_call_count = unique_call_count;
+    qsort(alias->sources, alias->source_count,
+          sizeof(CXLType2CudaAliasSource),
+          cxl_type2_cuda_alias_source_compare);
+    for (size_t i = 0; i < alias->source_count; i++) {
+        CXLType2CudaAliasSource *source = &alias->sources[i];
+        uint64_t source_end = source->destination_offset + source->length;
+
+        if ((i && source->destination_offset < envelope_end) ||
+            source_end < source->destination_offset ||
+            source_end > allocation->size) {
+            *reason = "alias-source-overlap";
             goto fail;
         }
+        envelope_begin = MIN(envelope_begin, source->destination_offset);
+        envelope_end = MAX(envelope_end, source_end);
+    }
+    alias->destination_offset = envelope_begin;
+    alias->logical_bytes = envelope_end - envelope_begin;
+    alias->guard_bytes = guard_bytes;
+
+    if (old_alias) {
         alias->owned_reservation = old_alias->owned_reservation;
         alias->reservation = old_alias->reservation;
-        if (mmap(alias->reservation, alias->reservation_size, PROT_NONE,
-                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE,
-                 -1, 0) != alias->reservation) {
-            *reason = "alias-remap-reservation-failed";
-            goto poison;
-        }
     } else {
         alias->owned_reservation =
             mmap(NULL, alias->owned_reservation_size, PROT_NONE,
@@ -1097,7 +1237,8 @@ bool cxl_type2_cuda_allocation_map_pageable_alias(
         alias->reservation = alias->owned_reservation + page_size;
     }
 
-    if (!cxl_type2_cuda_alias_map_pages(alias, total_bytes, reason)) {
+    if (!cxl_type2_cuda_alias_map_pages(alias, destination_offset, range_end,
+                                        reason)) {
         goto poison;
     }
     if (old_alias) {
@@ -1183,14 +1324,12 @@ bool cxl_type2_cuda_allocation_bind_pageable_alias_for_address(
 {
     CXLType2CudaAllocation *allocation = NULL;
     uint64_t offset = 0;
-    bool allocation_address = false;
 
     if (!table || !identity || !generation || !alias_address) {
         return false;
     }
     allocation = cxl_type2_cuda_allocation_containing(table, address, 1);
     if (allocation) {
-        allocation_address = true;
         offset = address - allocation->base;
     } else {
         for (size_t i = 0; i < table->count; i++) {
@@ -1198,8 +1337,9 @@ bool cxl_type2_cuda_allocation_bind_pageable_alias_for_address(
 
             if (candidate->pageable_alias &&
                 address >= candidate->device_alias &&
-                address - candidate->device_alias <
-                    candidate->pageable_alias->logical_bytes) {
+                cxl_type2_cuda_pageable_alias_contains(
+                    candidate->pageable_alias,
+                    address - candidate->device_alias)) {
                 allocation = candidate;
                 offset = address - candidate->device_alias;
                 break;
@@ -1207,12 +1347,8 @@ bool cxl_type2_cuda_allocation_bind_pageable_alias_for_address(
         }
     }
     if (!allocation || !allocation->pageable_alias ||
-        (allocation_address &&
-         (offset < allocation->pageable_alias->destination_offset ||
-          offset - allocation->pageable_alias->destination_offset >=
-              allocation->pageable_alias->logical_bytes)) ||
-        (!allocation_address &&
-         offset >= allocation->pageable_alias->logical_bytes) ||
+        !cxl_type2_cuda_pageable_alias_contains(
+            allocation->pageable_alias, offset) ||
         !cxl_type2_cuda_allocation_bind_graph_alias(
             table, allocation->base, allocation->epoch,
             allocation->device_alias)) {
@@ -1223,10 +1359,7 @@ bool cxl_type2_cuda_allocation_bind_pageable_alias_for_address(
         .epoch = allocation->epoch,
     };
     *generation = allocation->content_generation;
-    *alias_address = allocation->device_alias +
-                     (allocation_address
-                          ? offset - allocation->pageable_alias->destination_offset
-                          : offset);
+    *alias_address = allocation->device_alias + offset;
     return true;
 }
 
@@ -1297,9 +1430,8 @@ bool cxl_type2_cuda_allocation_acquire_pageable_alias_for_address(
         return false;
     }
     offset = address - allocation->base;
-    if (offset < allocation->pageable_alias->destination_offset ||
-        offset - allocation->pageable_alias->destination_offset >=
-            allocation->pageable_alias->logical_bytes ||
+    if (!cxl_type2_cuda_pageable_alias_contains(
+            allocation->pageable_alias, offset) ||
         !cxl_type2_cuda_allocation_acquire_pageable_alias(
             table, allocation->base, allocation->epoch,
             allocation->content_generation, consumer, alias_address)) {
@@ -1310,8 +1442,7 @@ bool cxl_type2_cuda_allocation_acquire_pageable_alias_for_address(
         .epoch = allocation->epoch,
     };
     *generation = allocation->content_generation;
-    *alias_address += offset -
-                      allocation->pageable_alias->destination_offset;
+    *alias_address += offset;
     return true;
 }
 
@@ -1398,8 +1529,9 @@ bool cxl_type2_cuda_allocation_identity_for_alias_address(
 
         if (!allocation->pageable_alias ||
             address < allocation->device_alias ||
-            address - allocation->device_alias >=
-                allocation->pageable_alias->logical_bytes) {
+            !cxl_type2_cuda_pageable_alias_contains(
+                allocation->pageable_alias,
+                address - allocation->device_alias)) {
             continue;
         }
         *identity = (CXLType2CudaAllocationIdentity) {

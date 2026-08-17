@@ -139,10 +139,12 @@ typedef struct CXLType2CudaAllocation {
 typedef struct CXLType2CudaAliasSource {
     int fd;
     const void *host_copy_source;
+    void *owned_host_copy;
     uint64_t file_offset;
     uint64_t destination_offset;
     uint64_t length;
     uint64_t mapping_generation;
+    uint64_t source_call_id;
     uint64_t logical_cxl_offset;
     uint64_t stat_device;
     uint64_t stat_inode;
@@ -320,6 +322,8 @@ bool cxl_type2_cuda_allocation_map_pageable_alias(
     size_t contributing_source_call_count, uint64_t destination_offset,
     uint64_t logical_bytes, uint64_t guard_bytes, uint64_t *device_alias,
     const char **reason);
+bool cxl_type2_cuda_pageable_alias_contains(
+    const CXLType2CudaPageableAlias *alias, uint64_t allocation_offset);
 bool cxl_type2_cuda_allocation_drop_pageable_alias(
     CXLType2CudaAllocationTable *table, uint64_t base, uint64_t epoch,
     uint64_t generation);

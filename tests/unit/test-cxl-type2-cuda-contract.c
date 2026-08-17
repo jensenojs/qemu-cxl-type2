@@ -838,6 +838,86 @@ static void test_cuda_pageable_alias_composite_remap(void)
     g_assert_cmpint(unlink(path), ==, 0);
 }
 
+static void test_cuda_pageable_alias_appends_allocation_subranges(void)
+{
+    CXLType2CudaAllocationTable table;
+    CXLType2CudaAliasSource source;
+    CXLType2CudaAllocationIdentity identity;
+    g_autofree char *path = NULL;
+    g_autofree uint8_t *file_bytes = NULL;
+    GError *error = NULL;
+    struct stat source_stat;
+    size_t page_size = qemu_real_host_page_size();
+    uint64_t base = UINT64_C(0x200000);
+    uint64_t epoch = 0;
+    uint64_t alias = 0;
+    uint64_t stable_alias = 0;
+    uint64_t generation = 0;
+    uint64_t source_call = 1;
+    const char *reason = NULL;
+    int fd;
+
+    fd = g_file_open_tmp("cxl-pageable-subranges-XXXXXX", &path, &error);
+    g_assert_no_error(error);
+    g_assert_cmpint(fd, >=, 0);
+    g_assert_cmpint(ftruncate(fd, 4 * page_size), ==, 0);
+    file_bytes = g_malloc(4 * page_size);
+    for (size_t i = 0; i < 4 * page_size; i++) {
+        file_bytes[i] = (i * 11 + 5) & 0xff;
+    }
+    g_assert_cmpint(pwrite(fd, file_bytes, 4 * page_size, 0), ==,
+                    4 * page_size);
+    g_assert_cmpint(fstat(fd, &source_stat), ==, 0);
+
+    cxl_type2_cuda_allocation_table_init(&table);
+    g_assert_true(cxl_type2_cuda_allocation_record(
+        &table, base, 4 * page_size, &epoch));
+
+    source = alias_source(fd, &source_stat, 0, 0, page_size, 1);
+    g_assert_true(cxl_type2_cuda_allocation_map_pageable_alias(
+        &table, base, epoch, 1, &source, 1, &source_call, 1,
+        0, page_size, 0, &stable_alias, &reason));
+    g_assert_null(reason);
+
+    source = alias_source(fd, &source_stat, page_size, 0,
+                          2 * page_size, 2);
+    source_call = 2;
+    g_assert_true(cxl_type2_cuda_allocation_map_pageable_alias(
+        &table, base, epoch, 2, &source, 1, &source_call, 1,
+        page_size, 2 * page_size, 0, &alias, &reason));
+    g_assert_null(reason);
+    g_assert_cmphex(alias, ==, stable_alias);
+    g_assert_cmpmem((const uint8_t *)(uintptr_t)alias, 3 * page_size,
+                    file_bytes, 3 * page_size);
+    g_assert_true(cxl_type2_cuda_pageable_alias_contains(
+        table.entries[0].pageable_alias, 0));
+    g_assert_true(cxl_type2_cuda_pageable_alias_contains(
+        table.entries[0].pageable_alias, 3 * page_size - 1));
+    g_assert_false(cxl_type2_cuda_pageable_alias_contains(
+        table.entries[0].pageable_alias, 3 * page_size));
+    source = alias_source(fd, &source_stat, 0, 0, page_size, 3);
+    source_call = 3;
+    g_assert_false(cxl_type2_cuda_allocation_map_pageable_alias(
+        &table, base, epoch, 3, &source, 1, &source_call, 1,
+        page_size / 2, page_size, 0, &alias, &reason));
+    g_assert_cmpstr(reason, ==, "alias-subrange-overlap");
+    g_assert_cmpmem((const uint8_t *)(uintptr_t)stable_alias, 3 * page_size,
+                    file_bytes, 3 * page_size);
+    g_assert_true(cxl_type2_cuda_allocation_acquire_pageable_alias_for_address(
+        &table, base + page_size, CXL_TYPE2_CUDA_ALIAS_NORMAL,
+        &identity, &generation, &alias));
+    g_assert_cmphex(alias, ==, stable_alias + page_size);
+    g_assert_cmpuint(generation, ==, 2);
+    g_assert_true(cxl_type2_cuda_allocation_release_pageable_alias(
+        &table, base, epoch, generation, CXL_TYPE2_CUDA_ALIAS_NORMAL));
+    g_assert_true(cxl_type2_cuda_allocation_drop_pageable_alias(
+        &table, base, epoch, generation));
+    g_assert_true(cxl_type2_cuda_allocation_forget(&table, base));
+    cxl_type2_cuda_allocation_table_destroy(&table);
+    close(fd);
+    g_assert_cmpint(unlink(path), ==, 0);
+}
+
 static void test_cuda_generation_reuse_lifecycle(void)
 {
     CXLType2CudaAllocationTable table;
@@ -1280,6 +1360,8 @@ int main(int argc, char **argv)
                     test_cuda_allocation_alias_lifecycle);
     g_test_add_func("/cxl/type2/direct/pageable-alias-composite-remap",
                     test_cuda_pageable_alias_composite_remap);
+    g_test_add_func("/cxl/type2/direct/pageable-alias-allocation-subranges",
+                    test_cuda_pageable_alias_appends_allocation_subranges);
     g_test_add_func("/cxl/type2/direct/generation-reuse-lifecycle",
                     test_cuda_generation_reuse_lifecycle);
     g_test_add_func("/cxl/type2/direct/destination-union-coverage",

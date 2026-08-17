@@ -3452,11 +3452,8 @@ static CXLType2ModelParamClass cxl_type2_model_param_classify(
     allocation = cxl_type2_cuda_allocation_find(
         &ct2d->cuda_allocations, identity.base, identity.epoch);
     if (allocation && allocation->pageable_alias &&
-        pointer - identity.base >=
-            allocation->pageable_alias->destination_offset &&
-        pointer - identity.base -
-                allocation->pageable_alias->destination_offset <
-            allocation->pageable_alias->logical_bytes) {
+        cxl_type2_cuda_pageable_alias_contains(
+            allocation->pageable_alias, pointer - identity.base)) {
         return CXL_TYPE2_MODEL_PARAM_GPU_DESTINATION;
     }
     return CXL_TYPE2_MODEL_PARAM_NON_MODEL_ALLOCATION;
@@ -3794,11 +3791,9 @@ static GArray *cxl_type2_model_alias_rewrite_params(
                         candidate->identity.epoch);
 
                 if (allocation && allocation->pageable_alias &&
-                    pointer - candidate->identity.base >=
-                        allocation->pageable_alias->destination_offset &&
-                    pointer - candidate->identity.base -
-                            allocation->pageable_alias->destination_offset <
-                        allocation->pageable_alias->logical_bytes) {
+                    cxl_type2_cuda_pageable_alias_contains(
+                        allocation->pageable_alias,
+                        pointer - candidate->identity.base)) {
                     binding = candidate;
                     break;
                 }
@@ -3806,12 +3801,7 @@ static GArray *cxl_type2_model_alias_rewrite_params(
         }
         if (binding) {
             alias_address = binding->alias_base +
-                            pointer - binding->identity.base -
-                            cxl_type2_cuda_allocation_find(
-                                &ct2d->cuda_allocations,
-                                binding->identity.base,
-                                binding->identity.epoch)
-                                ->pageable_alias->destination_offset;
+                            pointer - binding->identity.base;
             memcpy(params[i], &alias_address, sizeof(alias_address));
             continue;
         }
@@ -3823,12 +3813,7 @@ static GArray *cxl_type2_model_alias_rewrite_params(
         CXLType2AliasLaunchBinding current = {
             .identity = identity,
             .generation = generation,
-            .alias_base = alias_address -
-                          (pointer - identity.base -
-                           cxl_type2_cuda_allocation_find(
-                               &ct2d->cuda_allocations, identity.base,
-                               identity.epoch)
-                               ->pageable_alias->destination_offset),
+            .alias_base = alias_address - (pointer - identity.base),
         };
 
         g_array_append_val(bindings, current);
@@ -3972,9 +3957,7 @@ static bool cxl_type2_model_alias_bind_graph_params(
                                 (pointer >= identity.base &&
                                          pointer < identity.base +
                                                        allocation->size
-                                     ? pointer - identity.base -
-                                           allocation->pageable_alias
-                                               ->destination_offset
+                                     ? pointer - identity.base
                                      : pointer - allocation->device_alias);
                 memcpy(params[i], &alias_address, sizeof(alias_address));
                 model_pointer = false;
