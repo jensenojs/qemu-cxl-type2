@@ -864,7 +864,7 @@ bool cxl_type2_cuda_allocation_append_pageable_sources(
     return false;
   }
   ledger = allocation->pageable_sources;
-  if ((ledger && destination_offset != ledger->logical_bytes) ||
+  if ((ledger && destination_offset < ledger->destination_end) ||
       (!ledger && destination_offset != 0)) {
     *reason = "alias-source-order-invalid";
     return false;
@@ -924,7 +924,7 @@ bool cxl_type2_cuda_allocation_append_pageable_sources(
   ledger->source_count = old_source_count + source_count;
   ledger->source_call_ids = next_calls;
   ledger->source_call_count = old_call_count + 1;
-  ledger->logical_bytes = destination_offset + logical_bytes;
+  ledger->destination_end = destination_offset + logical_bytes;
   ledger->content_generation = generation;
   return true;
 
@@ -1264,8 +1264,10 @@ bool cxl_type2_cuda_allocation_map_pageable_alias(
   alias->owned_reservation_size = alias->mapping_size + 2 * page_size;
 
   for (size_t i = 0; i < source_count; i++) {
-    if (sources[i].destination_offset != covered ||
-        sources[i].length > total_bytes - covered) {
+    uint64_t source_end = sources[i].destination_offset + sources[i].length;
+
+    if (!sources[i].length || source_end < sources[i].destination_offset ||
+        sources[i].destination_offset < covered || source_end > total_bytes) {
       *reason = "alias-source-coverage";
       goto fail;
     }
@@ -1276,11 +1278,7 @@ bool cxl_type2_cuda_allocation_map_pageable_alias(
     if (contributing_source_call_count == 1) {
       alias->sources[i].source_call_id = contributing_source_call_ids[0];
     }
-    covered += sources[i].length;
-  }
-  if (covered != total_bytes) {
-    *reason = "alias-source-coverage";
-    goto fail;
+    covered = source_end;
   }
   for (size_t i = 0; i < contributing_source_call_count; i++) {
     alias->contributing_source_call_ids
@@ -1306,7 +1304,7 @@ bool cxl_type2_cuda_allocation_map_pageable_alias(
     CXLType2CudaAliasSource *source = &alias->sources[i];
     uint64_t source_end = source->destination_offset + source->length;
 
-    if (source->destination_offset != covered ||
+    if (source->destination_offset < covered ||
         source_end < source->destination_offset || source_end > total_bytes) {
       *reason = "alias-source-overlap";
       goto fail;
@@ -1369,7 +1367,8 @@ bool cxl_type2_cuda_allocation_finalize_pageable_alias(
   }
   if (!reason || !allocation || allocation->poisoned ||
       allocation->pageable_alias || !ledger || !ledger->source_count ||
-      !ledger->source_call_count || ledger->logical_bytes != allocation->size ||
+      !ledger->source_call_count ||
+      ledger->destination_end != allocation->size ||
       !ledger->content_generation || !device_alias) {
     if (reason) {
       *reason = "alias-source-ledger-incomplete";

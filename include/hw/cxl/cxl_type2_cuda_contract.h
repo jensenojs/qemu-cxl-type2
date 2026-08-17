@@ -161,7 +161,7 @@ typedef struct CXLType2CudaAliasLedger {
   size_t source_count;
   uint64_t *source_call_ids;
   size_t source_call_count;
-  uint64_t logical_bytes;
+  uint64_t destination_end;
   uint64_t content_generation;
 } CXLType2CudaAliasLedger;
 
