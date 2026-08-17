@@ -1647,6 +1647,108 @@ bool cxl_type2_cuda_generation_prefetch_enqueue(
     return true;
 }
 
+static CXLType2CudaGenerationRecord *
+cxl_type2_cuda_generation_find(CXLType2CudaAllocationTable *table,
+                               CXLType2CudaAllocationIdentity identity,
+                               uint64_t generation)
+{
+    if (!table || !table->available || !generation) {
+        return NULL;
+    }
+    for (size_t i = table->generation_count; i > 0; i--) {
+        CXLType2CudaGenerationRecord *record = &table->generations[i - 1];
+
+        if (record->allocation_base == identity.base &&
+            record->epoch == identity.epoch &&
+            record->generation == generation) {
+            return record;
+        }
+    }
+    return NULL;
+}
+
+bool cxl_type2_cuda_generation_prefetch_required(
+    CXLType2CudaAllocationTable *table,
+    CXLType2CudaAllocationIdentity identity, uint64_t generation,
+    bool *required)
+{
+    CXLType2CudaAllocation *allocation =
+        cxl_type2_cuda_allocation_find(table, identity.base, identity.epoch);
+    CXLType2CudaGenerationRecord *record =
+        cxl_type2_cuda_generation_find(table, identity, generation);
+
+    if (!required || !allocation || !allocation->pageable_alias || !record ||
+        allocation->content_generation != generation ||
+        allocation->pageable_alias->content_generation != generation) {
+        if (table) {
+            cxl_type2_cuda_generation_fail(table,
+                                           "prefetch-generation-missing");
+        }
+        return false;
+    }
+    *required = record->prefetch_count == 0;
+    return true;
+}
+
+bool cxl_type2_cuda_generation_prefetch_enqueue_for_identity(
+    CXLType2CudaAllocationTable *table,
+    CXLType2CudaAllocationIdentity identity, uint64_t generation,
+    uint64_t size, uint64_t enqueue_wall_ns)
+{
+    CXLType2CudaAllocation *allocation =
+        cxl_type2_cuda_allocation_find(table, identity.base, identity.epoch);
+    CXLType2CudaGenerationRecord *record =
+        cxl_type2_cuda_generation_find(table, identity, generation);
+
+    if (!allocation || !record || !size ||
+        allocation->content_generation != generation) {
+        if (table) {
+            cxl_type2_cuda_generation_fail(table,
+                                           "prefetch-generation-missing");
+        }
+        return false;
+    }
+    if (record->prefetch_count == UINT64_MAX ||
+        record->prefetch_requested_bytes > UINT64_MAX - size ||
+        record->prefetch_enqueue_wall_ns > UINT64_MAX - enqueue_wall_ns) {
+        cxl_type2_cuda_generation_fail(table, "prefetch-cost-overflow");
+        return false;
+    }
+    record->prefetch_count++;
+    record->prefetch_requested_bytes += size;
+    record->prefetch_enqueue_wall_ns += enqueue_wall_ns;
+    record->prefetch_completion_available = false;
+    return true;
+}
+
+bool cxl_type2_cuda_generation_prefetch_complete_for_identity(
+    CXLType2CudaAllocationTable *table,
+    CXLType2CudaAllocationIdentity identity, uint64_t generation,
+    uint64_t size, uint64_t completion_wall_ns)
+{
+    CXLType2CudaAllocation *allocation =
+        cxl_type2_cuda_allocation_find(table, identity.base, identity.epoch);
+    CXLType2CudaGenerationRecord *record =
+        cxl_type2_cuda_generation_find(table, identity, generation);
+
+    if (!allocation || !record || !record->prefetch_count || !size ||
+        allocation->content_generation != generation ||
+        record->promotion_count == UINT64_MAX ||
+        record->promotion_bytes > UINT64_MAX - size ||
+        record->promotion_wall_ns > UINT64_MAX - completion_wall_ns) {
+        if (table) {
+            cxl_type2_cuda_generation_fail(table,
+                                           "prefetch-completion-invalid");
+        }
+        return false;
+    }
+    record->promotion_count++;
+    record->promotion_bytes += size;
+    record->promotion_wall_ns += completion_wall_ns;
+    record->prefetch_completion_available = true;
+    return true;
+}
+
 bool cxl_type2_cuda_generation_release(CXLType2CudaAllocationTable *table,
                                        uint64_t base)
 {

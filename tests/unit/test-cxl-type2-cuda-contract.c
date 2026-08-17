@@ -723,6 +723,8 @@ static void test_cuda_pageable_alias_composite_remap(void)
     cxl_type2_cuda_allocation_table_init(&table);
     g_assert_true(cxl_type2_cuda_allocation_record(
         &table, UINT64_C(0x100000), 3 * page_size, &epoch));
+    g_assert_true(cxl_type2_cuda_generation_population_complete(
+        &table, UINT64_C(0x100000), 3 * page_size));
     g_assert_true(cxl_type2_cuda_allocation_map_pageable_alias(
         &table, UINT64_C(0x100000), epoch, 1, sources,
         G_N_ELEMENTS(sources), source_call_one, G_N_ELEMENTS(source_call_one),
@@ -763,6 +765,26 @@ static void test_cuda_pageable_alias_composite_remap(void)
     g_assert_cmpuint(
         table.entries[0].pageable_alias->boundary_composition_wall_ns,
         >, 0);
+    CXLType2CudaAllocationIdentity identity = {
+        .base = UINT64_C(0x100000),
+        .epoch = epoch,
+    };
+    bool prefetch_required = false;
+
+    g_assert_true(cxl_type2_cuda_generation_prefetch_required(
+        &table, identity, 1, &prefetch_required));
+    g_assert_true(prefetch_required);
+    g_assert_true(cxl_type2_cuda_generation_prefetch_enqueue_for_identity(
+        &table, identity, 1, logical_bytes + 32, 41));
+    g_assert_true(cxl_type2_cuda_generation_prefetch_required(
+        &table, identity, 1, &prefetch_required));
+    g_assert_false(prefetch_required);
+    g_assert_true(cxl_type2_cuda_generation_prefetch_complete_for_identity(
+        &table, identity, 1, logical_bytes + 32, 53));
+    g_assert_true(table.generations[0].prefetch_completion_available);
+    g_assert_cmpuint(table.generations[0].promotion_bytes, ==,
+                     logical_bytes + 32);
+    g_assert_cmpuint(table.generations[0].promotion_wall_ns, ==, 53);
 
     child = fork();
     g_assert_cmpint(child, >=, 0);

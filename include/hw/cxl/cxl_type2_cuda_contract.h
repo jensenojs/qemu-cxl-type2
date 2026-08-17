@@ -363,6 +363,18 @@ bool cxl_type2_cuda_generation_consume(
 bool cxl_type2_cuda_generation_prefetch_enqueue(
     CXLType2CudaAllocationTable *table, uint64_t address, uint64_t size,
     uint64_t enqueue_wall_ns);
+bool cxl_type2_cuda_generation_prefetch_required(
+    CXLType2CudaAllocationTable *table,
+    CXLType2CudaAllocationIdentity identity, uint64_t generation,
+    bool *required);
+bool cxl_type2_cuda_generation_prefetch_enqueue_for_identity(
+    CXLType2CudaAllocationTable *table,
+    CXLType2CudaAllocationIdentity identity, uint64_t generation,
+    uint64_t size, uint64_t enqueue_wall_ns);
+bool cxl_type2_cuda_generation_prefetch_complete_for_identity(
+    CXLType2CudaAllocationTable *table,
+    CXLType2CudaAllocationIdentity identity, uint64_t generation,
+    uint64_t size, uint64_t completion_wall_ns);
 bool cxl_type2_cuda_generation_release(CXLType2CudaAllocationTable *table,
                                        uint64_t base);
 bool cxl_type2_cuda_allocation_identity_for_address(

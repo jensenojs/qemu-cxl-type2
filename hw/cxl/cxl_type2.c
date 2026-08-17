@@ -3824,6 +3824,102 @@ static GArray *cxl_type2_model_alias_rewrite_params(
     return bindings;
 }
 
+static int cxl_type2_model_alias_prefetch(
+    CXLType2State *ct2d, const GArray *bindings, HetGPUStream stream)
+{
+    HetGPUState *hetgpu = &ct2d->gpu_info.hetgpu_state;
+
+    for (size_t i = 0; i < bindings->len; i++) {
+        const CXLType2AliasLaunchBinding *binding = &g_array_index(
+            bindings, CXLType2AliasLaunchBinding, i);
+        CXLType2CudaAllocation *allocation = cxl_type2_cuda_allocation_find(
+            &ct2d->cuda_allocations, binding->identity.base,
+            binding->identity.epoch);
+        bool required = false;
+
+        if (!cxl_type2_cuda_generation_prefetch_required(
+                &ct2d->cuda_allocations, binding->identity,
+                binding->generation, &required)) {
+            cxl_type2_generation_reuse_fail(
+                ct2d, ct2d->cuda_allocations.first_generation_error);
+            return CXL_GPU_ERROR_INVALID_VALUE;
+        }
+        if (!required) {
+            continue;
+        }
+        CXLType2CudaPageableAlias *alias = allocation->pageable_alias;
+        size_t source_index = 0;
+        uint64_t prefetched_bytes = 0;
+
+        while (source_index < alias->source_count) {
+            uint64_t begin = alias->sources[source_index].destination_offset;
+            uint64_t end = begin + alias->sources[source_index].length;
+            int64_t enqueue_begin_ns;
+            int64_t enqueue_end_ns;
+
+            source_index++;
+            while (source_index < alias->source_count &&
+                   alias->sources[source_index].destination_offset == end) {
+                end += alias->sources[source_index].length;
+                source_index++;
+            }
+            enqueue_begin_ns = cxl_type2_host_monotonic_ns();
+            int result = hetgpu_cuda_mem_prefetch_async(
+                hetgpu, allocation->device_alias + begin, end - begin,
+                hetgpu->device_index, stream);
+            enqueue_end_ns = cxl_type2_host_monotonic_ns();
+            if (result != CXL_GPU_SUCCESS ||
+                !cxl_type2_cuda_generation_prefetch_enqueue_for_identity(
+                    &ct2d->cuda_allocations, binding->identity,
+                    binding->generation, end - begin,
+                    enqueue_end_ns >= enqueue_begin_ns
+                        ? (uint64_t)(enqueue_end_ns - enqueue_begin_ns)
+                        : 0)) {
+                (void)hetgpu_cuda_stream_synchronize(hetgpu, stream);
+                cxl_type2_model_supply_fail(
+                    ct2d, ct2d->gpu_cmd.call_id, "prefetch",
+                    result == CXL_GPU_SUCCESS
+                        ? "prefetch-ledger-failed"
+                        : "alias-prefetch-failed",
+                    UINT64_MAX, binding->identity.base,
+                    binding->identity.epoch, binding->generation);
+                return result == CXL_GPU_SUCCESS
+                           ? CXL_GPU_ERROR_INVALID_VALUE
+                           : result;
+            }
+            prefetched_bytes += end - begin;
+        }
+        /*
+         * knockout: publish migration completion synchronously so consumers
+         * on any stream share one generation fact. Replace this wait with a
+         * generation-owned event only if measured prefetch wall dominates.
+         */
+        int64_t completion_begin_ns = cxl_type2_host_monotonic_ns();
+        int result = hetgpu_cuda_stream_synchronize(hetgpu, stream);
+        int64_t completion_end_ns = cxl_type2_host_monotonic_ns();
+
+        if (result != CXL_GPU_SUCCESS ||
+            !cxl_type2_cuda_generation_prefetch_complete_for_identity(
+                &ct2d->cuda_allocations, binding->identity,
+                binding->generation, prefetched_bytes,
+                completion_end_ns >= completion_begin_ns
+                    ? (uint64_t)(completion_end_ns - completion_begin_ns)
+                    : 0)) {
+            cxl_type2_model_supply_fail(
+                ct2d, ct2d->gpu_cmd.call_id, "prefetch",
+                result == CXL_GPU_SUCCESS
+                    ? "prefetch-completion-ledger-failed"
+                    : "alias-prefetch-completion-failed",
+                UINT64_MAX, binding->identity.base,
+                binding->identity.epoch, binding->generation);
+            return result == CXL_GPU_SUCCESS
+                       ? CXL_GPU_ERROR_INVALID_VALUE
+                       : result;
+        }
+    }
+    return CXL_GPU_SUCCESS;
+}
+
 static void cxl_type2_graph_alias_identities_unbind(
     CXLType2State *ct2d, GArray *identities)
 {
@@ -5032,19 +5128,28 @@ static void cxl_type2_log_generation_reuse_summary(
                 record->gpu_local_consumer_count
                     ? "gpu-read-bytes-not-produced"
                     : "none";
-            const char *prefetch_bytes =
-                record->prefetch_count ? "unavailable" : "0";
-            const char *prefetch_enqueue_wall_ns =
-                record->prefetch_count ? "unavailable" : "0";
-            const char *prefetch_completion_wall_ns =
-                record->prefetch_count ? "unavailable" : "0";
+            char prefetch_bytes[32];
+            char prefetch_enqueue_wall_ns[32];
+            char prefetch_completion_wall_ns[32];
             const char *prefetch_cost_status =
-                record->prefetch_count ? "unavailable" : "available";
+                record->prefetch_completion_available
+                    ? "available"
+                    : "unavailable";
             const char *prefetch_cost_reason =
-                record->prefetch_count
+                record->prefetch_completion_available
+                    ? "none"
+                    : record->prefetch_count
                     ? "prefetch-completion-boundary-not-produced"
                     : "none";
 
+            snprintf(prefetch_bytes, sizeof(prefetch_bytes), "%" PRIu64,
+                     record->prefetch_requested_bytes);
+            snprintf(prefetch_enqueue_wall_ns,
+                     sizeof(prefetch_enqueue_wall_ns), "%" PRIu64,
+                     record->prefetch_enqueue_wall_ns);
+            snprintf(prefetch_completion_wall_ns,
+                     sizeof(prefetch_completion_wall_ns), "%" PRIu64,
+                     record->promotion_wall_ns);
             if (record->consumer_observed) {
                 snprintf(first_consumer, sizeof(first_consumer),
                          "opcode:0x%02x/call:%" PRIu64,
@@ -10905,6 +11010,13 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
                 break;
             }
+            ct2d->gpu_cmd.cmd_result = cxl_type2_model_alias_prefetch(
+                ct2d, alias_bindings, stream);
+            if (ct2d->gpu_cmd.cmd_result != CXL_GPU_SUCCESS) {
+                cxl_type2_alias_launch_bindings_release(
+                    ct2d, alias_bindings, CXL_TYPE2_CUDA_ALIAS_GRAPH);
+                break;
+            }
             ct2d->gpu_cmd.cmd_result = hetgpu_cuda_graph_launch(
                 hetgpu, ct2d->gpu_cmd.graph_execs[graph_exec_id_raw], stream);
             if (ct2d->gpu_cmd.cmd_result == CXL_GPU_SUCCESS) {
@@ -11464,6 +11576,18 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 }
                 alias_bindings = cxl_type2_model_alias_rewrite_params(
                     ct2d, layout, args, CXL_TYPE2_CUDA_ALIAS_NORMAL);
+
+                if (!capturing && alias_bindings->len) {
+                    int prefetch_result = cxl_type2_model_alias_prefetch(
+                        ct2d, alias_bindings, config.stream);
+                    if (prefetch_result != CXL_GPU_SUCCESS) {
+                        cxl_type2_alias_launch_bindings_release(
+                            ct2d, alias_bindings,
+                            CXL_TYPE2_CUDA_ALIAS_NORMAL);
+                        ct2d->gpu_cmd.cmd_result = prefetch_result;
+                        break;
+                    }
+                }
 
                 if (ct2d->paired_case.qemu_cuda_calls_enabled) qemu_log(
                     "CXL TYPE2 TRACE function_param_layout event=launch "
