@@ -85,7 +85,6 @@ extern int LZ4_decompress_safe(const char *src, char *dst, int compressed_size,
 
 #define CXL_CUDA_MEMHOSTREGISTER_PORTABLE 0x01U
 #define CXL_CUDA_MEMHOSTREGISTER_DEVICEMAP 0x02U
-#define CXL_CUDA_MEMHOSTREGISTER_READ_ONLY 0x08U
 #define CXL_CUDA_DEVICE_ATTRIBUTE_CAN_MAP_HOST_MEMORY 19
 
 static int64_t cxl_type2_host_monotonic_ns(void) {
@@ -2899,8 +2898,7 @@ static int cxl_type2_model_alias_register(CXLType2State *ct2d,
   }
   result = hetgpu_cuda_mem_host_register(
       &ct2d->gpu_info.hetgpu_state, alias->mapping_base, alias->mapping_size,
-      CXL_CUDA_MEMHOSTREGISTER_PORTABLE | CXL_CUDA_MEMHOSTREGISTER_DEVICEMAP |
-          CXL_CUDA_MEMHOSTREGISTER_READ_ONLY);
+      CXL_CUDA_MEMHOSTREGISTER_PORTABLE | CXL_CUDA_MEMHOSTREGISTER_DEVICEMAP);
   if (result != CXL_GPU_SUCCESS) {
     return result;
   }

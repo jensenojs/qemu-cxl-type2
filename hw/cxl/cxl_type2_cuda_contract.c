@@ -969,8 +969,8 @@ static bool cxl_type2_cuda_alias_map_pages(CXLType2CudaPageableAlias *alias,
         page_end - page_begin == page_size && source && source->fd >= 0 &&
         source->destination_offset <= page_begin && source_end >= page_end &&
         file_page_offset % page_size == 0) {
-      mapped = mmap(page_address, page_size, PROT_READ, MAP_SHARED | MAP_FIXED,
-                    source->fd, file_page_offset);
+      mapped = mmap(page_address, page_size, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_FIXED, source->fd, file_page_offset);
       if (mapped != page_address) {
         *reason = "file-page-map-failed";
         return false;
@@ -1016,10 +1016,6 @@ static bool cxl_type2_cuda_alias_map_pages(CXLType2CudaPageableAlias *alias,
         }
         alias->derived_boundary_copy_bytes += copy_end - copy_begin;
       }
-    }
-    if (mprotect(page_address, page_size, PROT_READ) < 0) {
-      *reason = "boundary-page-protect-failed";
-      return false;
     }
     alias->boundary_composition_wall_ns +=
         qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - composition_begin_ns;
