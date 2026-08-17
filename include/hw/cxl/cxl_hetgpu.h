@@ -35,6 +35,34 @@ typedef struct CudaKernelNodeParams {
     void *context;
 } CudaKernelNodeParams;
 
+typedef struct CudaMemcpy3DParams {
+    size_t src_x_bytes;
+    size_t src_y;
+    size_t src_z;
+    size_t src_lod;
+    unsigned int src_memory_type;
+    const void *src_host;
+    uint64_t src_device;
+    void *src_array;
+    void *reserved0;
+    size_t src_pitch;
+    size_t src_height;
+    size_t dst_x_bytes;
+    size_t dst_y;
+    size_t dst_z;
+    size_t dst_lod;
+    unsigned int dst_memory_type;
+    void *dst_host;
+    uint64_t dst_device;
+    void *dst_array;
+    void *reserved1;
+    size_t dst_pitch;
+    size_t dst_height;
+    size_t width_bytes;
+    size_t height;
+    size_t depth;
+} CudaMemcpy3DParams;
+
 /* hetGPU Backend Types */
 typedef enum {
     HETGPU_BACKEND_AUTO = 0,     /* Auto-detect best backend */
@@ -691,12 +719,6 @@ int hetgpu_cuda_graph_exec_update(HetGPUState *state,
                                   HetGPUGraphExecUpdateResultInfo *result_info);
 int hetgpu_cuda_graph_get_nodes(HetGPUState *state, HetGPUGraph graph,
                                 HetGPUGraphNode *nodes, size_t *num_nodes);
-typedef enum HetGPUGraphNodeRole {
-    HETGPU_GRAPH_NODE_KERNEL,
-    HETGPU_GRAPH_NODE_INERT_CONTROL,
-    HETGPU_GRAPH_NODE_MEMORY_OR_NESTED,
-    HETGPU_GRAPH_NODE_UNKNOWN,
-} HetGPUGraphNodeRole;
 typedef enum HetGPUGraphNodeType {
     HETGPU_GRAPH_NODE_TYPE_KERNEL = 0,
     HETGPU_GRAPH_NODE_TYPE_MEMCPY = 1,
@@ -716,7 +738,9 @@ typedef enum HetGPUGraphNodeType {
 int hetgpu_cuda_graph_node_get_type(HetGPUState *state,
                                     HetGPUGraphNode graph_node,
                                     int *node_type);
-HetGPUGraphNodeRole hetgpu_cuda_graph_node_role(int node_type);
+int hetgpu_cuda_graph_memcpy_node_get_params(HetGPUState *state,
+                                             HetGPUGraphNode graph_node,
+                                             CudaMemcpy3DParams *params);
 int hetgpu_cuda_link_create(HetGPUState *state, void **link_state);
 int hetgpu_cuda_link_add_data(HetGPUState *state, void *link_state, int input_type,
                               void *data, size_t size, const char *name);

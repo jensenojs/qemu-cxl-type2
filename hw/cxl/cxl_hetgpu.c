@@ -116,6 +116,7 @@ typedef int (*cuGraphExecKernelNodeSetParams_fn)(void *, void *,
 typedef int (*cuGraphKernelNodeGetParams_fn)(void *, CudaKernelNodeParams *);
 typedef int (*cuGraphKernelNodeSetParams_fn)(void *,
                                              const CudaKernelNodeParams *);
+typedef int (*cuGraphMemcpyNodeGetParams_fn)(void *, CudaMemcpy3DParams *);
 typedef int (*cuGraphExecDestroy_fn)(void *);
 typedef int (*cuGraphLaunch_fn)(void *, void *);
 typedef int (*cuGraphDestroy_fn)(void *);
@@ -335,6 +336,7 @@ static struct {
     cuGraphExecKernelNodeSetParams_fn cuGraphExecKernelNodeSetParams;
     cuGraphKernelNodeGetParams_fn cuGraphKernelNodeGetParams;
     cuGraphKernelNodeSetParams_fn cuGraphKernelNodeSetParams;
+    cuGraphMemcpyNodeGetParams_fn cuGraphMemcpyNodeGetParams;
     cuGraphExecDestroy_fn cuGraphExecDestroy;
     cuGraphLaunch_fn cuGraphLaunch;
     cuGraphDestroy_fn cuGraphDestroy;
@@ -533,6 +535,8 @@ static HetGPUError hetgpu_init_internal(HetGPUState *state,
                 dlsym(g_cuda_lib_handle, "cuGraphKernelNodeGetParams_v2");
             g_cuda_funcs.cuGraphKernelNodeSetParams =
                 dlsym(g_cuda_lib_handle, "cuGraphKernelNodeSetParams_v2");
+            g_cuda_funcs.cuGraphMemcpyNodeGetParams =
+                dlsym(g_cuda_lib_handle, "cuGraphMemcpyNodeGetParams");
             g_cuda_funcs.cuGraphExecDestroy =
                 dlsym(g_cuda_lib_handle, "cuGraphExecDestroy");
             g_cuda_funcs.cuGraphLaunch =
@@ -2741,29 +2745,26 @@ int hetgpu_cuda_graph_node_get_type(HetGPUState *state,
     return result;
 }
 
-HetGPUGraphNodeRole hetgpu_cuda_graph_node_role(int node_type)
+int hetgpu_cuda_graph_memcpy_node_get_params(HetGPUState *state,
+                                             HetGPUGraphNode graph_node,
+                                             CudaMemcpy3DParams *params)
 {
-    switch ((HetGPUGraphNodeType)node_type) {
-    case HETGPU_GRAPH_NODE_TYPE_KERNEL:
-        return HETGPU_GRAPH_NODE_KERNEL;
-    case HETGPU_GRAPH_NODE_TYPE_EMPTY:
-    case HETGPU_GRAPH_NODE_TYPE_WAIT_EVENT:
-    case HETGPU_GRAPH_NODE_TYPE_EVENT_RECORD:
-    case HETGPU_GRAPH_NODE_TYPE_EXT_SEMAS_SIGNAL:
-    case HETGPU_GRAPH_NODE_TYPE_EXT_SEMAS_WAIT:
-        return HETGPU_GRAPH_NODE_INERT_CONTROL;
-    case HETGPU_GRAPH_NODE_TYPE_MEMCPY:
-    case HETGPU_GRAPH_NODE_TYPE_MEMSET:
-    case HETGPU_GRAPH_NODE_TYPE_HOST:
-    case HETGPU_GRAPH_NODE_TYPE_GRAPH:
-    case HETGPU_GRAPH_NODE_TYPE_MEM_ALLOC:
-    case HETGPU_GRAPH_NODE_TYPE_MEM_FREE:
-    case HETGPU_GRAPH_NODE_TYPE_BATCH_MEM_OP:
-    case HETGPU_GRAPH_NODE_TYPE_CONDITIONAL:
-        return HETGPU_GRAPH_NODE_MEMORY_OR_NESTED;
-    default:
-        return HETGPU_GRAPH_NODE_UNKNOWN;
+    if (!state || !state->initialized) {
+        return CUDA_ERROR_INVALID_CONTEXT;
     }
+    if (!graph_node || !params) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if (state->backend == HETGPU_BACKEND_SIMULATION ||
+        !g_cuda_funcs.cuGraphMemcpyNodeGetParams) {
+        return CUDA_ERROR_NOT_SUPPORTED;
+    }
+    if (!cuda_lock(state)) {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    int result = HETGPU_CUDA_CALL(cuGraphMemcpyNodeGetParams, graph_node, params);
+    cuda_unlock(state);
+    return result;
 }
 
 static bool hetgpu_cuda_ready(HetGPUState *state)

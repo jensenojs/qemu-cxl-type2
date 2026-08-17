@@ -4117,6 +4117,157 @@ static void cxl_type2_graph_exec_generation_consumers_free(gpointer opaque) {
   g_free(exec);
 }
 
+enum {
+  CXL_TYPE2_CUDA_MEMORY_HOST = 1,
+  CXL_TYPE2_CUDA_MEMORY_DEVICE = 2,
+  CXL_TYPE2_CUDA_MEMORY_ARRAY = 3,
+  CXL_TYPE2_CUDA_MEMORY_UNIFIED = 4,
+};
+
+static bool cxl_type2_graph_memcpy_device_range(
+    const CudaMemcpy3DParams *params, bool source, uint64_t *begin,
+    uint64_t *span, const char **reason) {
+  unsigned int memory_type =
+      source ? params->src_memory_type : params->dst_memory_type;
+  uint64_t address = source ? params->src_device : params->dst_device;
+  uint64_t x = source ? params->src_x_bytes : params->dst_x_bytes;
+  uint64_t y = source ? params->src_y : params->dst_y;
+  uint64_t z = source ? params->src_z : params->dst_z;
+  uint64_t pitch = source ? params->src_pitch : params->dst_pitch;
+  uint64_t plane_height =
+      source ? params->src_height : params->dst_height;
+  uint64_t offset = x;
+  uint64_t term;
+  uint64_t extent = params->width_bytes;
+
+  if (memory_type == CXL_TYPE2_CUDA_MEMORY_HOST ||
+      memory_type == CXL_TYPE2_CUDA_MEMORY_ARRAY) {
+    *begin = 0;
+    *span = 0;
+    return true;
+  }
+  if (memory_type != CXL_TYPE2_CUDA_MEMORY_DEVICE &&
+      memory_type != CXL_TYPE2_CUDA_MEMORY_UNIFIED) {
+    *reason = source ? "graph-memcpy-source-memory-type-invalid"
+                     : "graph-memcpy-destination-memory-type-invalid";
+    return false;
+  }
+  if (!address || !params->width_bytes || !params->height || !params->depth) {
+    *reason = "graph-memcpy-device-extent-invalid";
+    return false;
+  }
+  if (params->height > 1 || y) {
+    if (!pitch || umul64_overflow(y, pitch, &term) ||
+        uadd64_overflow(offset, term, &offset) ||
+        umul64_overflow(params->height - 1, pitch, &term) ||
+        uadd64_overflow(extent, term, &extent)) {
+      *reason = "graph-memcpy-device-extent-overflow";
+      return false;
+    }
+  }
+  if (params->depth > 1 || z) {
+    if (!pitch || !plane_height ||
+        umul64_overflow(pitch, plane_height, &term) ||
+        umul64_overflow(z, term, &term) ||
+        uadd64_overflow(offset, term, &offset) ||
+        umul64_overflow(pitch, plane_height, &term) ||
+        umul64_overflow(params->depth - 1, term, &term) ||
+        uadd64_overflow(extent, term, &extent)) {
+      *reason = "graph-memcpy-device-extent-overflow";
+      return false;
+    }
+  }
+  if (uadd64_overflow(address, offset, begin) ||
+      uadd64_overflow(*begin, extent - 1, &term)) {
+    *reason = "graph-memcpy-device-extent-overflow";
+    return false;
+  }
+  *span = extent;
+  return true;
+}
+
+static bool cxl_type2_ranges_overlap(uint64_t first, uint64_t first_size,
+                                     uint64_t second, uint64_t second_size) {
+  uint64_t first_end;
+  uint64_t second_end;
+
+  if (!first_size || !second_size ||
+      uadd64_overflow(first, first_size, &first_end) ||
+      uadd64_overflow(second, second_size, &second_end)) {
+    return false;
+  }
+  return first < second_end && second < first_end;
+}
+
+static bool cxl_type2_graph_memcpy_range_is_model(CXLType2State *ct2d,
+                                                   uint64_t begin,
+                                                   uint64_t span) {
+  if (!span) {
+    return false;
+  }
+  for (size_t i = 0; i < ct2d->cuda_allocations.count; i++) {
+    const CXLType2CudaAllocation *allocation =
+        &ct2d->cuda_allocations.entries[i];
+
+    if (!allocation->pageable_alias) {
+      continue;
+    }
+    if (cxl_type2_ranges_overlap(begin, span, allocation->base,
+                                 allocation->size)) {
+      return true;
+    }
+    for (const CXLType2CudaPageableAlias *alias = allocation->pageable_alias;
+         alias; alias = alias->next) {
+      if (alias->device_alias &&
+          cxl_type2_ranges_overlap(begin, span, alias->device_alias,
+                                   alias->logical_bytes)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+static bool cxl_type2_graph_memcpy_validate(CXLType2State *ct2d,
+                                            uint32_t graph_exec_id,
+                                            size_t node_index,
+                                            const CudaMemcpy3DParams *params,
+                                            const char **reason) {
+  uint64_t source_begin;
+  uint64_t source_span;
+  uint64_t destination_begin;
+  uint64_t destination_span;
+
+  *reason = NULL;
+  if (!cxl_type2_graph_memcpy_device_range(params, true, &source_begin,
+                                            &source_span, reason) ||
+      !cxl_type2_graph_memcpy_device_range(
+          params, false, &destination_begin, &destination_span, reason)) {
+    return false;
+  }
+  bool source_is_model = cxl_type2_graph_memcpy_range_is_model(
+      ct2d, source_begin, source_span);
+  bool destination_is_model = cxl_type2_graph_memcpy_range_is_model(
+      ct2d, destination_begin, destination_span);
+
+  qemu_log("KIMI_MODEL_SUPPLY_GRAPH_MEMCPY graph_exec_id=%u "
+           "node_index=%zu src_memory_type=%u src_begin=%" PRIu64
+           " src_span=%" PRIu64 " src_model=%u dst_memory_type=%u "
+           "dst_begin=%" PRIu64 " dst_span=%" PRIu64 " dst_model=%u\n",
+           graph_exec_id, node_index, params->src_memory_type, source_begin,
+           source_span, source_is_model, params->dst_memory_type,
+           destination_begin, destination_span, destination_is_model);
+  if (destination_is_model) {
+    *reason = "graph-memcpy-model-write-uncovered";
+    return false;
+  }
+  if (source_is_model) {
+    *reason = "graph-memcpy-model-read-uncovered";
+    return false;
+  }
+  return true;
+}
+
 static CXLType2GraphExecGenerationConsumers *
 cxl_type2_graph_generation_consumers_snapshot(CXLType2State *ct2d,
                                               HetGPUGraph graph,
@@ -4154,18 +4305,42 @@ cxl_type2_graph_generation_consumers_snapshot(CXLType2State *ct2d,
         CXL_GPU_SUCCESS) {
       goto failed;
     }
-    HetGPUGraphNodeRole node_role = hetgpu_cuda_graph_node_role(node_type);
-
-    if (node_role == HETGPU_GRAPH_NODE_INERT_CONTROL) {
+    if (node_type == HETGPU_GRAPH_NODE_TYPE_EMPTY ||
+        node_type == HETGPU_GRAPH_NODE_TYPE_WAIT_EVENT ||
+        node_type == HETGPU_GRAPH_NODE_TYPE_EVENT_RECORD ||
+        node_type == HETGPU_GRAPH_NODE_TYPE_EXT_SEMAS_SIGNAL ||
+        node_type == HETGPU_GRAPH_NODE_TYPE_EXT_SEMAS_WAIT) {
       continue;
     }
-    if (node_role != HETGPU_GRAPH_NODE_KERNEL) {
+    if (node_type == HETGPU_GRAPH_NODE_TYPE_MEMCPY) {
+      CudaMemcpy3DParams memcpy_params = {0};
+
+      if (hetgpu_cuda_graph_memcpy_node_get_params(hetgpu, nodes[i],
+                                                    &memcpy_params) !=
+              CXL_GPU_SUCCESS ||
+          !cxl_type2_graph_memcpy_validate(ct2d, graph_exec_id, i,
+                                            &memcpy_params,
+                                            &consumer_reason)) {
+        const char *detail = consumer_reason
+                                 ? consumer_reason
+                                 : "graph-memcpy-params-unavailable";
+
+        qemu_log("KIMI_MODEL_SUPPLY_GRAPH_REJECT graph_exec_id=%u "
+                 "node_index=%zu node_type=%d reason=%s\n",
+                 graph_exec_id, i, node_type, detail);
+        cxl_type2_model_supply_fail(ct2d, ct2d->gpu_cmd.call_id,
+                                    "driver-binding", detail, i, 0, 0, 0);
+        goto failed;
+      }
+      continue;
+    }
+    if (node_type != HETGPU_GRAPH_NODE_TYPE_KERNEL) {
       qemu_log("KIMI_MODEL_SUPPLY_GRAPH_REJECT graph_exec_id=%u "
-               "node_index=%zu node_type=%d reason=memory-consumer-uncovered\n",
+               "node_index=%zu node_type=%d reason=node-semantics-uncovered\n",
                graph_exec_id, i, node_type);
       cxl_type2_model_supply_fail(
           ct2d, ct2d->gpu_cmd.call_id, "driver-binding",
-          "graph-memory-consumer-uncovered", i, 0, 0, 0);
+          "graph-node-semantics-uncovered", i, 0, 0, 0);
       goto failed;
     }
     if (hetgpu_cuda_graph_kernel_node_get_params(hetgpu, nodes[i], &params) !=
