@@ -865,10 +865,7 @@ bool cxl_type2_cuda_allocation_append_pageable_sources(
   }
   ledger = allocation->pageable_sources;
   if ((ledger && destination_offset != ledger->logical_bytes) ||
-      (!ledger && destination_offset != 0) ||
-      (ledger && generation < ledger->content_generation) ||
-      (ledger && ledger->source_call_count &&
-       source_call_id <= ledger->source_call_ids[ledger->source_call_count - 1])) {
+      (!ledger && destination_offset != 0)) {
     *reason = "alias-source-order-invalid";
     return false;
   }
