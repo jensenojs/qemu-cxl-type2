@@ -678,6 +678,7 @@ static void test_cuda_pageable_alias_composite_remap(void)
     CXLType2CudaAliasSource sources[4];
     g_autofree char *path = NULL;
     g_autofree uint8_t *file_bytes = NULL;
+    uint8_t host_bytes[128];
     GError *error = NULL;
     struct stat source_stat;
     size_t page_size = qemu_real_host_page_size();
@@ -701,6 +702,9 @@ static void test_cuda_pageable_alias_composite_remap(void)
     for (size_t i = 0; i < 5 * page_size; i++) {
         file_bytes[i] = (i * 17 + 3) & 0xff;
     }
+    for (size_t i = 0; i < sizeof(host_bytes); i++) {
+        host_bytes[i] = (i * 29 + 7) & 0xff;
+    }
     g_assert_cmpint(pwrite(fd, file_bytes, 5 * page_size, 0), ==,
                     5 * page_size);
     g_assert_cmpint(fstat(fd, &source_stat), ==, 0);
@@ -709,6 +713,8 @@ static void test_cuda_pageable_alias_composite_remap(void)
                               page_size - 64, 1);
     sources[1] = alias_source(fd, &source_stat, 2 * page_size + 17,
                               page_size - 64, 128, 1);
+    sources[1].fd = -1;
+    sources[1].host_copy_source = host_bytes;
     sources[2] = alias_source(fd, &source_stat, 3 * page_size + 64,
                               page_size + 64, page_size - 64, 1);
     sources[3] = alias_source(fd, &source_stat, 4 * page_size,
@@ -744,7 +750,12 @@ static void test_cuda_pageable_alias_composite_remap(void)
         table.entries[0].pageable_alias->derived_boundary_pages, ==, 2);
     g_assert_cmpuint(
         table.entries[0].pageable_alias->derived_boundary_copy_bytes,
-        ==, 2 * page_size);
+        ==, 2 * page_size - sizeof(host_bytes));
+    g_assert_cmpuint(
+        table.entries[0].pageable_alias->host_composition_copy_bytes,
+        ==, sizeof(host_bytes));
+    g_assert_cmpmem((const uint8_t *)(uintptr_t)alias_one + page_size - 64,
+                    sizeof(host_bytes), host_bytes, sizeof(host_bytes));
     g_assert_nonnull(table.entries[0].pageable_alias->owned_reservation);
     g_assert_cmpuint(
         table.entries[0].pageable_alias->owned_reservation_size,

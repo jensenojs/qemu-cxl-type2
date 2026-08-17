@@ -138,6 +138,7 @@ typedef struct CXLType2CudaAllocation {
 
 typedef struct CXLType2CudaAliasSource {
     int fd;
+    const void *host_copy_source;
     uint64_t file_offset;
     uint64_t destination_offset;
     uint64_t length;
@@ -162,6 +163,7 @@ typedef struct CXLType2CudaPageableAlias {
     uint64_t *contributing_source_call_ids;
     size_t contributing_source_call_count;
     uint64_t file_mapped_bytes;
+    uint64_t host_composition_copy_bytes;
     uint64_t derived_boundary_copy_bytes;
     uint64_t boundary_composition_wall_ns;
     size_t derived_boundary_pages;

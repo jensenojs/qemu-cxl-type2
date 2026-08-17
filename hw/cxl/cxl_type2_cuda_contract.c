@@ -777,12 +777,19 @@ static bool cxl_type2_cuda_alias_source_copy(
 {
     struct stat source_stat;
     int duplicate;
+    bool host_copy = source->host_copy_source != NULL;
 
-    if (source->fd < 0 || !source->length || !source->readonly ||
-        !source->mapping_generation ||
-        source->file_offset > UINT64_MAX - source->length) {
+    if (!source->length || !source->readonly ||
+        (host_copy == (source->fd >= 0)) ||
+        (!host_copy && (!source->mapping_generation ||
+                        source->file_offset > UINT64_MAX - source->length))) {
         *reason = "source-invalid";
         return false;
+    }
+    if (host_copy) {
+        *destination = *source;
+        destination->fd = -1;
+        return true;
     }
     if (fstat(source->fd, &source_stat) < 0) {
         *reason = "source-stat-failed";
@@ -840,8 +847,18 @@ static bool cxl_type2_cuda_alias_verify(
             size_t count = MIN((uint64_t)sizeof(expected),
                                source->length - compared);
 
-            if (!cxl_type2_cuda_pread_all(source->fd, expected, count,
-                                          source->file_offset + compared) ||
+            bool read_ok = source->host_copy_source
+                               ? (memcpy(expected,
+                                         (const uint8_t *)
+                                                 source->host_copy_source +
+                                             compared,
+                                         count),
+                                  true)
+                               : cxl_type2_cuda_pread_all(
+                                     source->fd, expected, count,
+                                     source->file_offset + compared);
+
+            if (!read_ok ||
                 memcmp(expected,
                        alias->reservation + source->destination_offset +
                            compared,
@@ -884,7 +901,7 @@ static bool cxl_type2_cuda_alias_map_pages(
                                ? source->file_offset + page_begin -
                                      source->destination_offset
                                : 0;
-        if (covered_end == page_end && source &&
+        if (covered_end == page_end && source && source->fd >= 0 &&
             source->destination_offset <= page_begin &&
             source_end >= page_end && file_page_offset % page_size == 0) {
             mapped = mmap(page_address, page_size, PROT_READ,
@@ -919,16 +936,24 @@ static bool cxl_type2_cuda_alias_map_pages(
             if (copy_begin >= copy_end) {
                 continue;
             }
-            if (!cxl_type2_cuda_pread_all(
-                    source->fd,
-                    page_address + copy_begin - page_begin,
-                    copy_end - copy_begin,
-                    source->file_offset + copy_begin -
-                        source->destination_offset)) {
-                *reason = "boundary-page-read-failed";
-                return false;
+            if (source->host_copy_source) {
+                memcpy(page_address + copy_begin - page_begin,
+                       (const uint8_t *)source->host_copy_source +
+                           copy_begin - source->destination_offset,
+                       copy_end - copy_begin);
+                alias->host_composition_copy_bytes += copy_end - copy_begin;
+            } else {
+                if (!cxl_type2_cuda_pread_all(
+                        source->fd,
+                        page_address + copy_begin - page_begin,
+                        copy_end - copy_begin,
+                        source->file_offset + copy_begin -
+                            source->destination_offset)) {
+                    *reason = "boundary-page-read-failed";
+                    return false;
+                }
+                alias->derived_boundary_copy_bytes += copy_end - copy_begin;
             }
-            alias->derived_boundary_copy_bytes += copy_end - copy_begin;
         }
         if (mprotect(page_address, page_size, PROT_READ) < 0) {
             *reason = "boundary-page-protect-failed";
@@ -941,6 +966,9 @@ static bool cxl_type2_cuda_alias_map_pages(
     if (!cxl_type2_cuda_alias_verify(alias)) {
         *reason = "alias-byte-oracle-failed";
         return false;
+    }
+    for (size_t i = 0; i < alias->source_count; i++) {
+        alias->sources[i].host_copy_source = NULL;
     }
     return true;
 }

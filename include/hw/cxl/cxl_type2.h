@@ -248,6 +248,7 @@ typedef struct CXLType2DirectPhysical {
 
 typedef struct CXLType2DirectRun {
     CXLType2DirectPhysical *physical;
+    const void *ordinary_host;
     uint64_t physical_offset;
     uint64_t length;
     int source_fd;
@@ -483,6 +484,7 @@ typedef struct CXLType2State {
         uint64_t logical_source_view_bytes;
         uint64_t page_collateral_bytes;
         uint64_t file_mapped_bytes;
+        uint64_t host_composition_copy_bytes;
         uint64_t derived_boundary_pages;
         uint64_t derived_boundary_copy_bytes;
         uint64_t boundary_composition_wall_ns;

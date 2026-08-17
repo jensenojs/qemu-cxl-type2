@@ -2963,6 +2963,8 @@ static QDict *cxl_type2_model_supply_alias_release_event(
                             allocation->device_alias);
     cxl_type2_qdict_put_u64(event, "file_mapped_bytes",
                             alias->file_mapped_bytes);
+    cxl_type2_qdict_put_u64(event, "host_composition_copy_bytes",
+                            alias->host_composition_copy_bytes);
     cxl_type2_qdict_put_u64(event, "derived_boundary_pages",
                             alias->derived_boundary_pages);
     cxl_type2_qdict_put_u64(event, "derived_boundary_copy_bytes",
@@ -4518,6 +4520,7 @@ static void cxl_type2_reset_case_summary(CXLType2State *ct2d)
     ct2d->model_supply.logical_source_view_bytes = 0;
     ct2d->model_supply.page_collateral_bytes = 0;
     ct2d->model_supply.file_mapped_bytes = 0;
+    ct2d->model_supply.host_composition_copy_bytes = 0;
     ct2d->model_supply.derived_boundary_pages = 0;
     ct2d->model_supply.derived_boundary_copy_bytes = 0;
     ct2d->model_supply.boundary_composition_wall_ns = 0;
@@ -5142,7 +5145,11 @@ static void cxl_type2_log_model_supply_terminal(
         if (allocation->pageable_alias) {
             live_aliases++;
             live_source_views += allocation->pageable_alias->source_count;
-            live_source_fd_refs += allocation->pageable_alias->source_count;
+            for (size_t j = 0;
+                 j < allocation->pageable_alias->source_count; j++) {
+                live_source_fd_refs +=
+                    allocation->pageable_alias->sources[j].fd >= 0;
+            }
         }
     }
     pass = case_success && !ct2d->model_supply.first_failure_stage &&
@@ -5201,6 +5208,8 @@ static void cxl_type2_log_model_supply_terminal(
                             ct2d->model_supply.alias_releases);
     cxl_type2_qdict_put_u64(event, "file_mapped_bytes",
                             ct2d->model_supply.file_mapped_bytes);
+    cxl_type2_qdict_put_u64(event, "host_composition_copy_bytes",
+                            ct2d->model_supply.host_composition_copy_bytes);
     cxl_type2_qdict_put_u64(event, "derived_boundary_pages",
                             ct2d->model_supply.derived_boundary_pages);
     cxl_type2_qdict_put_u64(event, "derived_boundary_copy_bytes",
@@ -6286,6 +6295,7 @@ typedef struct CXLType2DirectValidatedRun {
     hwaddr guest_phys_addr;
     uint64_t length;
     VirtioSharedMemoryMapping *mapping;
+    const void *ordinary_host;
     uint64_t generation;
     hwaddr mapping_offset;
 } CXLType2DirectValidatedRun;
@@ -6387,6 +6397,8 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
     int result = CXL_GPU_ERROR_INVALID_VALUE;
     int64_t phase_begin_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
     uint64_t target_page_size = qemu_target_page_size();
+    uint32_t file_run_count = 0;
+    uint32_t ordinary_run_count = 0;
 
     *failure_stage_out = NULL;
     *failure_index_out = SIZE_MAX;
@@ -6518,14 +6530,11 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
         if (mr != dax_mr) {
             if (allow_ordinary_source && ordinary_source_out &&
                 memory_region_is_ram(mr)) {
-                /*
-                 * knockout: a mixed model/RAM batch remains one ordinary
-                 * HtoD batch. Split it only when a real workload proves that
-                 * the avoided model bytes outweigh the extra ordering state.
-                 */
-                *ordinary_source_out = true;
-                result = CXL_GPU_SUCCESS;
-                goto out;
+                validated[i].ordinary_host =
+                    (const uint8_t *)memory_region_get_ram_ptr(mr) +
+                    translated;
+                ordinary_run_count++;
+                continue;
             }
             *failure_stage_out = "address-translate";
             *failure_index_out = i;
@@ -6558,6 +6567,14 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
         validated[i].mapping = mapping;
         validated[i].generation = mapping->generation;
         validated[i].mapping_offset = translated;
+        file_run_count++;
+    }
+    if (ordinary_run_count &&
+        (!file_run_count || ct2d->model_supply.route !=
+                                CXL_TYPE2_MODEL_SUPPLY_CXL_DIRECT)) {
+        *ordinary_source_out = true;
+        result = CXL_GPU_SUCCESS;
+        goto out;
     }
     ct2d->paired_case.active_direct_register_resolve_ns +=
         qemu_clock_get_ns(QEMU_CLOCK_HOST) - phase_begin_ns;
@@ -6572,7 +6589,8 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
         bool duplicate = false;
 
         for (uint32_t j = 0; j < i; j++) {
-            if (validated[j].mapping == validated[i].mapping &&
+            if (validated[i].mapping &&
+                validated[j].mapping == validated[i].mapping &&
                 validated[j].mapping_offset == validated[i].mapping_offset &&
                 validated[j].length == validated[i].length) {
                 duplicate = true;
@@ -6607,6 +6625,11 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
             const CXLType2ModelMember *member;
 
             run->source_fd = -1;
+            run->length = validated[i].length;
+            if (validated[i].ordinary_host) {
+                run->ordinary_host = validated[i].ordinary_host;
+                continue;
+            }
             if (validated[i].mapping->allow_write ||
                 virtio_shared_memory_pin_range(
                     shmem, validated[i].mapping_offset, validated[i].length,
@@ -6637,7 +6660,6 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
             run->file_offset = mapping_file_offset +
                                validated[i].mapping_offset -
                                pinned_mapping->offset;
-            run->length = validated[i].length;
             run->mapping_generation = pinned_generation;
             run->source_device = source_stat.st_dev;
             run->source_inode = source_stat.st_ino;
@@ -7241,7 +7263,9 @@ static bool cxl_type2_direct_range_is_valid(
     for (uint32_t i = 0; i < range->run_count && remaining; i++) {
         CXLType2DirectRun *run = &source->runs[range->first_run + i];
 
-        if (source->pageable_alias ? run->source_fd < 0 : !run->physical) {
+        if (source->pageable_alias
+                ? ((run->source_fd >= 0) == (run->ordinary_host != NULL))
+                : !run->physical) {
             return false;
         }
         if (skip >= run->length) {
@@ -7264,6 +7288,7 @@ typedef struct CXLType2PageableAliasPiece {
     uint64_t destination;
     uint64_t source_index;
     uint32_t model_member_index;
+    bool file_backed;
 } CXLType2PageableAliasPiece;
 
 static gint cxl_type2_pageable_alias_piece_compare(gconstpointer left,
@@ -7350,6 +7375,11 @@ static int cxl_type2_direct_alias_submit(
             piece = (CXLType2PageableAliasPiece) {
                 .source = {
                     .fd = run->source_fd,
+                    .host_copy_source = run->ordinary_host
+                                            ? (const uint8_t *)
+                                                      run->ordinary_host +
+                                                  skip
+                                            : NULL,
                     .file_offset = run->file_offset + skip,
                     .destination_offset = allocation_offset + copied,
                     .length = chunk,
@@ -7364,6 +7394,7 @@ static int cxl_type2_direct_alias_submit(
                 .destination = wire.destination + copied,
                 .source_index = i,
                 .model_member_index = run->model_member_index,
+                .file_backed = run->source_fd >= 0,
             };
             g_array_append_val(pieces, piece);
             copied += chunk;
@@ -7399,7 +7430,7 @@ static int cxl_type2_direct_alias_submit(
             *failure_stage = "alias-geometry";
             goto out;
         }
-        if (piece->model_member_index >=
+        if (piece->file_backed && piece->model_member_index >=
             ct2d->model_supply.member_manifest.member_count) {
             *fail_index = i;
             *failure_stage = "member-range-admission";
@@ -7411,9 +7442,15 @@ static int cxl_type2_direct_alias_submit(
     for (size_t i = 0; i < pieces->len; i++) {
         CXLType2PageableAliasPiece *piece = &g_array_index(
             pieces, CXLType2PageableAliasPiece, i);
-        const CXLType2ModelMember *member =
+        const CXLType2ModelMember *member = piece->file_backed
+            ?
             &ct2d->model_supply.member_manifest.members[
-                piece->model_member_index];
+                piece->model_member_index]
+            : NULL;
+
+        if (!piece->file_backed) {
+            continue;
+        }
 
         QDict *event = cxl_type2_model_supply_event(ct2d);
 
@@ -7494,6 +7531,8 @@ static int cxl_type2_direct_alias_submit(
         cxl_type2_qdict_put_u64(event, "alias_offset", alias);
         cxl_type2_qdict_put_u64(event, "file_mapped_bytes",
                                 pageable->file_mapped_bytes);
+        cxl_type2_qdict_put_u64(event, "host_composition_copy_bytes",
+                                pageable->host_composition_copy_bytes);
         cxl_type2_qdict_put_u64(event, "derived_boundary_pages",
                                 pageable->derived_boundary_pages);
         cxl_type2_qdict_put_u64(event, "derived_boundary_copy_bytes",
@@ -7513,6 +7552,8 @@ static int cxl_type2_direct_alias_submit(
         ct2d->model_supply.alias_logical_bytes += covered;
         ct2d->model_supply.logical_source_view_bytes += covered;
         ct2d->model_supply.file_mapped_bytes += pageable->file_mapped_bytes;
+        ct2d->model_supply.host_composition_copy_bytes +=
+            pageable->host_composition_copy_bytes;
         ct2d->model_supply.derived_boundary_pages +=
             pageable->derived_boundary_pages;
         ct2d->model_supply.derived_boundary_copy_bytes +=
@@ -7520,15 +7561,18 @@ static int cxl_type2_direct_alias_submit(
         ct2d->model_supply.boundary_composition_wall_ns += duration_ns;
         ct2d->model_supply.guard_bytes += pageable->guard_bytes;
         if (pageable->file_mapped_bytes +
+                pageable->host_composition_copy_bytes +
                 pageable->derived_boundary_copy_bytes +
                 pageable->guard_bytes >
             covered) {
             ct2d->model_supply.page_collateral_bytes +=
                 pageable->file_mapped_bytes +
+                pageable->host_composition_copy_bytes +
                 pageable->derived_boundary_copy_bytes +
                 pageable->guard_bytes - covered;
         }
-        ct2d->model_supply.logical_direct_bytes += covered;
+        ct2d->model_supply.logical_direct_bytes +=
+            covered - pageable->host_composition_copy_bytes;
     }
     *logical_enqueued = range_count;
     *fail_index = SIZE_MAX;
