@@ -6392,6 +6392,7 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
     MemoryRegion *dax_mr;
     const uint8_t *range_base;
     GArray *resolved_runs = NULL;
+    GArray *mapped_runs = NULL;
     CXLType2DirectRangeLayout *range_layouts = NULL;
     uint64_t fail_index;
     int result = CXL_GPU_ERROR_INVALID_VALUE;
@@ -6506,69 +6507,107 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
         *failure_stage_out = "run-capacity";
         goto out;
     }
-    validated = (CXLType2DirectValidatedRun *)resolved_runs->data;
     ct2d->paired_case.active_direct_register_validate_ns +=
         qemu_clock_get_ns(QEMU_CLOCK_HOST) - phase_begin_ns;
     phase_begin_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
 
-    /* This pass has no mapping, CUDA, or table side effects. */
-    for (uint32_t i = 0; i < resolved_runs->len; i++) {
-        hwaddr translated = 0;
-        hwaddr translated_len;
-        MemoryRegion *mr;
-        VirtioSharedMemoryMapping *mapping;
+    /* Split contiguous guest runs at actual RAM and DAX mapping boundaries. */
+    mapped_runs = g_array_new(false, false,
+                              sizeof(CXLType2DirectValidatedRun));
+    for (uint32_t range_index = 0; range_index < header.range_count;
+         range_index++) {
+        uint32_t old_first = range_layouts[range_index].first_run;
+        uint32_t old_count = range_layouts[range_index].run_count;
 
-        translated_len = validated[i].length;
-        mr = address_space_translate(
-            &address_space_memory, validated[i].guest_phys_addr,
-            &translated, &translated_len, false, MEMTXATTRS_UNSPECIFIED);
-        if (translated_len < validated[i].length) {
-            *failure_stage_out = "address-translate";
-            *failure_index_out = i;
-            goto out;
-        }
-        if (mr != dax_mr) {
-            if (allow_ordinary_source && ordinary_source_out &&
-                memory_region_is_ram(mr)) {
-                validated[i].ordinary_host =
-                    (const uint8_t *)memory_region_get_ram_ptr(mr) +
-                    translated;
-                ordinary_run_count++;
-                continue;
+        range_layouts[range_index].first_run = mapped_runs->len;
+        for (uint32_t old_index = 0; old_index < old_count; old_index++) {
+            CXLType2DirectValidatedRun original = g_array_index(
+                resolved_runs, CXLType2DirectValidatedRun,
+                old_first + old_index);
+            hwaddr guest_phys_addr = original.guest_phys_addr;
+            uint64_t remaining = original.length;
+
+            while (remaining) {
+                CXLType2DirectValidatedRun run = {
+                    .guest_phys_addr = guest_phys_addr,
+                };
+                hwaddr translated = 0;
+                hwaddr translated_len = remaining;
+                MemoryRegion *mr = address_space_translate(
+                    &address_space_memory, guest_phys_addr, &translated,
+                    &translated_len, false, MEMTXATTRS_UNSPECIFIED);
+
+                if (!translated_len) {
+                    *failure_stage_out = "address-translate";
+                    *failure_index_out = old_first + old_index;
+                    goto out;
+                }
+                run.length = MIN(remaining, translated_len);
+                if (mr != dax_mr) {
+                    if (!allow_ordinary_source || !ordinary_source_out ||
+                        !memory_region_is_ram(mr)) {
+                        *failure_stage_out = "address-translate";
+                        *failure_index_out = old_first + old_index;
+                        goto out;
+                    }
+                    run.ordinary_host =
+                        (const uint8_t *)memory_region_get_ram_ptr(mr) +
+                        translated;
+                    ordinary_run_count++;
+                } else {
+                    VirtioSharedMemoryMapping *mapping =
+                        virtio_find_shmem_map(shmem, translated, 1);
+                    uint64_t mapping_offset;
+
+                    if (!mapping || translated < mapping->offset) {
+                        *failure_stage_out = "mapping-lookup";
+                        *failure_index_out = old_first + old_index;
+                        goto out;
+                    }
+                    if (mapping->revoke_pending) {
+                        *failure_stage_out = "mapping-revoking";
+                        *failure_index_out = old_first + old_index;
+                        goto out;
+                    }
+                    mapping_offset = translated - mapping->offset;
+                    run.length = MIN(run.length,
+                                     mapping->len - mapping_offset);
+                    run.mapping = mapping;
+                    run.generation = mapping->generation;
+                    run.mapping_offset = translated;
+                    file_run_count++;
+                    for (uint32_t j = 0; j < mapped_runs->len; j++) {
+                        CXLType2DirectValidatedRun *previous = &g_array_index(
+                            mapped_runs, CXLType2DirectValidatedRun, j);
+
+                        if (previous->mapping == mapping &&
+                            ranges_overlap(previous->mapping_offset,
+                                           previous->length, translated,
+                                           run.length) &&
+                            (previous->mapping_offset != translated ||
+                             previous->length != run.length)) {
+                            *failure_stage_out = "request-run-overlap";
+                            *failure_index_out = old_first + old_index;
+                            goto out;
+                        }
+                    }
+                }
+                if (mapped_runs->len == UINT32_MAX) {
+                    *failure_stage_out = "run-capacity";
+                    *failure_index_out = range_index;
+                    goto out;
+                }
+                g_array_append_val(mapped_runs, run);
+                guest_phys_addr += run.length;
+                remaining -= run.length;
             }
-            *failure_stage_out = "address-translate";
-            *failure_index_out = i;
-            goto out;
         }
-        mapping = virtio_find_shmem_map(
-            shmem, translated, validated[i].length);
-        if (!mapping) {
-            *failure_stage_out = "mapping-lookup";
-            *failure_index_out = i;
-            goto out;
-        }
-        if (mapping->revoke_pending) {
-            *failure_stage_out = "mapping-revoking";
-            *failure_index_out = i;
-            goto out;
-        }
-        for (uint32_t j = 0; j < i; j++) {
-            if (validated[j].mapping == mapping &&
-                ranges_overlap(validated[j].mapping_offset,
-                               validated[j].length, translated,
-                               validated[i].length) &&
-                (validated[j].mapping_offset != translated ||
-                 validated[j].length != validated[i].length)) {
-                *failure_stage_out = "request-run-overlap";
-                *failure_index_out = i;
-                goto out;
-            }
-        }
-        validated[i].mapping = mapping;
-        validated[i].generation = mapping->generation;
-        validated[i].mapping_offset = translated;
-        file_run_count++;
+        range_layouts[range_index].run_count =
+            mapped_runs->len - range_layouts[range_index].first_run;
     }
+    g_array_free(resolved_runs, true);
+    resolved_runs = g_steal_pointer(&mapped_runs);
+    validated = (CXLType2DirectValidatedRun *)resolved_runs->data;
     if (ordinary_run_count &&
         (!file_run_count || ct2d->model_supply.route !=
                                 CXL_TYPE2_MODEL_SUPPLY_CXL_DIRECT)) {
@@ -7216,6 +7255,9 @@ out:
     g_free(range_layouts);
     if (resolved_runs) {
         g_array_free(resolved_runs, true);
+    }
+    if (mapped_runs) {
+        g_array_free(mapped_runs, true);
     }
     return result;
 }

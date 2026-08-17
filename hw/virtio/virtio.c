@@ -3282,12 +3282,22 @@ int virtio_shared_memory_mapping_dup_source(
 VirtioSharedMemoryMapping *virtio_find_shmem_map(VirtioSharedMemory *shmem,
                                           hwaddr offset, uint64_t size)
 {
+    VirtioSharedMemoryMapping *mapping;
     VirtioSharedMemoryMapping key = {
         .offset = offset,
         .len = size,
     };
 
-    return size ? g_tree_lookup(shmem->map_index, &key) : NULL;
+    if (!size) {
+        return NULL;
+    }
+    mapping = g_tree_lookup(shmem->map_index, &key);
+    if (!mapping || offset < mapping->offset ||
+        offset - mapping->offset >= mapping->len ||
+        size > mapping->len - (offset - mapping->offset)) {
+        return NULL;
+    }
+    return mapping;
 }
 
 static int virtio_revoke_shmem_mapping(VirtioSharedMemory *shmem,
