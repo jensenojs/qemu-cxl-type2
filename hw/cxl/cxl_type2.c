@@ -4107,6 +4107,11 @@ cxl_type2_graph_generation_consumers_snapshot(CXLType2State *ct2d,
           g_array_new(false, false, sizeof(CXLType2AliasLaunchBinding));
     }
     g_array_append_val(exec->nodes, node);
+    if (ct2d->model_supply.route == CXL_TYPE2_MODEL_SUPPLY_CXL_DIRECT &&
+        hetgpu_cuda_graph_kernel_node_set_params(hetgpu, nodes[i], &params) !=
+            CXL_GPU_SUCCESS) {
+      goto failed;
+    }
   }
   return exec;
 

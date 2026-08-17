@@ -668,6 +668,9 @@ int hetgpu_cuda_graph_exec_kernel_node_set_params(
     HetGPUFunction function, const HetGPULaunchConfig *config, void **args);
 int hetgpu_cuda_graph_kernel_node_get_params(HetGPUState *state, HetGPUGraphNode graph_node,
                                              CudaKernelNodeParams *params);
+int hetgpu_cuda_graph_kernel_node_set_params(
+    HetGPUState *state, HetGPUGraphNode graph_node,
+    const CudaKernelNodeParams *params);
 int hetgpu_cuda_graph_exec_destroy(HetGPUState *state,
                                    HetGPUGraphExec graph_exec);
 int hetgpu_cuda_graph_launch(HetGPUState *state, HetGPUGraphExec graph_exec,
