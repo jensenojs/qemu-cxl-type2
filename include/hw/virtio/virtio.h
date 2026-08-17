@@ -156,6 +156,7 @@ struct VirtioSharedMemory {
     MemoryRegion mr;
     void *host_addr;
     uint64_t size;
+    bool retain_source_fds;
     QTAILQ_HEAD(, VirtioSharedMemoryMapping) mmaps;
     GTree *map_index;
     QSIMPLEQ_ENTRY(VirtioSharedMemory) entry;
@@ -471,12 +472,32 @@ int virtio_shared_memory_pin_range(
  * descriptor keeps the open-file identity alive after the transient mapping
  * pin is released. The function rejects generation, revoke, and stat drift.
  *
+ * The mapping's owner must have declared source fd retention with
+ * virtio_shared_memory_set_source_fd_retention() before installation;
+ * without retention the install path closes the fd and this function
+ * fails with -ESTALE.
+ *
  * Returns: 0 on success, or a negative errno value.
  */
 int virtio_shared_memory_mapping_dup_source(
     VirtioSharedMemoryMapping *mapping, uint64_t generation, int *fd,
     uint64_t *fd_offset, uint64_t *length);
 void virtio_shared_memory_unpin(VirtioSharedMemoryMapping *mapping);
+
+/**
+ * virtio_shared_memory_set_source_fd_retention() - Declare alias consumers
+ * @shmem: VirtioSharedMemory region
+ * @retain: true to keep each mapping's source fd open after installation
+ *
+ * By default virtio_add_shmem_map() closes the source fd once the mmap is
+ * installed: the VMA keeps content accessible and thousands of transient
+ * DAX mappings must not accumulate qemu fds (EMFILE). A device that later
+ * derives alias sources from installed mappings (cxl-type2
+ * cuda-direct-source) declares retention here at realize time, before the
+ * guest can install any mapping.
+ */
+void virtio_shared_memory_set_source_fd_retention(VirtioSharedMemory *shmem,
+                                                  bool retain);
 
 /**
  * virtio_del_shmem_map() - Remove a memory mapping from a shared region

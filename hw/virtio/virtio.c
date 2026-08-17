@@ -3239,7 +3239,26 @@ int virtio_add_shmem_map(VirtioSharedMemory *shmem,
     QTAILQ_INSERT_TAIL(&shmem->mmaps, mapping, link);
     g_tree_insert(shmem->map_index, mapping, mapping);
 
+    /*
+     * The installed VMA keeps the content alive; the source fd is only
+     * needed again when an alias consumer derives a retained fd via
+     * virtio_shared_memory_mapping_dup_source(). Without a declared
+     * consumer, close it here: workloads that page thousands of DAX
+     * mappings (MoE expert paging) otherwise exhaust the qemu fd table
+     * (EMFILE, observed as guest SIGBUS on cnb-c3p-1k08kl5re).
+     */
+    if (!shmem->retain_source_fds) {
+        close(mapping->fd);
+        mapping->fd = -1;
+    }
+
     return 0;
+}
+
+void virtio_shared_memory_set_source_fd_retention(VirtioSharedMemory *shmem,
+                                                  bool retain)
+{
+    shmem->retain_source_fds = retain;
 }
 
 int virtio_shared_memory_mapping_dup_source(

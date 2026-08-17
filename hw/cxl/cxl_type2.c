@@ -13218,7 +13218,7 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp) {
                      "cuda-direct-source=on");
     return;
   }
-  if (ct2d->cuda_direct_source) {
+  if (ct2d->cuda_direct_source || ct2d->model_alias_gate.output) {
     VirtioSharedMemory *source_shmem;
     MemoryRegion *source_mr;
     size_t host_page_size = qemu_real_host_page_size();
@@ -13226,10 +13226,18 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp) {
     if (!ct2d->direct_source_fs ||
         !vhost_user_fs_pci_get_dax(ct2d->direct_source_fs, &source_shmem,
                                    &source_mr)) {
-      error_setg(errp, "cuda-direct-source requires direct-source-fs "
-                       "to reference a realized vhost-user-fs-pci DAX device");
+      error_setg(errp, "cuda-direct-source and the model alias gate require "
+                       "direct-source-fs to reference a realized "
+                       "vhost-user-fs-pci DAX device");
       return;
     }
+    /*
+     * This device derives alias source fds from installed mappings via
+     * virtio_shared_memory_mapping_dup_source(); declare the lease before
+     * the guest can install any mapping so installation retains the fds.
+     */
+    virtio_shared_memory_set_source_fd_retention(source_shmem, true);
+    if (ct2d->cuda_direct_source) {
     if (!!ct2d->direct_registration_tile_size !=
         !!ct2d->direct_registration_padding_limit) {
       error_setg(errp, "direct registration tile and padding limit "
@@ -13241,6 +13249,7 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp) {
       error_setg(errp, "direct registration tile and padding limit "
                        "must be host-page aligned");
       return;
+    }
     }
   }
 
