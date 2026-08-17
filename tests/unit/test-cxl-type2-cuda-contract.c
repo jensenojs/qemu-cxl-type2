@@ -686,6 +686,7 @@ static void test_cuda_pageable_alias_composite_remap(void)
     uint64_t epoch = 0;
     uint64_t alias_one = 0;
     uint64_t alias_two = 0;
+    size_t removed_count = 0;
     const char *reason = NULL;
     int fd;
     pid_t child;
@@ -709,7 +710,7 @@ static void test_cuda_pageable_alias_composite_remap(void)
                     5 * page_size);
     g_assert_cmpint(fstat(fd, &source_stat), ==, 0);
 
-    sources[0] = alias_source(fd, &source_stat, 32, 0,
+    sources[0] = alias_source(fd, &source_stat, 0, 0,
                               page_size - 64, 1);
     sources[1] = alias_source(fd, &source_stat, 2 * page_size + 17,
                               page_size - 64, 128, 1);
@@ -725,6 +726,13 @@ static void test_cuda_pageable_alias_composite_remap(void)
         &table, UINT64_C(0x100000), 3 * page_size, &epoch));
     g_assert_true(cxl_type2_cuda_generation_population_complete(
         &table, UINT64_C(0x100000), 3 * page_size));
+    g_assert_false(cxl_type2_cuda_allocation_map_pageable_alias(
+        &table, UINT64_C(0x100000), epoch, 1, sources,
+        G_N_ELEMENTS(sources), invalid_source_calls,
+        G_N_ELEMENTS(invalid_source_calls), 0, logical_bytes, 32,
+        &alias_two, &reason));
+    g_assert_cmpstr(reason, ==, "alias-source-call-order-invalid");
+    reason = NULL;
     g_assert_true(cxl_type2_cuda_allocation_map_pageable_alias(
         &table, UINT64_C(0x100000), epoch, 1, sources,
         G_N_ELEMENTS(sources), source_call_one, G_N_ELEMENTS(source_call_one),
@@ -739,13 +747,6 @@ static void test_cuda_pageable_alias_composite_remap(void)
     g_assert_cmpuint(
         table.entries[0].pageable_alias->contributing_source_call_ids[1],
         ==, 3);
-    g_assert_false(cxl_type2_cuda_allocation_map_pageable_alias(
-        &table, UINT64_C(0x100000), epoch, 1, sources,
-        G_N_ELEMENTS(sources), invalid_source_calls,
-        G_N_ELEMENTS(invalid_source_calls), 0, logical_bytes, 32,
-        &alias_two, &reason));
-    g_assert_cmpstr(reason, ==, "alias-source-call-order-invalid");
-    reason = NULL;
     g_assert_cmpuint(table.entries[0].pageable_alias->file_mapped_bytes,
                      ==, page_size);
     g_assert_cmpuint(
@@ -841,16 +842,23 @@ static void test_cuda_pageable_alias_composite_remap(void)
         sources[i].mapping_generation = 2;
     }
     reason = NULL;
+    g_assert_false(cxl_type2_cuda_allocation_map_pageable_alias(
+        &table, UINT64_C(0x100000), epoch, 2, sources,
+        G_N_ELEMENTS(sources), source_call_two, G_N_ELEMENTS(source_call_two),
+        0, logical_bytes, 32, &alias_two, &reason));
+    g_assert_cmpstr(reason, ==, "alias-consumer-in-flight");
+    g_assert_true(cxl_type2_cuda_allocation_unbind_graph_alias(
+        &table, UINT64_C(0x100000), epoch, alias_one));
+    g_assert_true(cxl_type2_cuda_allocation_remove_pageable_aliases(
+        &table, UINT64_C(0x100000), epoch, 0, logical_bytes + 32,
+        &removed_count));
+    g_assert_cmpuint(removed_count, ==, 1);
+    reason = NULL;
     g_assert_true(cxl_type2_cuda_allocation_map_pageable_alias(
         &table, UINT64_C(0x100000), epoch, 2, sources,
         G_N_ELEMENTS(sources), source_call_two, G_N_ELEMENTS(source_call_two),
         0, logical_bytes, 32, &alias_two, &reason));
     g_assert_null(reason);
-    g_assert_cmphex(alias_two, ==, alias_one);
-    g_assert_false(cxl_type2_cuda_allocation_drop_pageable_alias(
-        &table, UINT64_C(0x100000), epoch, 2));
-    g_assert_true(cxl_type2_cuda_allocation_unbind_graph_alias(
-        &table, UINT64_C(0x100000), epoch, alias_two));
     g_assert_true(cxl_type2_cuda_allocation_drop_pageable_alias(
         &table, UINT64_C(0x100000), epoch, 2));
     g_assert_true(cxl_type2_cuda_allocation_forget(
@@ -920,27 +928,32 @@ static void test_cuda_pageable_alias_appends_allocation_subranges(void)
     g_assert_true(cxl_type2_cuda_generation_prefetch_required(
         &table, identity, 2, &prefetch_required));
     g_assert_true(prefetch_required);
-    g_assert_cmphex(alias, ==, stable_alias);
-    g_assert_cmpmem((const uint8_t *)(uintptr_t)alias, 3 * page_size,
-                    file_bytes, 3 * page_size);
-    g_assert_true(cxl_type2_cuda_pageable_alias_contains(
-        table.entries[0].pageable_alias, 0));
-    g_assert_true(cxl_type2_cuda_pageable_alias_contains(
-        table.entries[0].pageable_alias, 3 * page_size - 1));
-    g_assert_false(cxl_type2_cuda_pageable_alias_contains(
-        table.entries[0].pageable_alias, 3 * page_size));
+    g_assert_cmphex(alias, !=, stable_alias);
+    g_assert_cmpmem((const uint8_t *)(uintptr_t)stable_alias, page_size,
+                    file_bytes, page_size);
+    g_assert_cmpmem((const uint8_t *)(uintptr_t)alias, 2 * page_size,
+                    file_bytes + page_size, 2 * page_size);
+    g_assert_nonnull(cxl_type2_cuda_allocation_pageable_alias_for_offset(
+        &table.entries[0], 0));
+    g_assert_nonnull(cxl_type2_cuda_allocation_pageable_alias_for_offset(
+        &table.entries[0], 3 * page_size - 1));
+    g_assert_null(cxl_type2_cuda_allocation_pageable_alias_for_offset(
+        &table.entries[0], 3 * page_size));
     source = alias_source(fd, &source_stat, 0, 0, page_size, 3);
     source_call = 3;
     g_assert_false(cxl_type2_cuda_allocation_map_pageable_alias(
         &table, base, epoch, 3, &source, 1, &source_call, 1,
         page_size / 2, page_size, 0, &alias, &reason));
     g_assert_cmpstr(reason, ==, "alias-subrange-overlap");
-    g_assert_cmpmem((const uint8_t *)(uintptr_t)stable_alias, 3 * page_size,
-                    file_bytes, 3 * page_size);
+    g_assert_cmpmem((const uint8_t *)(uintptr_t)stable_alias, page_size,
+                    file_bytes, page_size);
+    g_assert_cmpmem((const uint8_t *)(uintptr_t)alias, 2 * page_size,
+                    file_bytes + page_size, 2 * page_size);
     g_assert_true(cxl_type2_cuda_allocation_acquire_pageable_alias_for_address(
         &table, base + page_size, CXL_TYPE2_CUDA_ALIAS_NORMAL,
         &identity, &generation, &alias));
-    g_assert_cmphex(alias, ==, stable_alias + page_size);
+    g_assert_cmpmem((const uint8_t *)(uintptr_t)alias, 2 * page_size,
+                    file_bytes + page_size, 2 * page_size);
     g_assert_cmpuint(generation, ==, 2);
     g_assert_true(cxl_type2_cuda_allocation_release_pageable_alias(
         &table, base, epoch, generation, CXL_TYPE2_CUDA_ALIAS_NORMAL));
