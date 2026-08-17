@@ -86,6 +86,7 @@ extern int LZ4_decompress_safe(const char *src, char *dst, int compressed_size,
 #define CXL_CUDA_MEMHOSTREGISTER_PORTABLE 0x01U
 #define CXL_CUDA_MEMHOSTREGISTER_DEVICEMAP 0x02U
 #define CXL_CUDA_DEVICE_ATTRIBUTE_CAN_MAP_HOST_MEMORY 19
+#define CXL_TYPE2_MEDIA_DIGEST_CHUNK_BYTES (UINT64_C(4) * MiB)
 
 static int64_t cxl_type2_host_monotonic_ns(void) {
   struct timespec now;
@@ -2887,8 +2888,8 @@ static QDict *cxl_type2_model_supply_alias_release_event(
 }
 
 static int cxl_type2_model_alias_register(CXLType2State *ct2d,
-                                          CXLType2CudaAllocation *allocation,
-                                          CXLType2CudaPageableAlias *alias) {
+                                           CXLType2CudaAllocation *allocation,
+                                           CXLType2CudaPageableAlias *alias) {
   HetGPUDevicePtr mapping_device = 0;
   int result;
 
@@ -2918,6 +2919,147 @@ static int cxl_type2_model_alias_register(CXLType2State *ct2d,
   alias->device_alias = mapping_device + alias->pointer_bias;
   allocation->device_alias = alias->device_alias;
   return CXL_GPU_SUCCESS;
+}
+
+static bool cxl_type2_media_digest_enabled(void) {
+  const char *value = getenv("CXL_TYPE2_MEDIA_DIGEST");
+
+  return value && !strcmp(value, "1");
+}
+
+static QDict *cxl_type2_model_supply_media_digest_event(
+    CXLType2State *ct2d, const CXLType2CudaAllocation *allocation,
+    const CXLType2CudaPageableAlias *alias, uint64_t destination_offset,
+    uint64_t bytes, const char *result) {
+  QDict *event = cxl_type2_model_supply_event(ct2d);
+
+  cxl_type2_qdict_put_u64(event, "destination_offset", destination_offset);
+  cxl_type2_qdict_put_u64(event, "bytes", bytes);
+  cxl_type2_qdict_put_u64(event, "alias_offset", alias->device_alias);
+  cxl_type2_qdict_put_u64(event, "destination_allocation_id", allocation->base);
+  cxl_type2_qdict_put_u64(event, "content_generation",
+                          alias->content_generation);
+  qdict_put_str(event, "result", result);
+  return event;
+}
+
+static void cxl_type2_model_supply_media_digest_error(
+    CXLType2State *ct2d, const CXLType2CudaAllocation *allocation,
+    const CXLType2CudaPageableAlias *alias, uint64_t destination_offset,
+    uint64_t bytes, const char *reason) {
+  QDict *event = cxl_type2_model_supply_media_digest_event(
+      ct2d, allocation, alias, destination_offset, bytes, "error");
+
+  qdict_put_str(event, "reason", reason);
+  cxl_type2_model_supply_emit("KIMI_MODEL_SUPPLY_MEDIA_DIGEST", event);
+}
+
+static void cxl_type2_model_supply_media_digests(
+    CXLType2State *ct2d, const CXLType2CudaAllocation *allocation,
+    const CXLType2CudaPageableAlias *alias) {
+  QList *covered_ranges = qlist_new();
+  uint64_t previous_end = 0;
+
+  if (!alias->reservation || !alias->device_alias || !alias->logical_bytes ||
+      alias->destination_offset > UINT64_MAX - alias->logical_bytes) {
+    cxl_type2_model_supply_media_digest_error(
+        ct2d, allocation, alias, alias->destination_offset, alias->logical_bytes,
+        "alias-media-range-unavailable");
+    qobject_unref(covered_ranges);
+    return;
+  }
+
+  for (size_t i = 0; i < alias->source_count; i++) {
+    const CXLType2CudaAliasSource *source = &alias->sources[i];
+    uint64_t source_begin = source->destination_offset;
+    uint64_t source_end;
+    QDict *covered_range;
+    struct stat source_stat;
+
+    if (source_begin >= alias->logical_bytes) {
+      continue;
+    }
+    if (!source->length || source->length > UINT64_MAX - source_begin) {
+      cxl_type2_model_supply_media_digest_error(
+          ct2d, allocation, alias, alias->destination_offset + source_begin, 0,
+          "alias-source-range-unavailable");
+      qobject_unref(covered_ranges);
+      return;
+    }
+    if (source->fd >= 0 &&
+        (fstat(source->fd, &source_stat) < 0 || source_stat.st_size < 0 ||
+         (uint64_t)source_stat.st_dev != source->stat_device ||
+         (uint64_t)source_stat.st_ino != source->stat_inode ||
+         (uint64_t)source_stat.st_size != source->stat_size ||
+         (uint32_t)source_stat.st_mode != source->stat_mode ||
+         source->length > source->stat_size ||
+         source->file_offset > source->stat_size - source->length)) {
+      cxl_type2_model_supply_media_digest_error(
+          ct2d, allocation, alias, alias->destination_offset + source_begin,
+          source->length, "alias-source-stat-mismatch");
+      qobject_unref(covered_ranges);
+      return;
+    }
+    source_end = MIN(alias->logical_bytes, source_begin + source->length);
+    if (source_begin < previous_end) {
+      cxl_type2_model_supply_media_digest_error(
+          ct2d, allocation, alias, alias->destination_offset + source_begin,
+          source_end - source_begin, "alias-source-coverage-overlap");
+      qobject_unref(covered_ranges);
+      return;
+    }
+    covered_range = qdict_new();
+    cxl_type2_qdict_put_u64(covered_range, "destination_offset",
+                            alias->destination_offset + source_begin);
+    cxl_type2_qdict_put_u64(covered_range, "bytes", source_end - source_begin);
+    qlist_append(covered_ranges, covered_range);
+    previous_end = source_end;
+  }
+  {
+    QDict *event = cxl_type2_model_supply_media_digest_event(
+        ct2d, allocation, alias, alias->destination_offset, alias->logical_bytes,
+        "pass");
+
+    qdict_put(event, "covered_ranges", covered_ranges);
+    cxl_type2_model_supply_emit("KIMI_MODEL_SUPPLY_MEDIA_DIGEST_WINDOW", event);
+  }
+
+  for (size_t i = 0; i < alias->source_count; i++) {
+    const CXLType2CudaAliasSource *source = &alias->sources[i];
+    uint64_t source_begin = source->destination_offset;
+    uint64_t source_end;
+
+    if (source_begin >= alias->logical_bytes) {
+      continue;
+    }
+    if (!source->length || source->length > UINT64_MAX - source_begin) {
+      continue;
+    }
+    source_end = MIN(alias->logical_bytes, source_begin + source->length);
+    while (source_begin < source_end) {
+      uint64_t destination_offset = alias->destination_offset + source_begin;
+      uint64_t block_remaining = CXL_TYPE2_MEDIA_DIGEST_CHUNK_BYTES -
+          destination_offset % CXL_TYPE2_MEDIA_DIGEST_CHUNK_BYTES;
+      uint64_t bytes = MIN(source_end - source_begin, block_remaining);
+      g_autoptr(GChecksum) checksum = g_checksum_new(G_CHECKSUM_SHA256);
+      QDict *event;
+
+      if (!checksum) {
+        cxl_type2_model_supply_media_digest_error(
+            ct2d, allocation, alias, destination_offset, bytes,
+            "sha256-allocation-failed");
+        return;
+      }
+      g_checksum_update(checksum,
+                        (const guchar *)alias->reservation + source_begin,
+                        bytes);
+      event = cxl_type2_model_supply_media_digest_event(
+          ct2d, allocation, alias, destination_offset, bytes, "pass");
+      qdict_put_str(event, "sha256", g_checksum_get_string(checksum));
+      cxl_type2_model_supply_emit("KIMI_MODEL_SUPPLY_MEDIA_DIGEST", event);
+      source_begin += bytes;
+    }
+  }
 }
 
 static int
@@ -7622,6 +7764,9 @@ static int cxl_type2_direct_alias_submit(
     cxl_type2_qdict_put_u64(event, "duration_ns", duration_ns);
     cxl_type2_model_supply_hash_event(ct2d->model_supply.alias_geometry, event);
     cxl_type2_model_supply_emit("KIMI_MODEL_SUPPLY_ALIAS", event);
+    if (cxl_type2_media_digest_enabled()) {
+      cxl_type2_model_supply_media_digests(ct2d, allocation, pageable);
+    }
 
     if (remap) {
       ct2d->model_supply.alias_remaps++;
