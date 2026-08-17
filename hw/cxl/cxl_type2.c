@@ -10716,6 +10716,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd) {
       uint64_t graph_exec_id = ct2d->gpu_cmd.params[0];
       uint64_t graph_id = ct2d->gpu_cmd.params[1];
       HetGPUGraphExecUpdateResultInfo info = {0};
+      CXLType2GraphExecGenerationConsumers *consumers = NULL;
 
       if (graph_exec_id > UINT32_MAX || graph_id > UINT32_MAX ||
           graph_exec_id >= ct2d->gpu_cmd.num_graph_execs ||
@@ -10726,21 +10727,26 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd) {
         break;
       }
       if (ct2d->model_supply.route == CXL_TYPE2_MODEL_SUPPLY_CXL_DIRECT) {
-        cxl_type2_model_supply_fail(
-            ct2d, ct2d->gpu_cmd.call_id, "driver-binding",
-            "graph-exec-update-not-qualified", UINT64_MAX, 0, 0, 0);
-        ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_SUPPORTED;
-        break;
+        consumers = cxl_type2_graph_generation_consumers_snapshot(
+            ct2d, ct2d->gpu_cmd.graphs[graph_id], graph_exec_id);
+        if (!consumers) {
+          cxl_type2_model_supply_fail(
+              ct2d, ct2d->gpu_cmd.call_id, "driver-binding",
+              "graph-update-consumer-snapshot-unavailable", UINT64_MAX, 0, 0,
+              0);
+          ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+          break;
+        }
       }
       int cuda_result = hetgpu_cuda_graph_exec_update(
           hetgpu, ct2d->gpu_cmd.graph_execs[graph_exec_id],
           ct2d->gpu_cmd.graphs[graph_id], &info);
       ct2d->gpu_cmd.cmd_result = cuda_result;
       if (cuda_result == CXL_GPU_SUCCESS) {
-        CXLType2GraphExecGenerationConsumers *consumers =
-            cxl_type2_graph_generation_consumers_snapshot(
-                ct2d, ct2d->gpu_cmd.graphs[graph_id], graph_exec_id);
-
+        if (!consumers) {
+          consumers = cxl_type2_graph_generation_consumers_snapshot(
+              ct2d, ct2d->gpu_cmd.graphs[graph_id], graph_exec_id);
+        }
         if (consumers) {
           cxl_type2_graph_generation_consumers_set(ct2d, graph_exec_id,
                                                    consumers);
@@ -10748,6 +10754,8 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd) {
           cxl_type2_generation_reuse_fail(
               ct2d, "graph-update-consumer-snapshot-unavailable");
         }
+      } else {
+        cxl_type2_graph_exec_generation_consumers_free(consumers);
       }
       ct2d->gpu_cmd.results[0] = (uint64_t)(int64_t)info.result;
       HetGPUGraphNode nodes[] = {info.error_node, info.error_from_node};
