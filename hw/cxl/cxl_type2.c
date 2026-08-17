@@ -3513,16 +3513,18 @@ static bool cxl_type2_model_consumer_validate(
                     layout->offsets[root->parameter_index] ||
                 root->parameter_size !=
                     layout->sizes[root->parameter_index] ||
-                root->parameter_size != sizeof(pointer) ||
                 !params[root->parameter_index]) {
                 *reason = "consumer-root-not-visible";
                 return false;
             }
+            /* Address roots also contain scalar indices and strides. */
+            if (root->parameter_size != sizeof(pointer)) {
+                continue;
+            }
             memcpy(&pointer, params[root->parameter_index], sizeof(pointer));
             classification = cxl_type2_model_param_classify(ct2d, pointer);
             if (classification == CXL_TYPE2_MODEL_PARAM_UNCLASSIFIED) {
-                *reason = "consumer-root-unclassified";
-                return false;
+                continue;
             }
             if (classification == CXL_TYPE2_MODEL_PARAM_ALIAS ||
                 classification == CXL_TYPE2_MODEL_PARAM_GPU_DESTINATION) {
