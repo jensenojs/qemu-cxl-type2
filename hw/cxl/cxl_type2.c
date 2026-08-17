@@ -6623,6 +6623,7 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
             void *mapping_host = NULL;
             struct stat source_stat;
             const CXLType2ModelMember *member;
+            int source_result;
 
             run->source_fd = -1;
             run->length = validated[i].length;
@@ -6630,30 +6631,58 @@ static int cxl_type2_direct_source_register(CXLType2State *ct2d,
                 run->ordinary_host = validated[i].ordinary_host;
                 continue;
             }
-            if (validated[i].mapping->allow_write ||
-                virtio_shared_memory_pin_range(
-                    shmem, validated[i].mapping_offset, validated[i].length,
-                    &pinned_mapping, &pinned_generation, &mapping_host,
-                    NULL, NULL) != 0) {
+            if (validated[i].mapping->allow_write) {
                 result = CXL_GPU_ERROR_INVALID_VALUE;
-                *failure_stage_out = "source-view-resolve";
+                *failure_stage_out = "source-view-writable";
+                *failure_index_out = i;
+                goto rollback;
+            }
+            source_result = virtio_shared_memory_pin_range(
+                shmem, validated[i].mapping_offset, validated[i].length,
+                &pinned_mapping, &pinned_generation, &mapping_host,
+                NULL, NULL);
+            if (source_result != 0) {
+                result = CXL_GPU_ERROR_INVALID_VALUE;
+                *failure_stage_out = "source-view-pin";
                 *failure_index_out = i;
                 goto rollback;
             }
             ct2d->model_supply.mapping_pin_acquires++;
             if (pinned_mapping != validated[i].mapping ||
-                pinned_generation != validated[i].generation ||
-                virtio_shared_memory_mapping_dup_source(
-                    pinned_mapping, pinned_generation, &run->source_fd,
-                    &mapping_file_offset, &mapping_length) != 0 ||
-                validated[i].mapping_offset < pinned_mapping->offset ||
-                validated[i].mapping_offset - pinned_mapping->offset >
-                    UINT64_MAX - mapping_file_offset ||
-                fstat(run->source_fd, &source_stat) != 0) {
+                pinned_generation != validated[i].generation) {
                 virtio_shared_memory_unpin(pinned_mapping);
                 ct2d->model_supply.mapping_pin_releases++;
                 result = CXL_GPU_ERROR_INVALID_VALUE;
-                *failure_stage_out = "source-view-resolve";
+                *failure_stage_out = "source-view-generation";
+                *failure_index_out = i;
+                goto rollback;
+            }
+            source_result = virtio_shared_memory_mapping_dup_source(
+                pinned_mapping, pinned_generation, &run->source_fd,
+                &mapping_file_offset, &mapping_length);
+            if (source_result != 0) {
+                virtio_shared_memory_unpin(pinned_mapping);
+                ct2d->model_supply.mapping_pin_releases++;
+                result = CXL_GPU_ERROR_INVALID_VALUE;
+                *failure_stage_out = "source-view-duplicate";
+                *failure_index_out = i;
+                goto rollback;
+            }
+            if (validated[i].mapping_offset < pinned_mapping->offset ||
+                validated[i].mapping_offset - pinned_mapping->offset >
+                    UINT64_MAX - mapping_file_offset) {
+                virtio_shared_memory_unpin(pinned_mapping);
+                ct2d->model_supply.mapping_pin_releases++;
+                result = CXL_GPU_ERROR_INVALID_VALUE;
+                *failure_stage_out = "source-view-offset";
+                *failure_index_out = i;
+                goto rollback;
+            }
+            if (fstat(run->source_fd, &source_stat) != 0) {
+                virtio_shared_memory_unpin(pinned_mapping);
+                ct2d->model_supply.mapping_pin_releases++;
+                result = CXL_GPU_ERROR_INVALID_VALUE;
+                *failure_stage_out = "source-view-stat";
                 *failure_index_out = i;
                 goto rollback;
             }
