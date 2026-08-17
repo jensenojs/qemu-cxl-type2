@@ -900,6 +900,15 @@ static void test_cuda_pageable_alias_appends_allocation_subranges(void)
         &table, base, epoch, 1, &source, 1, &source_call, 1,
         0, page_size, 0, &stable_alias, &reason));
     g_assert_null(reason);
+    identity = (CXLType2CudaAllocationIdentity) {
+        .base = base,
+        .epoch = epoch,
+    };
+    bool prefetch_required = false;
+
+    g_assert_true(cxl_type2_cuda_generation_prefetch_required(
+        &table, identity, 1, &prefetch_required));
+    g_assert_true(prefetch_required);
 
     source = alias_source(fd, &source_stat, page_size, 0,
                           2 * page_size, 2);
@@ -908,6 +917,9 @@ static void test_cuda_pageable_alias_appends_allocation_subranges(void)
         &table, base, epoch, 2, &source, 1, &source_call, 1,
         page_size, 2 * page_size, 0, &alias, &reason));
     g_assert_null(reason);
+    g_assert_true(cxl_type2_cuda_generation_prefetch_required(
+        &table, identity, 2, &prefetch_required));
+    g_assert_true(prefetch_required);
     g_assert_cmphex(alias, ==, stable_alias);
     g_assert_cmpmem((const uint8_t *)(uintptr_t)alias, 3 * page_size,
                     file_bytes, 3 * page_size);

@@ -467,13 +467,74 @@ static void cxl_type2_cuda_generation_fail(
     }
 }
 
+static CXLType2CudaGenerationRecord *
+cxl_type2_cuda_generation_publish(CXLType2CudaAllocationTable *table,
+                                  CXLType2CudaAllocation *allocation,
+                                  uint64_t generation)
+{
+    CXLType2CudaGenerationRecord *resized;
+    size_t capacity;
+
+    if (!table || !allocation || !generation) {
+        return NULL;
+    }
+    for (size_t i = table->generation_count; i > 0; i--) {
+        CXLType2CudaGenerationRecord *record = &table->generations[i - 1];
+
+        if (record->allocation_base != allocation->base ||
+            record->epoch != allocation->epoch) {
+            continue;
+        }
+        if (record->generation == generation) {
+            record->file_backed_system_uva = allocation->dax_backed;
+            return record;
+        }
+        if (record->generation > generation) {
+            cxl_type2_cuda_generation_fail(table,
+                                           "generation-order-invalid");
+            return NULL;
+        }
+        break;
+    }
+    if (table->generation_count == table->generation_capacity) {
+        capacity = table->generation_capacity
+                       ? table->generation_capacity * 2
+                       : 16;
+        if (capacity < table->generation_capacity ||
+            capacity > SIZE_MAX / sizeof(*table->generations)) {
+            cxl_type2_cuda_generation_fail(table,
+                                           "generation-capacity-overflow");
+            return NULL;
+        }
+        resized = g_try_realloc_n(table->generations, capacity,
+                                  sizeof(*table->generations));
+        if (!resized) {
+            cxl_type2_cuda_generation_fail(table,
+                                           "generation-allocation-failed");
+            return NULL;
+        }
+        table->generations = resized;
+        table->generation_capacity = capacity;
+    }
+    CXLType2CudaGenerationRecord *record =
+        &table->generations[table->generation_count++];
+
+    *record = (CXLType2CudaGenerationRecord) {
+        .allocation_base = allocation->base,
+        .epoch = allocation->epoch,
+        .generation = generation,
+        .file_backed_system_uva = allocation->dax_backed,
+        .prefetch_completion_available = true,
+        .next_boundary = CXL_TYPE2_CUDA_GENERATION_OPEN,
+    };
+    return record;
+}
+
 static CXLType2CudaGenerationRecord *cxl_type2_cuda_generation_current(
     CXLType2CudaAllocationTable *table, CXLType2CudaAllocation *allocation,
     bool population)
 {
     CXLType2CudaGenerationRecord *record = NULL;
-    CXLType2CudaGenerationRecord *resized;
-    size_t capacity;
     uint64_t next_generation = 1;
 
     for (size_t i = table->generation_count; i > 0; i--) {
@@ -501,36 +562,8 @@ static CXLType2CudaGenerationRecord *cxl_type2_cuda_generation_current(
         cxl_type2_cuda_generation_fail(table, "generation-overflow");
         return NULL;
     }
-    if (table->generation_count == table->generation_capacity) {
-        capacity = table->generation_capacity
-                       ? table->generation_capacity * 2
-                       : 16;
-        if (capacity < table->generation_capacity ||
-            capacity > SIZE_MAX / sizeof(*table->generations)) {
-            cxl_type2_cuda_generation_fail(table,
-                                           "generation-capacity-overflow");
-            return NULL;
-        }
-        resized = g_try_realloc_n(table->generations, capacity,
-                                  sizeof(*table->generations));
-        if (!resized) {
-            cxl_type2_cuda_generation_fail(table,
-                                           "generation-allocation-failed");
-            return NULL;
-        }
-        table->generations = resized;
-        table->generation_capacity = capacity;
-    }
-    record = &table->generations[table->generation_count++];
-    *record = (CXLType2CudaGenerationRecord) {
-        .allocation_base = allocation->base,
-        .epoch = allocation->epoch,
-        .generation = next_generation,
-        .file_backed_system_uva = allocation->dax_backed,
-        .prefetch_completion_available = true,
-        .next_boundary = CXL_TYPE2_CUDA_GENERATION_OPEN,
-    };
-    return record;
+    return cxl_type2_cuda_generation_publish(table, allocation,
+                                             next_generation);
 }
 
 static bool cxl_type2_cuda_population_interval_add(
@@ -1241,6 +1274,13 @@ bool cxl_type2_cuda_allocation_map_pageable_alias(
                                         reason)) {
         goto poison;
     }
+    allocation->dax_backed = true;
+    if (!cxl_type2_cuda_generation_publish(table, allocation, generation)) {
+        *reason = table->first_generation_error
+                      ? table->first_generation_error
+                      : "alias-generation-publish-failed";
+        goto poison;
+    }
     if (old_alias) {
         old_alias->owned_reservation = NULL;
         old_alias->reservation = NULL;
@@ -1249,7 +1289,6 @@ bool cxl_type2_cuda_allocation_map_pageable_alias(
     allocation->pageable_alias = alias;
     allocation->content_generation = generation;
     allocation->device_alias = (uintptr_t)alias->reservation;
-    allocation->dax_backed = true;
     *device_alias = allocation->device_alias;
     return true;
 
