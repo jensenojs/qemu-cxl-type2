@@ -1058,13 +1058,13 @@ bool cxl_type2_cuda_allocation_map_pageable_alias(
   }
   total_bytes = logical_bytes + guard_bytes;
   if (destination_offset > allocation->size ||
-      total_bytes > allocation->size - destination_offset ||
+      logical_bytes > allocation->size - destination_offset ||
       total_bytes > UINT64_MAX - (page_size - 1) ||
       allocation->size > UINT64_MAX - (page_size - 1)) {
     *reason = "alias-allocation-bounds";
     return false;
   }
-  range_end = destination_offset + total_bytes;
+  range_end = destination_offset + logical_bytes;
   if (allocation->consumer_refs || allocation->normal_inflight_refs ||
       allocation->graph_binding_refs || allocation->graph_inflight_refs) {
     *reason = "alias-consumer-in-flight";
@@ -1113,7 +1113,7 @@ bool cxl_type2_cuda_allocation_map_pageable_alias(
   }
   alias->content_generation = generation;
   alias->destination_offset = destination_offset;
-  alias->logical_bytes = total_bytes;
+  alias->logical_bytes = logical_bytes;
   alias->guard_bytes = guard_bytes;
 
   for (size_t i = 0; i < source_count; i++) {

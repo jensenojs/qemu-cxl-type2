@@ -7083,11 +7083,13 @@ static int cxl_type2_direct_alias_submit(
   CXLType2CudaAllocationIdentity allocation_identity = {0};
   CXLType2CudaAllocation *allocation = NULL;
   CXLType2CudaAliasSource *alias_sources = NULL;
+  uint8_t *alias_guard = NULL;
   uint64_t generation = source_override ? source_override->source_id : 0;
   uint64_t destination_offset = 0;
   uint64_t covered = 0;
   uint64_t alias = 0;
   uint64_t alias_begin_ns = 0;
+  uint64_t guard_bytes = qemu_real_host_page_size();
   const char *alias_reason = NULL;
   bool remap = false;
   bool first_alias = false;
@@ -7252,8 +7254,9 @@ static int cxl_type2_direct_alias_submit(
     ct2d->model_supply.source_descriptor_count++;
     ct2d->model_supply.source_logical_bytes += piece->source.length;
   }
-  alias_sources = g_try_new(CXLType2CudaAliasSource, pieces->len);
-  if (!alias_sources) {
+  alias_sources = g_try_new0(CXLType2CudaAliasSource, pieces->len + 1);
+  alias_guard = g_try_malloc0(guard_bytes);
+  if (!alias_sources || !alias_guard) {
     *failure_stage = "alias-source-allocate";
     result = CXL_GPU_ERROR_OUT_OF_MEMORY;
     goto out;
@@ -7262,6 +7265,13 @@ static int cxl_type2_direct_alias_submit(
     alias_sources[i] =
         g_array_index(pieces, CXLType2PageableAliasPiece, i).source;
   }
+  alias_sources[pieces->len] = (CXLType2CudaAliasSource){
+      .fd = -1,
+      .host_copy_source = alias_guard,
+      .destination_offset = covered,
+      .length = guard_bytes,
+      .readonly = true,
+  };
   first_alias = allocation->pageable_alias == NULL;
   result = cxl_type2_model_aliases_replace_range(
       ct2d, allocation, destination_offset, covered, &remap);
@@ -7273,8 +7283,9 @@ static int cxl_type2_direct_alias_submit(
   if (!covered || !cxl_type2_cuda_allocation_map_pageable_alias(
                       &ct2d->cuda_allocations, allocation_identity.base,
                       allocation_identity.epoch, generation, alias_sources,
-                      pieces->len, &source_override->register_call_id, 1,
-                      destination_offset, covered, 0, &alias, &alias_reason)) {
+                      pieces->len + 1, &source_override->register_call_id, 1,
+                      destination_offset, covered, guard_bytes, &alias,
+                      &alias_reason)) {
     *failure_stage = alias_reason ? alias_reason : "alias-map";
     goto out;
   }
@@ -7340,21 +7351,24 @@ static int cxl_type2_direct_alias_submit(
     ct2d->model_supply.boundary_composition_wall_ns += duration_ns;
     ct2d->model_supply.guard_bytes += pageable->guard_bytes;
     if (pageable->file_mapped_bytes + pageable->host_composition_copy_bytes +
-            pageable->derived_boundary_copy_bytes + pageable->guard_bytes >
+            pageable->derived_boundary_copy_bytes >
         covered) {
       ct2d->model_supply.page_collateral_bytes +=
           pageable->file_mapped_bytes + pageable->host_composition_copy_bytes +
-          pageable->derived_boundary_copy_bytes + pageable->guard_bytes -
-          covered;
+          pageable->derived_boundary_copy_bytes - covered;
     }
-    ct2d->model_supply.logical_direct_bytes +=
-        covered - pageable->host_composition_copy_bytes;
+    uint64_t logical_host_copy =
+        pageable->host_composition_copy_bytes > pageable->guard_bytes
+            ? pageable->host_composition_copy_bytes - pageable->guard_bytes
+            : 0;
+    ct2d->model_supply.logical_direct_bytes += covered - logical_host_copy;
   }
   *logical_enqueued = range_count;
   *fail_index = SIZE_MAX;
   result = CXL_GPU_SUCCESS;
 
 out:
+  g_free(alias_guard);
   g_free(alias_sources);
   if (pieces) {
     g_array_free(pieces, true);

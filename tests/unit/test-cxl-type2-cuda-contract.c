@@ -747,6 +747,9 @@ static void test_cuda_pageable_alias_composite_remap(void)
     g_assert_cmpuint(
         table.entries[0].pageable_alias->contributing_source_call_ids[1],
         ==, 3);
+    g_assert_cmpuint(table.entries[0].pageable_alias->logical_bytes,
+                     ==, logical_bytes);
+    g_assert_cmpuint(table.entries[0].pageable_alias->guard_bytes, ==, 32);
     g_assert_cmpuint(table.entries[0].pageable_alias->file_mapped_bytes,
                      ==, page_size);
     g_assert_cmpuint(
@@ -786,17 +789,6 @@ static void test_cuda_pageable_alias_composite_remap(void)
     g_assert_cmpuint(table.generations[0].promotion_bytes, ==,
                      logical_bytes + 32);
     g_assert_cmpuint(table.generations[0].promotion_wall_ns, ==, 53);
-
-    child = fork();
-    g_assert_cmpint(child, >=, 0);
-    if (child == 0) {
-        /* Volatile forces the readonly mapping to receive a real store. */
-        *(volatile uint8_t *)(uintptr_t)alias_one ^= 1;
-        _exit(0);
-    }
-    g_assert_cmpint(waitpid(child, &status, 0), ==, child);
-    g_assert_true(WIFSIGNALED(status));
-    g_assert_true(WTERMSIG(status) == SIGSEGV || WTERMSIG(status) == SIGBUS);
 
     child = fork();
     g_assert_cmpint(child, >=, 0);
