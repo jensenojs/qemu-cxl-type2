@@ -2741,6 +2741,31 @@ int hetgpu_cuda_graph_node_get_type(HetGPUState *state,
     return result;
 }
 
+HetGPUGraphNodeRole hetgpu_cuda_graph_node_role(int node_type)
+{
+    switch ((HetGPUGraphNodeType)node_type) {
+    case HETGPU_GRAPH_NODE_TYPE_KERNEL:
+        return HETGPU_GRAPH_NODE_KERNEL;
+    case HETGPU_GRAPH_NODE_TYPE_EMPTY:
+    case HETGPU_GRAPH_NODE_TYPE_WAIT_EVENT:
+    case HETGPU_GRAPH_NODE_TYPE_EVENT_RECORD:
+    case HETGPU_GRAPH_NODE_TYPE_EXT_SEMAS_SIGNAL:
+    case HETGPU_GRAPH_NODE_TYPE_EXT_SEMAS_WAIT:
+        return HETGPU_GRAPH_NODE_INERT_CONTROL;
+    case HETGPU_GRAPH_NODE_TYPE_MEMCPY:
+    case HETGPU_GRAPH_NODE_TYPE_MEMSET:
+    case HETGPU_GRAPH_NODE_TYPE_HOST:
+    case HETGPU_GRAPH_NODE_TYPE_GRAPH:
+    case HETGPU_GRAPH_NODE_TYPE_MEM_ALLOC:
+    case HETGPU_GRAPH_NODE_TYPE_MEM_FREE:
+    case HETGPU_GRAPH_NODE_TYPE_BATCH_MEM_OP:
+    case HETGPU_GRAPH_NODE_TYPE_CONDITIONAL:
+        return HETGPU_GRAPH_NODE_MEMORY_OR_NESTED;
+    default:
+        return HETGPU_GRAPH_NODE_UNKNOWN;
+    }
+}
+
 static bool hetgpu_cuda_ready(HetGPUState *state)
 {
     return state && state->initialized && state->backend != HETGPU_BACKEND_SIMULATION;

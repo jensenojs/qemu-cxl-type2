@@ -691,9 +691,32 @@ int hetgpu_cuda_graph_exec_update(HetGPUState *state,
                                   HetGPUGraphExecUpdateResultInfo *result_info);
 int hetgpu_cuda_graph_get_nodes(HetGPUState *state, HetGPUGraph graph,
                                 HetGPUGraphNode *nodes, size_t *num_nodes);
+typedef enum HetGPUGraphNodeRole {
+    HETGPU_GRAPH_NODE_KERNEL,
+    HETGPU_GRAPH_NODE_INERT_CONTROL,
+    HETGPU_GRAPH_NODE_MEMORY_OR_NESTED,
+    HETGPU_GRAPH_NODE_UNKNOWN,
+} HetGPUGraphNodeRole;
+typedef enum HetGPUGraphNodeType {
+    HETGPU_GRAPH_NODE_TYPE_KERNEL = 0,
+    HETGPU_GRAPH_NODE_TYPE_MEMCPY = 1,
+    HETGPU_GRAPH_NODE_TYPE_MEMSET = 2,
+    HETGPU_GRAPH_NODE_TYPE_HOST = 3,
+    HETGPU_GRAPH_NODE_TYPE_GRAPH = 4,
+    HETGPU_GRAPH_NODE_TYPE_EMPTY = 5,
+    HETGPU_GRAPH_NODE_TYPE_WAIT_EVENT = 6,
+    HETGPU_GRAPH_NODE_TYPE_EVENT_RECORD = 7,
+    HETGPU_GRAPH_NODE_TYPE_EXT_SEMAS_SIGNAL = 8,
+    HETGPU_GRAPH_NODE_TYPE_EXT_SEMAS_WAIT = 9,
+    HETGPU_GRAPH_NODE_TYPE_MEM_ALLOC = 10,
+    HETGPU_GRAPH_NODE_TYPE_MEM_FREE = 11,
+    HETGPU_GRAPH_NODE_TYPE_BATCH_MEM_OP = 12,
+    HETGPU_GRAPH_NODE_TYPE_CONDITIONAL = 13,
+} HetGPUGraphNodeType;
 int hetgpu_cuda_graph_node_get_type(HetGPUState *state,
                                     HetGPUGraphNode graph_node,
                                     int *node_type);
+HetGPUGraphNodeRole hetgpu_cuda_graph_node_role(int node_type);
 int hetgpu_cuda_link_create(HetGPUState *state, void **link_state);
 int hetgpu_cuda_link_add_data(HetGPUState *state, void *link_state, int input_type,
                               void *data, size_t size, const char *name);
