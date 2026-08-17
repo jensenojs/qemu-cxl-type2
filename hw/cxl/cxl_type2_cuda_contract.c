@@ -28,20 +28,6 @@ cxl_type2_cuda_pageable_alias_free(CXLType2CudaPageableAlias *alias) {
 }
 
 static void
-cxl_type2_cuda_alias_ledger_free(CXLType2CudaAliasLedger *ledger) {
-  if (!ledger) {
-    return;
-  }
-  for (size_t i = 0; i < ledger->source_count; i++) {
-    close(ledger->sources[i].fd);
-    g_free(ledger->sources[i].owned_host_copy);
-  }
-  g_free(ledger->source_call_ids);
-  g_free(ledger->sources);
-  g_free(ledger);
-}
-
-static void
 cxl_type2_cuda_allocation_alias_clear(CXLType2CudaAllocation *allocation) {
   CXLType2CudaPageableAlias *alias = allocation->pageable_alias;
 
@@ -52,8 +38,6 @@ cxl_type2_cuda_allocation_alias_clear(CXLType2CudaAllocation *allocation) {
     alias = next;
   }
   allocation->pageable_alias = NULL;
-  cxl_type2_cuda_alias_ledger_free(allocation->pageable_sources);
-  allocation->pageable_sources = NULL;
   allocation->device_alias = 0;
   allocation->content_generation = 0;
   allocation->dax_backed = false;
@@ -835,111 +819,6 @@ cxl_type2_cuda_alias_source_copy(CXLType2CudaAliasSource *destination,
   return true;
 }
 
-bool cxl_type2_cuda_allocation_append_pageable_sources(
-    CXLType2CudaAllocationTable *table, uint64_t base, uint64_t epoch,
-    uint64_t generation, const CXLType2CudaAliasSource *sources,
-    size_t source_count, uint64_t source_call_id, uint64_t destination_offset,
-    uint64_t logical_bytes, const char **reason) {
-  CXLType2CudaAllocation *allocation =
-      cxl_type2_cuda_allocation_find(table, base, epoch);
-  CXLType2CudaAliasLedger *ledger;
-  CXLType2CudaAliasSource *next_sources = NULL;
-  uint64_t *next_calls = NULL;
-  uint64_t covered = destination_offset;
-  size_t copied = 0;
-
-  if (reason) {
-    *reason = NULL;
-  }
-  if (!reason || !allocation || allocation->poisoned ||
-      allocation->pageable_alias || !generation || !sources || !source_count ||
-      !source_call_id || !logical_bytes ||
-      destination_offset > allocation->size ||
-      logical_bytes > allocation->size - destination_offset ||
-      allocation->consumer_refs || allocation->normal_inflight_refs ||
-      allocation->graph_binding_refs || allocation->graph_inflight_refs) {
-    if (reason) {
-      *reason = "alias-source-append-invalid";
-    }
-    return false;
-  }
-  ledger = allocation->pageable_sources;
-  if ((ledger && destination_offset < ledger->destination_end) ||
-      (!ledger && destination_offset != 0)) {
-    *reason = "alias-source-order-invalid";
-    return false;
-  }
-  for (size_t i = 0; i < source_count; i++) {
-    if (sources[i].destination_offset != covered ||
-        sources[i].length > destination_offset + logical_bytes - covered) {
-      *reason = "alias-source-coverage";
-      return false;
-    }
-    covered += sources[i].length;
-  }
-  if (covered != destination_offset + logical_bytes) {
-    *reason = "alias-source-coverage";
-    return false;
-  }
-
-  size_t old_source_count = ledger ? ledger->source_count : 0;
-  size_t old_call_count = ledger ? ledger->source_call_count : 0;
-
-  next_sources = g_try_new0(CXLType2CudaAliasSource,
-                            old_source_count + source_count);
-  next_calls = g_try_new(uint64_t, old_call_count + 1);
-  if (!next_sources || !next_calls) {
-    *reason = "alias-source-allocation-failed";
-    goto fail;
-  }
-  for (size_t i = 0; i < old_source_count + source_count; i++) {
-    next_sources[i].fd = -1;
-  }
-  if (ledger) {
-    memcpy(next_sources, ledger->sources,
-           old_source_count * sizeof(*next_sources));
-    memcpy(next_calls, ledger->source_call_ids,
-           old_call_count * sizeof(*next_calls));
-  }
-  for (size_t i = 0; i < source_count; i++) {
-    if (!cxl_type2_cuda_alias_source_copy(
-            &next_sources[old_source_count + i], &sources[i], reason)) {
-      goto fail;
-    }
-    copied++;
-  }
-  next_calls[old_call_count] = source_call_id;
-  if (!ledger) {
-    ledger = g_try_new0(CXLType2CudaAliasLedger, 1);
-    if (!ledger) {
-      *reason = "alias-source-allocation-failed";
-      goto fail;
-    }
-    allocation->pageable_sources = ledger;
-  } else {
-    g_free(ledger->sources);
-    g_free(ledger->source_call_ids);
-  }
-  ledger->sources = next_sources;
-  ledger->source_count = old_source_count + source_count;
-  ledger->source_call_ids = next_calls;
-  ledger->source_call_count = old_call_count + 1;
-  ledger->destination_end = destination_offset + logical_bytes;
-  ledger->content_generation = generation;
-  return true;
-
-fail:
-  for (size_t i = 0; i < copied; i++) {
-    CXLType2CudaAliasSource *source = &next_sources[old_source_count + i];
-
-    close(source->fd);
-    g_free(source->owned_host_copy);
-  }
-  g_free(next_calls);
-  g_free(next_sources);
-  return false;
-}
-
 static bool cxl_type2_cuda_pread_all(int fd, uint8_t *destination,
                                      uint64_t count, uint64_t offset) {
   while (count) {
@@ -1348,68 +1227,6 @@ poison:
 fail:
   cxl_type2_cuda_pageable_alias_free(alias);
   return false;
-}
-
-bool cxl_type2_cuda_allocation_finalize_pageable_alias(
-    CXLType2CudaAllocationTable *table, uint64_t base, uint64_t epoch,
-    uint64_t guard_bytes, uint64_t *device_alias, const char **reason) {
-  CXLType2CudaAllocation *allocation =
-      cxl_type2_cuda_allocation_find(table, base, epoch);
-  CXLType2CudaAliasLedger *ledger =
-      allocation ? allocation->pageable_sources : NULL;
-  CXLType2CudaAliasSource *sources = NULL;
-  uint8_t *guard = NULL;
-  size_t source_count;
-  bool mapped = false;
-
-  if (reason) {
-    *reason = NULL;
-  }
-  if (!reason || !allocation || allocation->poisoned ||
-      allocation->pageable_alias || !ledger || !ledger->source_count ||
-      !ledger->source_call_count ||
-      ledger->destination_end != allocation->size ||
-      !ledger->content_generation || !device_alias) {
-    if (reason) {
-      *reason = "alias-source-ledger-incomplete";
-    }
-    return false;
-  }
-  source_count = ledger->source_count + (guard_bytes != 0);
-  sources = g_try_new(CXLType2CudaAliasSource, source_count);
-  if (!sources) {
-    *reason = "alias-source-allocation-failed";
-    return false;
-  }
-  memcpy(sources, ledger->sources,
-         ledger->source_count * sizeof(*sources));
-  if (guard_bytes) {
-    guard = g_try_malloc0(guard_bytes);
-    if (!guard) {
-      *reason = "alias-guard-allocation-failed";
-      goto out;
-    }
-    sources[ledger->source_count] = (CXLType2CudaAliasSource){
-        .fd = -1,
-        .host_copy_source = guard,
-        .destination_offset = allocation->size,
-        .length = guard_bytes,
-        .readonly = true,
-    };
-  }
-  mapped = cxl_type2_cuda_allocation_map_pageable_alias(
-      table, base, epoch, ledger->content_generation, sources, source_count,
-      ledger->source_call_ids, ledger->source_call_count, 0, allocation->size,
-      guard_bytes, device_alias, reason);
-  if (mapped) {
-    cxl_type2_cuda_alias_ledger_free(allocation->pageable_sources);
-    allocation->pageable_sources = NULL;
-  }
-
-out:
-  g_free(guard);
-  g_free(sources);
-  return mapped;
 }
 
 bool cxl_type2_cuda_allocation_remove_pageable_aliases(

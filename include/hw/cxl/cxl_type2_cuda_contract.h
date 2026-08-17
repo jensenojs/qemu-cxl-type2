@@ -121,8 +121,6 @@ bool cxl_gpu_direct_page_registration_span(
     uint64_t request_length, uint64_t following_offset, uint64_t page_size,
     uint64_t *registration_offset, uint64_t *registration_length);
 
-struct CXLType2CudaAliasLedger;
-
 typedef struct CXLType2CudaAllocation {
   uint64_t base;
   uint64_t size;
@@ -134,7 +132,6 @@ typedef struct CXLType2CudaAllocation {
   uint64_t graph_binding_refs;
   uint64_t graph_inflight_refs;
   struct CXLType2CudaPageableAlias *pageable_alias;
-  struct CXLType2CudaAliasLedger *pageable_sources;
   bool poisoned;
   bool dax_backed;
 } CXLType2CudaAllocation;
@@ -155,15 +152,6 @@ typedef struct CXLType2CudaAliasSource {
   uint32_t stat_mode;
   bool readonly;
 } CXLType2CudaAliasSource;
-
-typedef struct CXLType2CudaAliasLedger {
-  CXLType2CudaAliasSource *sources;
-  size_t source_count;
-  uint64_t *source_call_ids;
-  size_t source_call_count;
-  uint64_t destination_end;
-  uint64_t content_generation;
-} CXLType2CudaAliasLedger;
 
 typedef struct CXLType2CudaPageableAlias {
   struct CXLType2CudaPageableAlias *next;
@@ -341,14 +329,6 @@ bool cxl_type2_cuda_allocation_map_pageable_alias(
     size_t contributing_source_call_count, uint64_t destination_offset,
     uint64_t logical_bytes, uint64_t guard_bytes, uint64_t *device_alias,
     const char **reason);
-bool cxl_type2_cuda_allocation_append_pageable_sources(
-    CXLType2CudaAllocationTable *table, uint64_t base, uint64_t epoch,
-    uint64_t generation, const CXLType2CudaAliasSource *sources,
-    size_t source_count, uint64_t source_call_id, uint64_t destination_offset,
-    uint64_t logical_bytes, const char **reason);
-bool cxl_type2_cuda_allocation_finalize_pageable_alias(
-    CXLType2CudaAllocationTable *table, uint64_t base, uint64_t epoch,
-    uint64_t guard_bytes, uint64_t *device_alias, const char **reason);
 bool cxl_type2_cuda_allocation_remove_pageable_aliases(
     CXLType2CudaAllocationTable *table, uint64_t base, uint64_t epoch,
     uint64_t destination_offset, uint64_t logical_bytes, size_t *removed_count);
