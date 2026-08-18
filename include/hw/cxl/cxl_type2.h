@@ -524,6 +524,10 @@ typedef struct CXLType2State {
   CXLType2DirectRegistration *direct_registrations;
   GTree *direct_physical_ranges;
   CXLType2DirectSource *direct_sources;
+  /* Diagnostic: number of per-run source registration observations to log
+   * before throttling (0 disables). Populated from KIMI_SOURCE_RUN_LOG_LIMIT
+   * at realize so operators can enable it without rebuilding. */
+  uint64_t source_run_log_limit;
   GHashTable *direct_source_ids;
   uint64_t next_direct_source_id;
   bool direct_source_poisoned;

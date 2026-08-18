@@ -6760,10 +6760,30 @@ static int cxl_type2_direct_source_register(
             *failure_index_out = old_first + old_index;
             goto out;
           }
+          if (ct2d->source_run_log_limit) {
+            qemu_log("KIMI_SOURCE_RUN gpa=0x%" PRIx64 " translated=0x%" PRIx64
+                     " mr=%s dax=%d ram=1 dax_range=[0x%" PRIx64
+                     ",0x%" PRIx64 ") dax_host=%p\n",
+                     guest_phys_addr, translated, memory_region_name(mr),
+                     mr == dax_mr ? 1 : 0,
+                     (uint64_t)shmem->mr.addr, (uint64_t)(shmem->mr.addr + shmem->size),
+                     shmem->host_addr);
+            ct2d->source_run_log_limit--;
+          }
           run.ordinary_host =
               (const uint8_t *)memory_region_get_ram_ptr(mr) + translated;
           ordinary_run_count++;
         } else {
+          if (ct2d->source_run_log_limit) {
+            qemu_log("KIMI_SOURCE_RUN gpa=0x%" PRIx64 " translated=0x%" PRIx64
+                     " mr=%s dax=%d ram=0 dax_range=[0x%" PRIx64
+                     ",0x%" PRIx64 ") dax_host=%p\n",
+                     guest_phys_addr, translated, memory_region_name(mr),
+                     mr == dax_mr ? 1 : 0,
+                     (uint64_t)shmem->mr.addr, (uint64_t)(shmem->mr.addr + shmem->size),
+                     shmem->host_addr);
+            ct2d->source_run_log_limit--;
+          }
           VirtioSharedMemoryMapping *mapping =
               virtio_find_shmem_map(shmem, translated, 1);
           uint64_t mapping_offset;
@@ -13090,6 +13110,11 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp) {
   }
   if (ct2d->device_mem_size == 0) {
     ct2d->device_mem_size = CXL_TYPE2_DEFAULT_MEM_SIZE;
+  }
+  {
+    const char *limit_env = getenv("KIMI_SOURCE_RUN_LOG_LIMIT");
+    ct2d->source_run_log_limit =
+        limit_env ? g_ascii_strtoull(limit_env, NULL, 10) : 100;
   }
   if (ct2d->cache_size < CXL_GPU_CMD_REG_SIZE) {
     error_setg(errp,
