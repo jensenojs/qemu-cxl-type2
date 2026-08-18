@@ -5871,6 +5871,31 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
         cxl_type2_cuda_classifier_status_name(classifier_status),
         cxl_type2_cuda_rejection_reason_name(rejection_reason),
         rejection_command_name);
+
+    /* 防御性暴露：cuda-direct-source 声明了但直供没有生效，不静默。
+       触发条件：policy_enabled(cuda_direct_source)=1 且 direct_bytes=0 且
+       register 调用发生过（说明 shim 走了 0x35 但 QEMU 没建成 direct source）。 */
+    if (ct2d->cuda_direct_source &&
+        ct2d->paired_case.active_direct_register_calls > 0 &&
+        ct2d->paired_case.active_direct_bytes == 0) {
+      qemu_log("KIMI_DIRECT_SOURCE_DEGRADED run_binding=%" PRIu64
+               " case=%s epoch=%" PRIu64 " policy_enabled=1"
+               " register_calls=%" PRIu64 " direct_bytes=%" PRIu64
+               " allocation_unknown_batches=%" PRIu64
+               " allocation_unknown_bytes=%" PRIu64
+               " allocation_classified_batches=%" PRIu64
+               " allocation_classified_bytes=%" PRIu64
+               " first_rejection_reason=%s first_rejection_command=%s\n",
+               run_binding, cxl_type2_paired_case_name(case_kind), epoch,
+               ct2d->paired_case.active_direct_register_calls,
+               ct2d->paired_case.active_direct_bytes,
+               ct2d->paired_case.allocation_unknown_batches,
+               ct2d->paired_case.allocation_unknown_bytes,
+               ct2d->paired_case.allocation_classified_batches,
+               ct2d->paired_case.allocation_classified_bytes,
+               cxl_type2_cuda_rejection_reason_name(rejection_reason),
+               rejection_command_name);
+    }
   }
 
   cxl_type2_log_command_scope_summary(run_binding, case_kind, epoch, "case",
@@ -13235,8 +13260,20 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp) {
      * This device derives alias source fds from installed mappings via
      * virtio_shared_memory_mapping_dup_source(); declare the lease before
      * the guest can install any mapping so installation retains the fds.
+     *
+     * Retention is granted only to the model alias gate (its output path
+     * always calls dup_source). cuda-direct-source alone must NOT retain:
+     * under selected-htod routing the 0x35 register never reaches the
+     * DIRECT branch (cxl_type2_direct_source_register returns ORDINARY for
+     * non-cxl-direct routes), so no dup_source consumer exists and every
+     * retained fd leaks until EMFILE -> guest SIGBUS (r2/r5, closed by the
+     * d6g same-QEMU direct-off control). When the S4 supply engine makes
+     * 0x35 DIRECT again, retention is declared dynamically at first
+     * successful register instead of here.
      */
-    virtio_shared_memory_set_source_fd_retention(source_shmem, true);
+    if (ct2d->model_alias_gate.output) {
+        virtio_shared_memory_set_source_fd_retention(source_shmem, true);
+    }
     if (ct2d->cuda_direct_source) {
     if (!!ct2d->direct_registration_tile_size !=
         !!ct2d->direct_registration_padding_limit) {
