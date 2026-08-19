@@ -6357,23 +6357,28 @@ static int cxl_type2_direct_physical_put(CXLType2State *ct2d,
   g_assert(physical->registration && physical->registration->references > 0);
   physical->references--;
   physical->registration->references--;
-  if (physical->registration->references == 0) {
+  if (physical->registration->references == 0 &&
+      physical->registration->revoke_pending) {
     /*
-     * Release immediately when the last reference drops, not only on
-     * revoke. A lingering pinned registration blocks the guest from
-     * unmapping its DAX region: virtio_del_shmem_map returns -EBUSY and
-     * sets revoke_pending, the mapping stays in the interval tree, and a
-     * later SHMEM_MAP for the same file region fails with -EEXIST ->
-     * virtiofsd FrontendInternalError -> guest SIGBUS (cnb-05g, token 8
-     * of 63). b18 never hit this because its llama kept model buffers
-     * mapped; the current llama munmaps and re-mmaps model pages across
-     * tokens. The idle_cleanup path stays for registrations that outlive
-     * their sources (case-end sweep), this change only releases the pin
-     * as soon as no source references it.
+     * Zero source references make a registration idle; they do not make
+     * its still-live DAX mapping invalid.  Keep that registration cached
+     * so a later selected range can reuse the NVIDIA HostRegister.  The
+     * signed b18 llama input keeps those mappings live and depends on this
+     * reuse: releasing every idle registration amplified the latest run to
+     * 118879 register/unregister pairs and collapsed throughput.
+     *
+     * A mapping revoke changes the lifetime contract.  The revoke path
+     * marks the registration before dropping its remaining source refs, so
+     * the last put must unregister and unpin it here.  cnb-05g showed the
+     * consequence of retaining a pin past that point: virtiofs DAX unmap
+     * returned -EBUSY, the replacement mapping collided with the retained
+     * interval, and the guest later received SIGBUS.  Inputs that repeatedly
+     * revoke and remap therefore need a registration owner keyed by stable
+     * file identity; this retained-cache path is only valid while the
+     * underlying mapping remains live.
      */
     int result = cxl_type2_direct_registration_release(
-        ct2d, physical->registration,
-        physical->registration->revoke_pending);
+        ct2d, physical->registration, true);
 
     if (result != CXL_GPU_SUCCESS) {
       physical->references++;
