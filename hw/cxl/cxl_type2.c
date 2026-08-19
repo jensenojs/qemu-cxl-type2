@@ -6226,6 +6226,7 @@ static void cxl_type2_direct_physical_unlink(CXLType2State *ct2d,
 
   g_assert(g_tree_remove(ct2d->direct_physical_ranges, physical));
   virtio_shared_memory_unpin(physical->mapping);
+  ct2d->model_supply.mapping_pin_releases++;
   cursor = &ct2d->direct_physicals;
   while (*cursor != physical) {
     cursor = &(*cursor)->next;

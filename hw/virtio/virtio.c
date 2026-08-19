@@ -3228,8 +3228,12 @@ int virtio_add_shmem_map(VirtioSharedMemory *shmem,
     void *mapped = mmap(addr, mapping->len, prot, MAP_SHARED | MAP_FIXED,
                         mapping->fd, mapping->fd_offset);
     if (mapped != addr) {
-        error_report("Unable to map VIRTIO Shared Memory range: %s",
-                     strerror(errno));
+        error_report("Unable to map VIRTIO Shared Memory range "
+                     "[0x%"PRIx64", 0x%"PRIx64") fd=%d fd_offset=0x%"PRIx64
+                     " prot=%d: %s (errno=%d)",
+                     mapping->offset, mapping->offset + mapping->len,
+                     mapping->fd, mapping->fd_offset, prot,
+                     strerror(errno), errno);
         return -1;
     }
     mapping->generation = generation;
@@ -3323,12 +3327,30 @@ static int virtio_revoke_shmem_mapping(VirtioSharedMemory *shmem,
                                        VirtioSharedMemoryMapping *mapping)
 {
     void *addr = shmem->host_addr + mapping->offset;
+
+    /*
+     * munmap the file-backed VMA so the kernel reclaims the map-count
+     * slot, then re-reserve the range as PROT_NONE anonymous so no
+     * unrelated mmap can claim the address.  The previous
+     * mmap(PROT_NONE|MAP_FIXED) only replaced the VMA content without
+     * freeing the slot; under 100K+ DAX mappings that exhausts
+     * vm.max_map_count and kills the guest with SIGBUS.
+     */
+    if (munmap(addr, mapping->len) != 0) {
+        error_report("Unable to unmap revoked VIRTIO Shared Memory "
+                     "range [0x%"PRIx64", 0x%"PRIx64"): %s (errno=%d)",
+                     mapping->offset, mapping->offset + mapping->len,
+                     strerror(errno), errno);
+        return -errno;
+    }
     void *reserved = mmap(addr, mapping->len, PROT_NONE,
                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED |
                           MAP_NORESERVE, -1, 0);
     if (reserved != addr) {
-        error_report("Unable to revoke VIRTIO Shared Memory range: %s",
-                     strerror(errno));
+        error_report("Unable to re-reserve VIRTIO Shared Memory "
+                     "range [0x%"PRIx64", 0x%"PRIx64"): %s (errno=%d)",
+                     mapping->offset, mapping->offset + mapping->len,
+                     strerror(errno), errno);
         return -errno;
     }
 
