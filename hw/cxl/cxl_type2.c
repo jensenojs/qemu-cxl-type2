@@ -4899,6 +4899,8 @@ static void cxl_type2_reset_case_summary(CXLType2State *ct2d) {
   ct2d->paired_case.active_cxl_range_bytes = 0;
   ct2d->paired_case.active_cxl_wire_bytes = 0;
   ct2d->paired_case.active_direct_register_calls = 0;
+  ct2d->paired_case.active_direct_file_run_pages = 0;
+  ct2d->paired_case.active_direct_ordinary_run_pages = 0;
   ct2d->paired_case.active_direct_unregister_calls = 0;
   ct2d->paired_case.active_direct_register_validate_ns = 0;
   ct2d->paired_case.active_direct_register_resolve_ns = 0;
@@ -5694,6 +5696,7 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
         "KIMI_DIRECT_SOURCE_SUMMARY schema=direct-source-summary-v13"
         " run_binding=%" PRIu64 " case=%s case_epoch=%" PRIu64
         " policy_enabled=%u register_calls=%" PRIu64
+        " file_run_pages=%" PRIu64 " ordinary_run_pages=%" PRIu64
         " register_busy_ns=%" PRIu64 " legacy_register_calls=%" PRIu64
         " legacy_register_busy_ns=%" PRIu64
         " fused_register_batch_calls=%" PRIu64
@@ -5769,6 +5772,8 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
         run_binding, cxl_type2_paired_case_name(case_kind), epoch,
         ct2d->cuda_direct_source,
         ct2d->paired_case.active_direct_register_calls,
+        ct2d->paired_case.active_direct_file_run_pages,
+        ct2d->paired_case.active_direct_ordinary_run_pages,
         busy[CXL_GPU_CMD_SOURCE_REGISTER] +
             busy[CXL_GPU_CMD_SOURCE_REGISTER_BATCH_HTOD_DIRECT_ASYNC],
         calls[CXL_GPU_CMD_SOURCE_REGISTER], busy[CXL_GPU_CMD_SOURCE_REGISTER],
@@ -6889,7 +6894,19 @@ static int cxl_type2_direct_source_register(
   }
   source->range_count = header.range_count;
   source->ranges = g_steal_pointer(&range_layouts);
-  if (source->pageable_alias) {
+  /*
+   * Gate runs construction on "this batch actually contains DAX pages"
+   * (file_run_count > 0), not on pageable_alias. pageable_alias keeps its
+   * route meaning: it selects the alias submission path (requires allocation
+   * generation, only reachable with cxl-direct + model-consumer-certificate).
+   * b18 semantics: a batch whose pages are DAX-backed must be submittable
+   * through the ordinary direct path (virtio_shared_memory_pin_range +
+   * hetgpu memcpy) even when route is selected-htod and no allocation record
+   * exists for the mmap'ed model pages. 0x35 regression to 0.93 TPS happened
+   * because runs were only built under pageable_alias, so selected-htod
+   * batches skipped DIRECT construction entirely (direct_bytes=0).
+   */
+  if (source->pageable_alias || file_run_count > 0) {
     source->runs = g_try_new0(CXLType2DirectRun, resolved_runs->len);
     if (!source->runs) {
       result = CXL_GPU_ERROR_OUT_OF_MEMORY;
@@ -7423,6 +7440,15 @@ views_done:
   (void)inserted;
   *source_id_out = source->source_id;
   g_array_free(resolved_runs, true);
+  qemu_log("KIMI_SOURCE_RUN_SUMMARY run_binding=%" PRIu64
+           " case=%s case_epoch=%" PRIu64 " call_id=%" PRIu64
+           " dax_pages=%u ordinary_pages=%u result=%d\n",
+           ct2d->paired_case.run_binding,
+           cxl_type2_paired_case_name(ct2d->paired_case.active_case),
+           ct2d->paired_case.active_epoch, ct2d->gpu_cmd.call_id,
+           file_run_count, ordinary_run_count, CXL_GPU_SUCCESS);
+  ct2d->paired_case.active_direct_file_run_pages += file_run_count;
+  ct2d->paired_case.active_direct_ordinary_run_pages += ordinary_run_count;
   ct2d->paired_case.active_direct_register_commit_ns +=
       qemu_clock_get_ns(QEMU_CLOCK_HOST) - phase_begin_ns;
   return CXL_GPU_SUCCESS;
@@ -7451,6 +7477,20 @@ rollback:
     *failure_index_out = source->run_count;
   }
 out:
+  /* Per-call summary so the per-page gate-1 result is auditable even when
+   * the batch was short-circuited (gate 2) or failed mid-build. */
+  qemu_log("KIMI_SOURCE_RUN_SUMMARY run_binding=%" PRIu64
+           " case=%s case_epoch=%" PRIu64 " call_id=%" PRIu64
+           " dax_pages=%u ordinary_pages=%u result=%d\n",
+           ct2d->paired_case.run_binding,
+           cxl_type2_paired_case_name(ct2d->paired_case.active_case),
+           ct2d->paired_case.active_epoch, ct2d->gpu_cmd.call_id,
+           file_run_count, ordinary_run_count, result);
+  /* Record page classification even when the batch was short-circuited to
+   * ordinary (gate 2) or failed mid-build, so KIMI_DIRECT_SOURCE_SUMMARY
+   * can attribute direct_bytes == 0 to the right gate. */
+  ct2d->paired_case.active_direct_file_run_pages += file_run_count;
+  ct2d->paired_case.active_direct_ordinary_run_pages += ordinary_run_count;
   if (source) {
     g_free(source->ranges);
     g_free(source->runs);

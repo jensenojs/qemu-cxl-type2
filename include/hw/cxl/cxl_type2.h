@@ -568,6 +568,13 @@ typedef struct CXLType2State {
     uint64_t active_cxl_range_bytes;
     uint64_t active_cxl_wire_bytes;
     uint64_t active_direct_register_calls;
+    /* per-batch page classification: pages that resolved to the DAX file
+     * window (direct-capable) vs ordinary RAM (staging fallback). Exposed in
+     * KIMI_DIRECT_SOURCE_SUMMARY so a single run shows whether gate 1 (page
+     * classification) and gate 2 (batch short-circuit) were the cause of
+     * direct_bytes == 0, without needing the per-page KIMI_SOURCE_RUN log. */
+    uint64_t active_direct_file_run_pages;
+    uint64_t active_direct_ordinary_run_pages;
     uint64_t active_direct_unregister_calls;
     uint64_t active_direct_register_validate_ns;
     uint64_t active_direct_register_resolve_ns;
