@@ -6999,11 +6999,48 @@ static int cxl_type2_direct_source_register(
           &ct2d->model_supply.member_manifest, run->source_device,
           run->source_inode, run->source_size, run->source_mode,
           run->file_offset, run->length);
-      if (!member ||
-          member->logical_cxl_offset >
-              UINT64_MAX - ct2d->model_aperture.offset ||
-          run->file_offset > UINT64_MAX - member->logical_cxl_offset -
-                                 ct2d->model_aperture.offset) {
+      if (member) {
+        if (member->logical_cxl_offset >
+                UINT64_MAX - ct2d->model_aperture.offset ||
+            run->file_offset > UINT64_MAX - member->logical_cxl_offset -
+                                   ct2d->model_aperture.offset) {
+          virtio_shared_memory_unpin(pinned_mapping);
+          ct2d->model_supply.mapping_pin_releases++;
+          result = CXL_GPU_ERROR_INVALID_VALUE;
+          *failure_stage_out = "member-range-admission";
+          *failure_index_out = i;
+          goto rollback;
+        }
+        run->logical_cxl_offset = ct2d->model_aperture.offset +
+                                  member->logical_cxl_offset + run->file_offset;
+        run->model_member_index =
+            member - ct2d->model_supply.member_manifest.members;
+        if (!cxl_type2_range_contains(ct2d->model_aperture.offset,
+                                      ct2d->model_aperture.size,
+                                      run->logical_cxl_offset, run->length)) {
+          virtio_shared_memory_unpin(pinned_mapping);
+          ct2d->model_supply.mapping_pin_releases++;
+          result = CXL_GPU_ERROR_INVALID_VALUE;
+          *failure_stage_out = "aperture-capacity";
+          *failure_index_out = i;
+          goto rollback;
+        }
+        if (!cxl_type2_fabric_access_allowed(ct2d, run->logical_cxl_offset,
+                                             run->length, false, false) ||
+            !cxl_type2_memsim_request(ct2d, CXL_OP_RANGE_READ,
+                                      run->logical_cxl_offset, run->length,
+                                      NULL, NULL)) {
+          virtio_shared_memory_unpin(pinned_mapping);
+          ct2d->model_supply.mapping_pin_releases++;
+          result = CXL_GPU_ERROR_INVALID_VALUE;
+          *failure_stage_out = "fabric-request";
+          *failure_index_out = i;
+          goto rollback;
+        }
+      } else if (ct2d->model_supply.route ==
+                 CXL_TYPE2_MODEL_SUPPLY_CXL_DIRECT) {
+        /* cxl-direct 路由要求每个 run 都能归属到 model member（system-UVA
+         * 目标的 allocation/epoch 身份）。member 缺失即不可准入。 */
         virtio_shared_memory_unpin(pinned_mapping);
         ct2d->model_supply.mapping_pin_releases++;
         result = CXL_GPU_ERROR_INVALID_VALUE;
@@ -7011,32 +7048,12 @@ static int cxl_type2_direct_source_register(
         *failure_index_out = i;
         goto rollback;
       }
-      run->logical_cxl_offset = ct2d->model_aperture.offset +
-                                member->logical_cxl_offset + run->file_offset;
-      run->model_member_index =
-          member - ct2d->model_supply.member_manifest.members;
-      if (!cxl_type2_range_contains(ct2d->model_aperture.offset,
-                                    ct2d->model_aperture.size,
-                                    run->logical_cxl_offset, run->length)) {
-        virtio_shared_memory_unpin(pinned_mapping);
-        ct2d->model_supply.mapping_pin_releases++;
-        result = CXL_GPU_ERROR_INVALID_VALUE;
-        *failure_stage_out = "aperture-capacity";
-        *failure_index_out = i;
-        goto rollback;
-      }
-      if (!cxl_type2_fabric_access_allowed(ct2d, run->logical_cxl_offset,
-                                           run->length, false, false) ||
-          !cxl_type2_memsim_request(ct2d, CXL_OP_RANGE_READ,
-                                    run->logical_cxl_offset, run->length, NULL,
-                                    NULL)) {
-        virtio_shared_memory_unpin(pinned_mapping);
-        ct2d->model_supply.mapping_pin_releases++;
-        result = CXL_GPU_ERROR_INVALID_VALUE;
-        *failure_stage_out = "fabric-request";
-        *failure_index_out = i;
-        goto rollback;
-      }
+      /* b18 copy-direct 语义（route != CXL_DIRECT，mmap 模型页无 member）：
+       * host_address 保持 mapping_host（virtio DAX 映射），不计算
+       * logical_cxl_offset、不做 fabric/memsim 记账——b18 没有 member
+       * 准入，DAX 页直接 pin + 拷。缺失 member 不是错误；system-UVA 的
+       * member 归属与 CXL 记账留给 cxl-direct 路由显式声明
+       * （model-consumer-certificate）。 */
       virtio_shared_memory_unpin(pinned_mapping);
       ct2d->model_supply.mapping_pin_releases++;
     }
