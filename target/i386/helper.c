@@ -239,7 +239,8 @@ void cpu_x86_update_cr4(CPUX86State *env, uint32_t new_cr4)
 
 #if !defined(CONFIG_USER_ONLY)
 hwaddr x86_cpu_get_phys_page_attrs_debug(CPUState *cs, vaddr addr,
-                                         MemTxAttrs *attrs)
+                                         MemTxAttrs *attrs,
+                                         hwaddr *translation_span)
 {
     X86CPU *cpu = X86_CPU(cs);
     CPUX86State *env = &cpu->env;
@@ -357,6 +358,7 @@ hwaddr x86_cpu_get_phys_page_attrs_debug(CPUState *cs, vaddr addr,
 #ifdef TARGET_X86_64
 out:
 #endif
+    *translation_span = page_size;
     pte &= PG_ADDRESS_MASK & ~(page_size - 1);
     page_offset = (addr & TARGET_PAGE_MASK) & (page_size - 1);
     return pte | page_offset;

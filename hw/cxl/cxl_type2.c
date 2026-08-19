@@ -6779,12 +6779,26 @@ static int cxl_type2_direct_source_register(
     cursor = wire_range.guest_virtual_address;
     remaining = wire_range.length;
     while (remaining) {
-      hwaddr page = cpu_get_phys_page_debug(current_cpu, cursor);
-      uint64_t page_offset = cursor & (target_page_size - 1);
-      uint64_t chunk = MIN(remaining, target_page_size - page_offset);
+      MemTxAttrs attrs;
+      hwaddr translation_span;
+      hwaddr page = cpu_get_phys_page_attrs_debug_span(
+          current_cpu, cursor, &attrs, &translation_span);
+      uint64_t page_offset;
+      uint64_t translation_offset;
+      uint64_t chunk;
       CXLType2DirectValidatedRun run;
 
-      if (page == (hwaddr)-1 || page > UINT64_MAX - page_offset) {
+      if (page == (hwaddr)-1 || !translation_span ||
+          (translation_span & (translation_span - 1)) ||
+          translation_span < target_page_size) {
+        *failure_stage_out = "gva-translate";
+        *failure_index_out = i;
+        goto out;
+      }
+      page_offset = cursor & (target_page_size - 1);
+      translation_offset = cursor & (translation_span - 1);
+      chunk = MIN(remaining, translation_span - translation_offset);
+      if (page > UINT64_MAX - page_offset) {
         *failure_stage_out = "gva-translate";
         *failure_index_out = i;
         goto out;

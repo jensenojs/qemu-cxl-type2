@@ -712,6 +712,23 @@ hwaddr cpu_get_phys_page_attrs_debug(CPUState *cpu, vaddr addr,
                                      MemTxAttrs *attrs);
 
 /**
+ * cpu_get_phys_page_attrs_debug_span:
+ * @cpu: The CPU to obtain the physical page address for.
+ * @addr: The virtual address.
+ * @attrs: Updated with the memory transaction attributes for this access.
+ * @translation_span: Updated with the contiguous virtual-to-physical page
+ *                    table leaf size containing @addr.
+ *
+ * Like cpu_get_phys_page_attrs_debug(), and also returns the page-table leaf
+ * size when the target exposes it. Targets without that information return
+ * their target page size, which is always safe for callers advancing through
+ * a virtual range.
+ */
+hwaddr cpu_get_phys_page_attrs_debug_span(CPUState *cpu, vaddr addr,
+                                          MemTxAttrs *attrs,
+                                          hwaddr *translation_span);
+
+/**
  * cpu_get_phys_page_debug:
  * @cpu: The CPU to obtain the physical page address for.
  * @addr: The virtual address.

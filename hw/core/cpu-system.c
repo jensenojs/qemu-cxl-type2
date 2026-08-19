@@ -22,6 +22,7 @@
 #include "qapi/error.h"
 #include "system/address-spaces.h"
 #include "exec/cputlb.h"
+#include "exec/target_page.h"
 #include "system/memory.h"
 #include "exec/tb-flush.h"
 #include "qemu/target-info.h"
@@ -56,14 +57,17 @@ bool cpu_get_memory_mapping(CPUState *cpu, MemoryMappingList *list,
     return false;
 }
 
-hwaddr cpu_get_phys_page_attrs_debug(CPUState *cpu, vaddr addr,
-                                     MemTxAttrs *attrs)
+hwaddr cpu_get_phys_page_attrs_debug_span(CPUState *cpu, vaddr addr,
+                                          MemTxAttrs *attrs,
+                                          hwaddr *translation_span)
 {
     hwaddr paddr;
 
+    *translation_span = qemu_target_page_size();
     if (cpu->cc->sysemu_ops->get_phys_page_attrs_debug) {
         paddr = cpu->cc->sysemu_ops->get_phys_page_attrs_debug(cpu, addr,
-                                                               attrs);
+                                                               attrs,
+                                                               translation_span);
     } else {
         /* Fallback for CPUs which don't implement the _attrs_ hook */
         *attrs = MEMTXATTRS_UNSPECIFIED;
@@ -72,6 +76,15 @@ hwaddr cpu_get_phys_page_attrs_debug(CPUState *cpu, vaddr addr,
     /* Indicate that this is a debug access. */
     attrs->debug = 1;
     return paddr;
+}
+
+hwaddr cpu_get_phys_page_attrs_debug(CPUState *cpu, vaddr addr,
+                                     MemTxAttrs *attrs)
+{
+    hwaddr translation_span;
+
+    return cpu_get_phys_page_attrs_debug_span(cpu, addr, attrs,
+                                              &translation_span);
 }
 
 hwaddr cpu_get_phys_page_debug(CPUState *cpu, vaddr addr)
