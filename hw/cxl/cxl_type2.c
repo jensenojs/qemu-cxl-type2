@@ -6931,29 +6931,14 @@ static int cxl_type2_direct_source_register(
   g_array_free(resolved_runs, true);
   resolved_runs = g_steal_pointer(&mapped_runs);
   validated = (CXLType2DirectValidatedRun *)resolved_runs->data;
-  if (ordinary_run_count && !file_run_count) {
-    /* 整批没有任何一页落在 DAX 窗口（virtio-shmem），只能全部走 ordinary
-     * staging 拷贝路径。这是纯普通内存 source 的兜底，与路由无关。
-     *
-     * 历史背景（b18 copy-direct 语义回归修复，2026-08-19）：
-     * 早期版本在这里还要求 route == CXL_DIRECT 才放行 DIRECT，否则整批
-     * 降级 ordinary。但 copy-direct（cuda-direct-source=on）配置下 qemu
-     * 从不发射 model-supply-route 属性（kimi_same_vm.py:219-224 仅在
-     * !cuda_direct_source 时发射），route 落为默认 SELECTED_HTOD，
-     * 导致 b18 的 DAX DIRECT 路径被误伤：模型页明明在 DAX 窗口
-     * （KIMI_SOURCE_RUN 显示 mr=virtio-shmem-0 dax=1），整批 9731 次
-     * 全降级 ordinary，TPS 从 1.93 跌到 0.93（cnb-pd8 实证）。
-     *
-     * 修复：短路只保留「无任何 DAX 页」的纯兜底；只要批内存在 DAX 页，
-     * 就放行到下方 per-run 混合处理（ordinary_host 保留 + file 页
-     * pin_range DIRECT，见 validated[i].ordinary_host 分支）。混合批
-     * 的正确性由 per-run 结构保证，不需要整批降级。
-     *
-     * 根解方向（system-UVA 路线，见 docs/plans/direct-placement-allocation-backing.md）：
-     * cxl-direct 显式路由 + model-consumer-certificate 是目标形态，届时
-     * route 显式声明、本短路只剩 DAX 判定；copy-direct 是 b18 历史参考，
-     * 本修复让它恢复历史语义，不作为目标实现的组成部分。
-     */
+  if (ordinary_run_count &&
+      (!file_run_count ||
+       ct2d->model_supply.route != CXL_TYPE2_MODEL_SUPPLY_CXL_DIRECT)) {
+    /* Copy-direct registration owns one page-aligned DAX registration set.
+     * A batch containing ordinary RAM cannot enter that owner without a
+     * second registration shape, so preserve the existing whole-batch
+     * ordinary path.  The explicit system-UVA route retains its per-run
+     * source composition below. */
     *ordinary_source_out = true;
     result = CXL_GPU_SUCCESS;
     goto out;
@@ -6985,19 +6970,9 @@ static int cxl_type2_direct_source_register(
   }
   source->range_count = header.range_count;
   source->ranges = g_steal_pointer(&range_layouts);
-  /*
-   * Gate runs construction on "this batch actually contains DAX pages"
-   * (file_run_count > 0), not on pageable_alias. pageable_alias keeps its
-   * route meaning: it selects the alias submission path (requires allocation
-   * generation, only reachable with cxl-direct + model-consumer-certificate).
-   * b18 semantics: a batch whose pages are DAX-backed must be submittable
-   * through the ordinary direct path (virtio_shared_memory_pin_range +
-   * hetgpu memcpy) even when route is selected-htod and no allocation record
-   * exists for the mmap'ed model pages. 0x35 regression to 0.93 TPS happened
-   * because runs were only built under pageable_alias, so selected-htod
-   * batches skipped DIRECT construction entirely (direct_bytes=0).
-   */
-  if (source->pageable_alias || file_run_count > 0) {
+  /* The system-UVA route owns file/member-bearing source views. Copy-direct
+   * falls through to the page-aligned registration views below. */
+  if (source->pageable_alias) {
     source->runs = g_try_new0(CXLType2DirectRun, resolved_runs->len);
     if (!source->runs) {
       result = CXL_GPU_ERROR_OUT_OF_MEMORY;
@@ -7050,153 +7025,108 @@ static int cxl_type2_direct_source_register(
         *failure_index_out = i;
         goto rollback;
       }
-      if (source->pageable_alias) {
-        /* cxl-direct alias path: the fd is needed for fstat (member
-         * identity) and the alias submission path. dup_source requires
-         * retained mapping fds (declared in realize for the alias gate). */
-        source_result = virtio_shared_memory_mapping_dup_source(
-            pinned_mapping, pinned_generation, &run->source_fd,
-            &mapping_file_offset, &mapping_length);
-        if (source_result != 0) {
-          virtio_shared_memory_unpin(pinned_mapping);
-          ct2d->model_supply.mapping_pin_releases++;
-          result = CXL_GPU_ERROR_INVALID_VALUE;
-          *failure_stage_out = "source-view-duplicate";
-          *failure_index_out = i;
-          goto rollback;
-        }
-        if (validated[i].mapping_offset < pinned_mapping->offset ||
-            validated[i].mapping_offset - pinned_mapping->offset >
-                UINT64_MAX - mapping_file_offset) {
-          virtio_shared_memory_unpin(pinned_mapping);
-          ct2d->model_supply.mapping_pin_releases++;
-          result = CXL_GPU_ERROR_INVALID_VALUE;
-          *failure_stage_out = "source-view-offset";
-          *failure_index_out = i;
-          goto rollback;
-        }
-        if (fstat(run->source_fd, &source_stat) != 0) {
-          virtio_shared_memory_unpin(pinned_mapping);
-          ct2d->model_supply.mapping_pin_releases++;
-          result = CXL_GPU_ERROR_INVALID_VALUE;
-          *failure_stage_out = "source-view-stat";
-          *failure_index_out = i;
-          goto rollback;
-        }
-        run->file_offset = mapping_file_offset + validated[i].mapping_offset -
-                           pinned_mapping->offset;
-        run->mapping_generation = pinned_generation;
-        run->source_device = source_stat.st_dev;
-        run->source_inode = source_stat.st_ino;
-        run->source_size = source_stat.st_size;
-        run->source_mode = source_stat.st_mode;
-        member = cxl_type2_model_member_find(
-            &ct2d->model_supply.member_manifest, run->source_device,
-            run->source_inode, run->source_size, run->source_mode,
-            run->file_offset, run->length);
-        if (!member) {
-          /* cxl-direct 路由要求每个 run 都能归属到 model member（system-UVA
-           * 目标的 allocation/epoch 身份）。member 缺失即不可准入。 */
-          virtio_shared_memory_unpin(pinned_mapping);
-          ct2d->model_supply.mapping_pin_releases++;
-          result = CXL_GPU_ERROR_INVALID_VALUE;
-          *failure_stage_out = "member-range-admission";
-          *failure_index_out = i;
-          goto rollback;
-        }
-        if (member->logical_cxl_offset >
-                UINT64_MAX - ct2d->model_aperture.offset ||
-            run->file_offset > UINT64_MAX - member->logical_cxl_offset -
-                                   ct2d->model_aperture.offset) {
-          virtio_shared_memory_unpin(pinned_mapping);
-          ct2d->model_supply.mapping_pin_releases++;
-          result = CXL_GPU_ERROR_INVALID_VALUE;
-          *failure_stage_out = "member-range-admission";
-          *failure_index_out = i;
-          goto rollback;
-        }
-        run->logical_cxl_offset = ct2d->model_aperture.offset +
-                                  member->logical_cxl_offset + run->file_offset;
-        run->model_member_index =
-            member - ct2d->model_supply.member_manifest.members;
-        if (!cxl_type2_range_contains(ct2d->model_aperture.offset,
-                                      ct2d->model_aperture.size,
-                                      run->logical_cxl_offset, run->length)) {
-          virtio_shared_memory_unpin(pinned_mapping);
-          ct2d->model_supply.mapping_pin_releases++;
-          result = CXL_GPU_ERROR_INVALID_VALUE;
-          *failure_stage_out = "aperture-capacity";
-          *failure_index_out = i;
-          goto rollback;
-        }
-        if (!cxl_type2_fabric_access_allowed(ct2d, run->logical_cxl_offset,
-                                             run->length, false, false) ||
-            !cxl_type2_memsim_request(ct2d, CXL_OP_RANGE_READ,
-                                      run->logical_cxl_offset, run->length,
-                                      NULL, NULL)) {
-          virtio_shared_memory_unpin(pinned_mapping);
-          ct2d->model_supply.mapping_pin_releases++;
-          result = CXL_GPU_ERROR_INVALID_VALUE;
-          *failure_stage_out = "fabric-request";
-          *failure_index_out = i;
-          goto rollback;
-        }
-        /* Member found: keep the accounting above, but the copy source is
-         * still the DAX mapping host pointer (direct_batch_submit copies
-         * from physical->host_address), so the run needs the same
-         * physical/registration as the member-less path. */
-        run->physical = cxl_type2_direct_physical_for_host(
-            ct2d, pinned_mapping, pinned_generation,
-            validated[i].mapping_offset, validated[i].length, mapping_host);
-        if (!run->physical) {
-          virtio_shared_memory_unpin(pinned_mapping);
-          ct2d->model_supply.mapping_pin_releases++;
-          result = CXL_GPU_ERROR_INVALID_VALUE;
-          *failure_stage_out = "source-view-physical";
-          *failure_index_out = i;
-          goto rollback;
-        }
-        run->physical_offset = validated[i].mapping_offset -
-                             run->physical->mapping_offset;
-        run->physical->references++;
-        run->physical->registration->references++;
-      } else {
-        /* b18 copy-direct 语义（route != CXL_DIRECT，mmap 模型页无 member）：
-         * host_address 保持 mapping_host（virtio DAX 映射），不计算
-         * logical_cxl_offset、不做 fabric/memsim 记账、不 dup source fd
-         * ——b18 没有 member 准入，DAX 页直接 pin + 拷，拷贝源是
-         * physical->host_address。缺失 member 不是错误；system-UVA 的
-         * member 归属与 CXL 记账留给 cxl-direct 路由显式声明
-         * （model-consumer-certificate）。
-         *
-         * direct_range_is_valid（pageable_alias=false）要求 run->physical
-         * 非 NULL，direct_batch_submit 用 physical->host_address 作拷贝源。
-         * 因此这里必须建立 physical（host = DAX 映射 host 指针），
-         * 不能 goto views_done 跳过 physical 填充（2qo: source-view-duplicate
-         * + physical=NULL 双重失败）。mapping 保持 pinned（引用计数持有），
-         * unregister/idle 清理时经 physical 释放。
-         *
-         * 不 dup source fd：copy-direct 路径无需 fd（无 alias 消费、
-         * 无 member fstat），保留 fd 会带来每 run 一个 fd 的消耗与
-         * EMFILE/生命周期压力（r5l 第 8 个 token register 失败）。
-         */
-        run->mapping_generation = pinned_generation;
-        run->physical = cxl_type2_direct_physical_for_host(
-            ct2d, pinned_mapping, pinned_generation,
-            validated[i].mapping_offset, validated[i].length, mapping_host);
-        if (!run->physical) {
-          virtio_shared_memory_unpin(pinned_mapping);
-          ct2d->model_supply.mapping_pin_releases++;
-          result = CXL_GPU_ERROR_INVALID_VALUE;
-          *failure_stage_out = "source-view-physical";
-          *failure_index_out = i;
-          goto rollback;
-        }
-        run->physical_offset = validated[i].mapping_offset -
-                               run->physical->mapping_offset;
-        run->physical->references++;
-        run->physical->registration->references++;
+      /* The fd supplies exact file identity and bytes to the system-UVA
+       * alias owner. Retained mapping fds are admitted at realize time. */
+      source_result = virtio_shared_memory_mapping_dup_source(
+          pinned_mapping, pinned_generation, &run->source_fd,
+          &mapping_file_offset, &mapping_length);
+      if (source_result != 0) {
+        virtio_shared_memory_unpin(pinned_mapping);
+        ct2d->model_supply.mapping_pin_releases++;
+        result = CXL_GPU_ERROR_INVALID_VALUE;
+        *failure_stage_out = "source-view-duplicate";
+        *failure_index_out = i;
+        goto rollback;
       }
+      if (validated[i].mapping_offset < pinned_mapping->offset ||
+          validated[i].mapping_offset - pinned_mapping->offset >
+              UINT64_MAX - mapping_file_offset) {
+        virtio_shared_memory_unpin(pinned_mapping);
+        ct2d->model_supply.mapping_pin_releases++;
+        result = CXL_GPU_ERROR_INVALID_VALUE;
+        *failure_stage_out = "source-view-offset";
+        *failure_index_out = i;
+        goto rollback;
+      }
+      if (fstat(run->source_fd, &source_stat) != 0) {
+        virtio_shared_memory_unpin(pinned_mapping);
+        ct2d->model_supply.mapping_pin_releases++;
+        result = CXL_GPU_ERROR_INVALID_VALUE;
+        *failure_stage_out = "source-view-stat";
+        *failure_index_out = i;
+        goto rollback;
+      }
+      run->file_offset = mapping_file_offset + validated[i].mapping_offset -
+                         pinned_mapping->offset;
+      run->mapping_generation = pinned_generation;
+      run->source_device = source_stat.st_dev;
+      run->source_inode = source_stat.st_ino;
+      run->source_size = source_stat.st_size;
+      run->source_mode = source_stat.st_mode;
+      member = cxl_type2_model_member_find(
+          &ct2d->model_supply.member_manifest, run->source_device,
+          run->source_inode, run->source_size, run->source_mode,
+          run->file_offset, run->length);
+      if (!member) {
+        virtio_shared_memory_unpin(pinned_mapping);
+        ct2d->model_supply.mapping_pin_releases++;
+        result = CXL_GPU_ERROR_INVALID_VALUE;
+        *failure_stage_out = "member-range-admission";
+        *failure_index_out = i;
+        goto rollback;
+      }
+      if (member->logical_cxl_offset >
+              UINT64_MAX - ct2d->model_aperture.offset ||
+          run->file_offset > UINT64_MAX - member->logical_cxl_offset -
+                                 ct2d->model_aperture.offset) {
+        virtio_shared_memory_unpin(pinned_mapping);
+        ct2d->model_supply.mapping_pin_releases++;
+        result = CXL_GPU_ERROR_INVALID_VALUE;
+        *failure_stage_out = "member-range-admission";
+        *failure_index_out = i;
+        goto rollback;
+      }
+      run->logical_cxl_offset = ct2d->model_aperture.offset +
+                                member->logical_cxl_offset + run->file_offset;
+      run->model_member_index =
+          member - ct2d->model_supply.member_manifest.members;
+      if (!cxl_type2_range_contains(ct2d->model_aperture.offset,
+                                    ct2d->model_aperture.size,
+                                    run->logical_cxl_offset, run->length)) {
+        virtio_shared_memory_unpin(pinned_mapping);
+        ct2d->model_supply.mapping_pin_releases++;
+        result = CXL_GPU_ERROR_INVALID_VALUE;
+        *failure_stage_out = "aperture-capacity";
+        *failure_index_out = i;
+        goto rollback;
+      }
+      if (!cxl_type2_fabric_access_allowed(ct2d, run->logical_cxl_offset,
+                                           run->length, false, false) ||
+          !cxl_type2_memsim_request(ct2d, CXL_OP_RANGE_READ,
+                                    run->logical_cxl_offset, run->length, NULL,
+                                    NULL)) {
+        virtio_shared_memory_unpin(pinned_mapping);
+        ct2d->model_supply.mapping_pin_releases++;
+        result = CXL_GPU_ERROR_INVALID_VALUE;
+        *failure_stage_out = "fabric-request";
+        *failure_index_out = i;
+        goto rollback;
+      }
+      run->physical = cxl_type2_direct_physical_for_host(
+          ct2d, pinned_mapping, pinned_generation,
+          validated[i].mapping_offset, validated[i].length, mapping_host);
+      if (!run->physical) {
+        virtio_shared_memory_unpin(pinned_mapping);
+        ct2d->model_supply.mapping_pin_releases++;
+        result = CXL_GPU_ERROR_INVALID_VALUE;
+        *failure_stage_out = "source-view-physical";
+        *failure_index_out = i;
+        goto rollback;
+      }
+      run->physical_offset =
+          validated[i].mapping_offset - run->physical->mapping_offset;
+      run->physical->references++;
+      run->physical->registration->references++;
     }
     goto views_done;
   }
