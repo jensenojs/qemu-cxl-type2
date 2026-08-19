@@ -85,6 +85,7 @@ extern int LZ4_decompress_safe(const char *src, char *dst, int compressed_size,
 
 #define CXL_CUDA_MEMHOSTREGISTER_PORTABLE 0x01U
 #define CXL_CUDA_MEMHOSTREGISTER_DEVICEMAP 0x02U
+#define CXL_CUDA_MEMHOSTREGISTER_READ_ONLY 0x08U
 #define CXL_CUDA_DEVICE_ATTRIBUTE_CAN_MAP_HOST_MEMORY 19
 #define CXL_TYPE2_MEDIA_DIGEST_CHUNK_BYTES (UINT64_C(4) * MiB)
 
@@ -6301,7 +6302,9 @@ cxl_type2_direct_registration_ensure(CXLType2State *ct2d,
   begin_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
   result = hetgpu_cuda_mem_host_register(
       &ct2d->gpu_info.hetgpu_state, registration->host_address,
-      registration->length, CXL_CUDA_MEMHOSTREGISTER_PORTABLE);
+      registration->length,
+      CXL_CUDA_MEMHOSTREGISTER_PORTABLE |
+          CXL_CUDA_MEMHOSTREGISTER_READ_ONLY);
   ct2d->paired_case.active_direct_physical_register_calls++;
   ct2d->paired_case.active_direct_physical_register_ns +=
       qemu_clock_get_ns(QEMU_CLOCK_HOST) - begin_ns;
