@@ -6835,9 +6835,29 @@ static int cxl_type2_direct_source_register(
   g_array_free(resolved_runs, true);
   resolved_runs = g_steal_pointer(&mapped_runs);
   validated = (CXLType2DirectValidatedRun *)resolved_runs->data;
-  if (ordinary_run_count &&
-      (!file_run_count ||
-       ct2d->model_supply.route != CXL_TYPE2_MODEL_SUPPLY_CXL_DIRECT)) {
+  if (ordinary_run_count && !file_run_count) {
+    /* 整批没有任何一页落在 DAX 窗口（virtio-shmem），只能全部走 ordinary
+     * staging 拷贝路径。这是纯普通内存 source 的兜底，与路由无关。
+     *
+     * 历史背景（b18 copy-direct 语义回归修复，2026-08-19）：
+     * 早期版本在这里还要求 route == CXL_DIRECT 才放行 DIRECT，否则整批
+     * 降级 ordinary。但 copy-direct（cuda-direct-source=on）配置下 qemu
+     * 从不发射 model-supply-route 属性（kimi_same_vm.py:219-224 仅在
+     * !cuda_direct_source 时发射），route 落为默认 SELECTED_HTOD，
+     * 导致 b18 的 DAX DIRECT 路径被误伤：模型页明明在 DAX 窗口
+     * （KIMI_SOURCE_RUN 显示 mr=virtio-shmem-0 dax=1），整批 9731 次
+     * 全降级 ordinary，TPS 从 1.93 跌到 0.93（cnb-pd8 实证）。
+     *
+     * 修复：短路只保留「无任何 DAX 页」的纯兜底；只要批内存在 DAX 页，
+     * 就放行到下方 per-run 混合处理（ordinary_host 保留 + file 页
+     * pin_range DIRECT，见 validated[i].ordinary_host 分支）。混合批
+     * 的正确性由 per-run 结构保证，不需要整批降级。
+     *
+     * 根解方向（system-UVA 路线，见 docs/plans/direct-placement-allocation-backing.md）：
+     * cxl-direct 显式路由 + model-consumer-certificate 是目标形态，届时
+     * route 显式声明、本短路只剩 DAX 判定；copy-direct 是 b18 历史参考，
+     * 本修复让它恢复历史语义，不作为目标实现的组成部分。
+     */
     *ordinary_source_out = true;
     result = CXL_GPU_SUCCESS;
     goto out;
