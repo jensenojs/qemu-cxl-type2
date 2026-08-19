@@ -7199,11 +7199,8 @@ static int cxl_type2_direct_source_register(
         } else {
           VirtioSharedMemoryMapping *pinned_mapping;
           uint64_t pinned_generation;
-          uint64_t following_offset;
-          uint64_t padding_budget = 0;
           uint64_t registration_offset;
           uint64_t registration_request_length;
-          uint64_t host_page_size = qemu_real_host_page_size();
           uint64_t pin_length;
           void *mapping_host;
 
@@ -7217,32 +7214,13 @@ static int cxl_type2_direct_source_register(
             *failure_index_out = i;
             goto view_rollback;
           }
-          following_offset = physical ? physical->mapping_offset
-                                      : validated[i].mapping->offset +
-                                            validated[i].mapping->len;
-          if (ct2d->direct_registration_padding_bytes <
-                  ct2d->direct_registration_padding_limit &&
-              pending_padding_bytes <
-                  ct2d->direct_registration_padding_limit -
-                      ct2d->direct_registration_padding_bytes) {
-            padding_budget = ct2d->direct_registration_padding_limit -
-                             ct2d->direct_registration_padding_bytes -
-                             pending_padding_bytes;
-          }
-          if (!cxl_gpu_direct_page_registration_span(
-                  validated[i].mapping->offset, validated[i].mapping->len,
-                  cursor, segment_length, following_offset, host_page_size,
-                  &registration_offset, &registration_request_length)) {
-            result = CXL_GPU_ERROR_INVALID_VALUE;
-            *failure_stage_out = "registration-page-span";
-            *failure_index_out = i;
-            goto view_rollback;
-          }
+          registration_offset = validated[i].mapping->offset;
+          registration_request_length = validated[i].mapping->len;
           pin_length = cxl_gpu_direct_registration_length(
               validated[i].mapping->offset, validated[i].mapping->len,
               registration_offset, registration_request_length,
-              following_offset, ct2d->direct_registration_tile_size,
-              padding_budget);
+              validated[i].mapping->offset + validated[i].mapping->len,
+              ct2d->direct_registration_tile_size, 0);
           if (!pin_length) {
             result = CXL_GPU_ERROR_INVALID_VALUE;
             *failure_stage_out = "registration-tile";
