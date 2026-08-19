@@ -8077,12 +8077,6 @@ out:
   return result;
 }
 
-static int cxl_type2_enqueue_htod_from_host(CXLType2State *ct2d,
-                                            uint64_t dev_ptr,
-                                            const void *source, size_t size,
-                                            void *stream,
-                                            const char *transport);
-
 static int cxl_type2_direct_batch_submit(
     CXLType2State *ct2d, const uint8_t *payload, uint64_t payload_capacity,
     uint64_t range_count, uint64_t payload_bytes, void *stream,
@@ -8283,31 +8277,6 @@ static int cxl_type2_direct_batch_submit(
       ct2d->paired_case.allocation_whole_single_span_batches++;
       ct2d->paired_case.allocation_whole_single_span_bytes += classified_bytes;
     }
-  }
-  if (source_override) {
-    for (size_t i = 0; i < spans->len; i++) {
-      CXLType2DirectSpan *span = &g_array_index(spans, CXLType2DirectSpan, i);
-
-      result = cxl_type2_enqueue_htod_from_host(ct2d, span->destination,
-                                                span->host, span->length,
-                                                stream, "cxl-source-copy");
-      if (result != CXL_GPU_SUCCESS) {
-        *fail_index = span->logical_index;
-        *failure_stage = "driver-copy-submit";
-        goto out;
-      }
-      ct2d->model_supply.model_htod_calls++;
-      ct2d->model_supply.model_htod_bytes += span->length;
-      (*fragments_enqueued)++;
-      *logical_enqueued =
-          i + 1 == spans->len || g_array_index(spans, CXLType2DirectSpan, i + 1)
-                                         .logical_index != span->logical_index
-              ? span->logical_index + 1
-              : span->logical_index;
-    }
-    g_assert(*logical_enqueued == range_count);
-    *fail_index = SIZE_MAX;
-    goto out;
   }
   /* Let each ready prefix run while the host registers the next range. */
   for (size_t slice_start = 0, boundary = 0; boundary <= spans->len;
