@@ -6614,6 +6614,12 @@ static void cxl_type2_log_direct_source_register_failure(
  * the normal physical/registration cleanup path (physical_put -> idle
  * cleanup -> registration_release -> physical_unlink -> unpin).
  *
+ * The direct_physical_ranges tree is a global (mapping, offset, length)
+ * interval index shared across register calls: the same DAX segment
+ * registered twice must reuse the existing physical (b18 views-path
+ * semantics: find_at_or_after + references++), not insert a duplicate
+ * (which asserts). On reuse the just-acquired pin is released again.
+ *
  * Mirrors the views-path construction (g_new0 with references 0, tree
  * insert, lists, counters); the caller increments references for each run
  * that points at the physical.
@@ -6623,10 +6629,24 @@ static CXLType2DirectPhysical *cxl_type2_direct_physical_for_host(
     uint64_t pinned_generation, hwaddr mapping_offset, uint64_t length,
     void *mapping_host) {
   CXLType2DirectRegistration *registration;
+  CXLType2DirectPhysical *existing;
   CXLType2DirectPhysical *physical;
 
   if (!ct2d || !pinned_mapping || !pinned_generation || !mapping_host) {
     return NULL;
+  }
+  existing = cxl_type2_direct_physical_find_at_or_after(
+      ct2d, pinned_mapping, mapping_offset);
+  if (existing && existing->mapping_offset <= mapping_offset &&
+      mapping_offset <= UINT64_MAX - length &&
+      mapping_offset + length <= existing->mapping_offset + existing->length &&
+      existing->generation == pinned_generation &&
+      !existing->mapping->revoke_pending &&
+      !existing->registration->revoke_pending) {
+    /* Same DAX segment already pinned: reuse it, release this pin. */
+    virtio_shared_memory_unpin(pinned_mapping);
+    ct2d->model_supply.mapping_pin_releases++;
+    return existing;
   }
   physical = g_new0(CXLType2DirectPhysical, 1);
   registration = g_new0(CXLType2DirectRegistration, 1);
@@ -7109,7 +7129,8 @@ static int cxl_type2_direct_source_register(
           *failure_index_out = i;
           goto rollback;
         }
-        run->physical_offset = 0;
+        run->physical_offset = validated[i].mapping_offset -
+                             run->physical->mapping_offset;
         run->physical->references++;
         run->physical->registration->references++;
       } else if (ct2d->model_supply.route ==
@@ -7147,7 +7168,8 @@ static int cxl_type2_direct_source_register(
         *failure_index_out = i;
         goto rollback;
       }
-      run->physical_offset = 0;
+      run->physical_offset = validated[i].mapping_offset -
+                             run->physical->mapping_offset;
       run->physical->references++;
       run->physical->registration->references++;
     }
