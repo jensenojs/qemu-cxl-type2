@@ -6353,10 +6353,23 @@ static int cxl_type2_direct_physical_put(CXLType2State *ct2d,
   g_assert(physical->registration && physical->registration->references > 0);
   physical->references--;
   physical->registration->references--;
-  if (physical->registration->references == 0 &&
-      physical->registration->revoke_pending) {
+  if (physical->registration->references == 0) {
+    /*
+     * Release immediately when the last reference drops, not only on
+     * revoke. A lingering pinned registration blocks the guest from
+     * unmapping its DAX region: virtio_del_shmem_map returns -EBUSY and
+     * sets revoke_pending, the mapping stays in the interval tree, and a
+     * later SHMEM_MAP for the same file region fails with -EEXIST ->
+     * virtiofsd FrontendInternalError -> guest SIGBUS (cnb-05g, token 8
+     * of 63). b18 never hit this because its llama kept model buffers
+     * mapped; the current llama munmaps and re-mmaps model pages across
+     * tokens. The idle_cleanup path stays for registrations that outlive
+     * their sources (case-end sweep), this change only releases the pin
+     * as soon as no source references it.
+     */
     int result = cxl_type2_direct_registration_release(
-        ct2d, physical->registration, true);
+        ct2d, physical->registration,
+        physical->registration->revoke_pending);
 
     if (result != CXL_GPU_SUCCESS) {
       physical->references++;
