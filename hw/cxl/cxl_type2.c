@@ -5812,8 +5812,8 @@ static void cxl_type2_log_case_summary(CXLType2State *ct2d,
         ct2d->paired_case.active_direct_tile_pin_failures,
         ct2d->paired_case.active_direct_cross_mapping_groups,
         ct2d->paired_case.active_direct_cross_mapping_members,
-        ct2d->direct_registration_tile_size,
-        ct2d->direct_registration_padding_limit,
+        (uint64_t)0,
+        (uint64_t)0,
         ct2d->direct_registration_padding_bytes,
         ct2d->paired_case.active_direct_registration_groups,
         ct2d->paired_case.active_direct_group_members,
@@ -7214,7 +7214,6 @@ static int cxl_type2_direct_source_register(
           VirtioSharedMemoryMapping *pinned_mapping;
           uint64_t pinned_generation;
           uint64_t registration_offset;
-          uint64_t registration_request_length;
           uint64_t pin_length;
           void *mapping_host;
 
@@ -7229,18 +7228,7 @@ static int cxl_type2_direct_source_register(
             goto view_rollback;
           }
           registration_offset = validated[i].mapping->offset;
-          registration_request_length = validated[i].mapping->len;
-          pin_length = cxl_gpu_direct_registration_length(
-              validated[i].mapping->offset, validated[i].mapping->len,
-              registration_offset, registration_request_length,
-              validated[i].mapping->offset + validated[i].mapping->len,
-              ct2d->direct_registration_tile_size, 0);
-          if (!pin_length) {
-            result = CXL_GPU_ERROR_INVALID_VALUE;
-            *failure_stage_out = "registration-tile";
-            *failure_index_out = i;
-            goto view_rollback;
-          }
+          pin_length = validated[i].mapping->len;
           if (virtio_shared_memory_pin_range(
                   shmem, registration_offset, pin_length, &pinned_mapping,
                   &pinned_generation, &mapping_host,
@@ -13378,18 +13366,9 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp) {
     ct2d->paired_case.active_case = CXL_GPU_CASE_NONE;
   }
 
-  if ((ct2d->direct_registration_tile_size ||
-       ct2d->direct_registration_padding_limit) &&
-      !ct2d->cuda_direct_source) {
-    error_setg(errp, "direct registration tiling requires "
-                     "cuda-direct-source=on");
-    return;
-  }
   if (ct2d->cuda_direct_source || ct2d->model_alias_gate.output) {
     VirtioSharedMemory *source_shmem;
     MemoryRegion *source_mr;
-    size_t host_page_size = qemu_real_host_page_size();
-
     if (!ct2d->direct_source_fs ||
         !vhost_user_fs_pci_get_dax(ct2d->direct_source_fs, &source_shmem,
                                    &source_mr)) {
@@ -13415,20 +13394,6 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp) {
      */
     if (ct2d->model_alias_gate.output) {
         virtio_shared_memory_set_source_fd_retention(source_shmem, true);
-    }
-    if (ct2d->cuda_direct_source) {
-    if (!!ct2d->direct_registration_tile_size !=
-        !!ct2d->direct_registration_padding_limit) {
-      error_setg(errp, "direct registration tile and padding limit "
-                       "must both be zero or both be nonzero");
-      return;
-    }
-    if ((ct2d->direct_registration_tile_size % host_page_size) ||
-        (ct2d->direct_registration_padding_limit % host_page_size)) {
-      error_setg(errp, "direct registration tile and padding limit "
-                       "must be host-page aligned");
-      return;
-    }
     }
   }
 
@@ -13737,10 +13702,6 @@ static const Property cxl_type2_props[] = {
                      htod_staging_pool_size, 0),
     DEFINE_PROP_BOOL("cuda-direct-source", CXLType2State, cuda_direct_source,
                      false),
-    DEFINE_PROP_SIZE("cuda-direct-registration-tile-size", CXLType2State,
-                     direct_registration_tile_size, 0),
-    DEFINE_PROP_SIZE("cuda-direct-registration-padding-size", CXLType2State,
-                     direct_registration_padding_limit, 0),
     DEFINE_PROP_LINK("direct-source-fs", CXLType2State, direct_source_fs,
                      TYPE_VHOST_USER_FS_PCI, Object *),
     DEFINE_PROP_STRING("model-supply-route", CXLType2State,

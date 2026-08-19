@@ -287,49 +287,6 @@ bool cxl_gpu_direct_destinations_are_independent(const uint64_t *destinations,
   return true;
 }
 
-uint64_t cxl_gpu_direct_registration_length(
-    uint64_t mapping_offset, uint64_t mapping_length, uint64_t request_offset,
-    uint64_t request_length, uint64_t following_offset, uint64_t tile_size,
-    uint64_t padding_budget) {
-  uint64_t mapping_end;
-  uint64_t request_end;
-  uint64_t limit;
-  uint64_t relative_end;
-  uint64_t rounded_end;
-  uint64_t tile_end;
-
-  if (!mapping_length || !request_length ||
-      mapping_offset > UINT64_MAX - mapping_length ||
-      request_offset < mapping_offset ||
-      request_offset > UINT64_MAX - request_length) {
-    return 0;
-  }
-  mapping_end = mapping_offset + mapping_length;
-  request_end = request_offset + request_length;
-  if (request_end > mapping_end || following_offset < request_end ||
-      following_offset > mapping_end) {
-    return 0;
-  }
-  if (!tile_size || !padding_budget || request_end == following_offset) {
-    return request_length;
-  }
-
-  relative_end = request_end - mapping_offset;
-  if (relative_end > UINT64_MAX - (tile_size - 1)) {
-    rounded_end = mapping_length;
-  } else {
-    rounded_end = ((relative_end + tile_size - 1) / tile_size) * tile_size;
-    rounded_end = MIN(rounded_end, mapping_length);
-  }
-  tile_end = mapping_offset + rounded_end;
-  tile_end = MIN(tile_end, following_offset);
-  limit = padding_budget > UINT64_MAX - request_end
-              ? UINT64_MAX
-              : request_end + padding_budget;
-  tile_end = MIN(tile_end, limit);
-  return tile_end - request_offset;
-}
-
 static size_t
 cxl_type2_cuda_allocation_lower_bound(const CXLType2CudaAllocationTable *table,
                                       uint64_t base) {

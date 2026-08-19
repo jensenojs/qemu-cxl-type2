@@ -1145,32 +1145,6 @@ static void test_cuda_opcode_summary_empty_and_bounded(void)
     g_assert_cmpuint(summary.reader_commands, ==, UINT64_MAX);
 }
 
-static void test_direct_registration_tile_bounds(void)
-{
-    const uint64_t mib = 1024 * 1024;
-
-    g_assert_cmpuint(cxl_gpu_direct_registration_length(
-                         64 * mib, 128 * mib, 80 * mib, 4 * mib,
-                         192 * mib, 64 * mib, 32 * mib),
-                     ==, 36 * mib);
-    g_assert_cmpuint(cxl_gpu_direct_registration_length(
-                         64 * mib, 128 * mib, 80 * mib, 4 * mib,
-                         96 * mib, 64 * mib, 32 * mib),
-                     ==, 16 * mib);
-    g_assert_cmpuint(cxl_gpu_direct_registration_length(
-                         64 * mib, 128 * mib, 80 * mib, 4 * mib,
-                         192 * mib, 64 * mib, 8 * mib),
-                     ==, 12 * mib);
-    g_assert_cmpuint(cxl_gpu_direct_registration_length(
-                         64 * mib, 128 * mib, 80 * mib, 4 * mib,
-                         192 * mib, 0, 32 * mib),
-                     ==, 4 * mib);
-    g_assert_cmpuint(cxl_gpu_direct_registration_length(
-                         64 * mib, 128 * mib, 60 * mib, 4 * mib,
-                         192 * mib, 64 * mib, 32 * mib),
-                     ==, 0);
-}
-
 static void test_direct_cross_case_epoch(void)
 {
     g_assert_false(cxl_gpu_direct_epoch_is_cross_case(0, 2));
@@ -1389,8 +1363,6 @@ int main(int argc, char **argv)
                     test_cuda_opcode_summary_wire_and_conservation);
     g_test_add_func("/cxl/type2/direct/opcode-summary-bounds",
                     test_cuda_opcode_summary_empty_and_bounded);
-    g_test_add_func("/cxl/type2/direct/registration-tile-bounds",
-                    test_direct_registration_tile_bounds);
     g_test_add_func("/cxl/type2/direct/cross-case-epoch",
                     test_direct_cross_case_epoch);
     g_test_add_func("/cxl/type2/stream/progress-classification",

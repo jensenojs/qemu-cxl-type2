@@ -112,10 +112,6 @@ bool cxl_gpu_direct_destinations_are_independent(const uint64_t *destinations,
                                                  const size_t *sizes,
                                                  size_t count,
                                                  size_t *conflict_index);
-uint64_t cxl_gpu_direct_registration_length(
-    uint64_t mapping_offset, uint64_t mapping_length, uint64_t request_offset,
-    uint64_t request_length, uint64_t following_offset, uint64_t tile_size,
-    uint64_t padding_budget);
 typedef struct CXLType2CudaAllocation {
   uint64_t base;
   uint64_t size;

@@ -460,8 +460,6 @@ typedef struct CXLType2State {
   uint64_t htod_driver_frees;
   uint64_t htod_pool_evictions;
   bool cuda_direct_source;
-  uint64_t direct_registration_tile_size;
-  uint64_t direct_registration_padding_limit;
   uint64_t direct_registration_padding_bytes;
   Object *direct_source_fs;
   struct {
