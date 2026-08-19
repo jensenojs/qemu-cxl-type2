@@ -13504,17 +13504,17 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp) {
      * virtio_shared_memory_mapping_dup_source(); declare the lease before
      * the guest can install any mapping so installation retains the fds.
      *
-     * Retention goes to the model alias gate (its output path always calls
-     * dup_source) AND to cuda-direct-source: the DAX register path
-     * (first per-run branch of cxl_type2_direct_source_register) calls
-     * dup_source for every DAX run and closes the fd at unregister/rollback,
-     * so the retained fd has a real consumer and a release path. The r2/r5
-     * EMFILE accumulation happened only while the selected-htod 0x35 batch
-     * was short-circuited to ORDINARY (never reaching the DIRECT branch),
-     * which gate-2/gate-3 fixes removed: DAX batches now reach the DIRECT
-     * branch and dup_source each run exactly once.
+     * Retention is granted only to the model alias gate (its output path
+     * always calls dup_source). cuda-direct-source alone must NOT retain:
+     * copy-direct (pageable_alias=false) never consumes dup_source fds —
+     * the copy source is physical->host_address (b18 semantics) — so every
+     * retained fd has no consumer and leaks until EMFILE -> guest SIGBUS.
+     * This was regressed by 8031b60dbc (unconditional retain for
+     * cuda_direct_source) and restored here; cnb-m8o/cnb-5l7/cnb-7mo all
+     * crashed at exactly 65450 SHMEM_MAPs (nofile=65535) because of it.
+     * The alias gate path (system-UVA) keeps its dup_source consumer.
      */
-    if (ct2d->model_alias_gate.output || ct2d->cuda_direct_source) {
+    if (ct2d->model_alias_gate.output) {
         virtio_shared_memory_set_source_fd_retention(source_shmem, true);
     }
     if (ct2d->cuda_direct_source) {
