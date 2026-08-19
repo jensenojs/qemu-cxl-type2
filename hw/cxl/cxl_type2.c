@@ -6602,6 +6602,63 @@ static void cxl_type2_log_direct_source_register_failure(
            payload_bytes);
 }
 
+/*
+ * Build a minimal direct physical + registration for a DAX mapping segment
+ * that has no model member (b18 copy-direct semantics: mmap'ed model pages
+ * are not model-consumer-certificate members). direct_range_is_valid
+ * requires run->physical non-NULL when pageable_alias is false, and
+ * direct_batch_submit copies from physical->host_address; without a member
+ * there is no registration group, so the physical stands alone with the DAX
+ * mapping host pointer. The mapping stays pinned (reference held by the
+ * physical through virtio_shared_memory_pin_range); release happens through
+ * the normal physical/registration cleanup path (physical_put -> idle
+ * cleanup -> registration_release -> physical_unlink -> unpin).
+ *
+ * Mirrors the views-path construction (g_new0 with references 0, tree
+ * insert, lists, counters); the caller increments references for each run
+ * that points at the physical.
+ */
+static CXLType2DirectPhysical *cxl_type2_direct_physical_for_host(
+    CXLType2State *ct2d, VirtioSharedMemoryMapping *pinned_mapping,
+    uint64_t pinned_generation, hwaddr mapping_offset, uint64_t length,
+    void *mapping_host) {
+  CXLType2DirectRegistration *registration;
+  CXLType2DirectPhysical *physical;
+
+  if (!ct2d || !pinned_mapping || !pinned_generation || !mapping_host) {
+    return NULL;
+  }
+  physical = g_new0(CXLType2DirectPhysical, 1);
+  registration = g_new0(CXLType2DirectRegistration, 1);
+  physical->mapping = pinned_mapping;
+  physical->generation = pinned_generation;
+  physical->last_case_epoch = ct2d->paired_case.active_epoch;
+  physical->mapping_offset = mapping_offset;
+  physical->length = length;
+  physical->host_address = mapping_host;
+  physical->registration = registration;
+  registration->host_address = mapping_host;
+  registration->length = length;
+  registration->member_count = 1;
+  registration->members = physical;
+  registration->next = ct2d->direct_registrations;
+  ct2d->direct_registrations = registration;
+  g_assert(!g_tree_lookup(ct2d->direct_physical_ranges, physical));
+  g_tree_insert(ct2d->direct_physical_ranges, physical, physical);
+  physical->next = ct2d->direct_physicals;
+  ct2d->direct_physicals = physical;
+  ct2d->paired_case.active_direct_retained_groups++;
+  ct2d->paired_case.active_direct_peak_retained_groups =
+      MAX(ct2d->paired_case.active_direct_peak_retained_groups,
+          ct2d->paired_case.active_direct_retained_groups);
+  ct2d->paired_case.active_direct_retained_physicals++;
+  ct2d->paired_case.active_direct_peak_retained_physicals =
+      MAX(ct2d->paired_case.active_direct_peak_retained_physicals,
+          ct2d->paired_case.active_direct_retained_physicals);
+  ct2d->paired_case.active_direct_cache_misses++;
+  return physical;
+}
+
 static int cxl_type2_direct_source_register(
     CXLType2State *ct2d, uint64_t payload_bytes, uint64_t *source_id_out,
     bool allow_ordinary_source, bool *ordinary_source_out,
@@ -7037,6 +7094,24 @@ static int cxl_type2_direct_source_register(
           *failure_index_out = i;
           goto rollback;
         }
+        /* Member found: keep the accounting above, but the copy source is
+         * still the DAX mapping host pointer (direct_batch_submit copies
+         * from physical->host_address), so the run needs the same
+         * physical/registration as the member-less path. */
+        run->physical = cxl_type2_direct_physical_for_host(
+            ct2d, pinned_mapping, pinned_generation,
+            validated[i].mapping_offset, validated[i].length, mapping_host);
+        if (!run->physical) {
+          virtio_shared_memory_unpin(pinned_mapping);
+          ct2d->model_supply.mapping_pin_releases++;
+          result = CXL_GPU_ERROR_INVALID_VALUE;
+          *failure_stage_out = "source-view-physical";
+          *failure_index_out = i;
+          goto rollback;
+        }
+        run->physical_offset = 0;
+        run->physical->references++;
+        run->physical->registration->references++;
       } else if (ct2d->model_supply.route ==
                  CXL_TYPE2_MODEL_SUPPLY_CXL_DIRECT) {
         /* cxl-direct 路由要求每个 run 都能归属到 model member（system-UVA
@@ -7053,9 +7128,28 @@ static int cxl_type2_direct_source_register(
        * logical_cxl_offset、不做 fabric/memsim 记账——b18 没有 member
        * 准入，DAX 页直接 pin + 拷。缺失 member 不是错误；system-UVA 的
        * member 归属与 CXL 记账留给 cxl-direct 路由显式声明
-       * （model-consumer-certificate）。 */
-      virtio_shared_memory_unpin(pinned_mapping);
-      ct2d->model_supply.mapping_pin_releases++;
+       * （model-consumer-certificate）。
+       *
+       * direct_range_is_valid（pageable_alias=false）要求 run->physical
+       * 非 NULL，direct_batch_submit 用 physical->host_address 作拷贝源。
+       * 因此这里必须建立 physical（host = DAX 映射 host 指针），
+       * 不能 goto views_done 跳过 physical 填充（2qo: source-view-duplicate
+       * + physical=NULL 双重失败）。mapping 保持 pinned（引用计数持有），
+       * unregister/idle 清理时经 physical 释放。 */
+      run->physical = cxl_type2_direct_physical_for_host(
+          ct2d, pinned_mapping, pinned_generation,
+          validated[i].mapping_offset, validated[i].length, mapping_host);
+      if (!run->physical) {
+        virtio_shared_memory_unpin(pinned_mapping);
+        ct2d->model_supply.mapping_pin_releases++;
+        result = CXL_GPU_ERROR_INVALID_VALUE;
+        *failure_stage_out = "source-view-physical";
+        *failure_index_out = i;
+        goto rollback;
+      }
+      run->physical_offset = 0;
+      run->physical->references++;
+      run->physical->registration->references++;
     }
     goto views_done;
   }
@@ -13363,17 +13457,17 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp) {
      * virtio_shared_memory_mapping_dup_source(); declare the lease before
      * the guest can install any mapping so installation retains the fds.
      *
-     * Retention is granted only to the model alias gate (its output path
-     * always calls dup_source). cuda-direct-source alone must NOT retain:
-     * under selected-htod routing the 0x35 register never reaches the
-     * DIRECT branch (cxl_type2_direct_source_register returns ORDINARY for
-     * non-cxl-direct routes), so no dup_source consumer exists and every
-     * retained fd leaks until EMFILE -> guest SIGBUS (r2/r5, closed by the
-     * d6g same-QEMU direct-off control). When the S4 supply engine makes
-     * 0x35 DIRECT again, retention is declared dynamically at first
-     * successful register instead of here.
+     * Retention goes to the model alias gate (its output path always calls
+     * dup_source) AND to cuda-direct-source: the DAX register path
+     * (first per-run branch of cxl_type2_direct_source_register) calls
+     * dup_source for every DAX run and closes the fd at unregister/rollback,
+     * so the retained fd has a real consumer and a release path. The r2/r5
+     * EMFILE accumulation happened only while the selected-htod 0x35 batch
+     * was short-circuited to ORDINARY (never reaching the DIRECT branch),
+     * which gate-2/gate-3 fixes removed: DAX batches now reach the DIRECT
+     * branch and dup_source each run exactly once.
      */
-    if (ct2d->model_alias_gate.output) {
+    if (ct2d->model_alias_gate.output || ct2d->cuda_direct_source) {
         virtio_shared_memory_set_source_fd_retention(source_shmem, true);
     }
     if (ct2d->cuda_direct_source) {
